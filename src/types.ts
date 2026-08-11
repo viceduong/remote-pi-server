@@ -90,8 +90,16 @@ export interface ChatMessage {
   errorMessage: string | null;
 }
 
+/** Runtime phase of a session (derived from the owner's event stream). */
+export type SessionPhase = 'idle' | 'streaming' | 'awaitingInput' | 'terminated';
+
+/** Who owns the session's agent runtime (the single writer). */
+export type SessionOwner = 'none' | 'terminal' | 'bridge';
+
 export interface SessionSummary {
   id: string;
+  phase: SessionPhase;
+  owner: SessionOwner;
   name: string;
   running: boolean;
   busy: boolean;

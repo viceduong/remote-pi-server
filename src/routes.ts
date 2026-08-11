@@ -117,6 +117,7 @@ export function registerRoutes(
     let queued = false;
     let behavior = body.data.streamingBehavior;
     const busyNow = session.busy;
+    if (session.phase === 'streaming') session.busy = true;
     if (busyNow && !behavior) {
       // The busy flag can go stale; verify against the live process. If the
       // check fails, DON'T queue — an unverifiable agent must not swallow
@@ -184,6 +185,42 @@ export function registerRoutes(
       return { session: session.toSummary(), state };
     } catch (err) {
       return { session: session.toSummary(), state: { error: (err as Error).message } };
+    }
+  });
+
+  fastify.get('/api/sessions/:id/models', async (req, reply) => {
+    const id = parseId(req, reply);
+    if (!id) return;
+    try {
+      const data = await manager.listModels(id);
+      return { models: data };
+    } catch (err) {
+      return reply.code(404).send({ error: (err as Error).message });
+    }
+  });
+
+  const SetModelSchema = z.object({ modelId: z.string().min(1) });
+  fastify.post('/api/sessions/:id/models', async (req, reply) => {
+    const id = parseId(req, reply);
+    if (!id) return;
+    const body = SetModelSchema.safeParse(req.body);
+    if (!body.success) return reply.code(400).send({ error: 'Invalid body' });
+    try {
+      await manager.setModel(id, body.data.modelId);
+      return { ok: true };
+    } catch (err) {
+      return reply.code(404).send({ error: (err as Error).message });
+    }
+  });
+
+  fastify.post('/api/sessions/:id/models/cycle', async (req, reply) => {
+    const id = parseId(req, reply);
+    if (!id) return;
+    try {
+      const modelId = await manager.cycleModel(id);
+      return { modelId };
+    } catch (err) {
+      return reply.code(404).send({ error: (err as Error).message });
     }
   });
 

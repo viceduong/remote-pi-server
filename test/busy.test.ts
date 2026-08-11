@@ -42,3 +42,22 @@ describe('session busy tracking (mid-turn safety)', () => {
     expect(s.lastTurnStartAt).toBeGreaterThan(0);
   });
 });
+
+describe('session phase state machine', () => {
+  it('idle -> streaming -> awaitingInput -> streaming cycle', () => {
+    const s = makeSession();
+    expect(s.phase).toBe('idle');
+    s.handleEvent({ type: 'turn_start' } as never);
+    expect(s.phase).toBe('streaming');
+    // per-message done does NOT end the phase (tool loops)
+    s.handleEvent({ type: 'message_update', assistantMessageEvent: { type: 'done' } } as never);
+    expect(s.phase).toBe('streaming');
+    s.handleEvent({ type: 'turn_end' } as never);
+    expect(s.phase).toBe('awaitingInput');
+    s.handleEvent({ type: 'turn_start' } as never);
+    expect(s.phase).toBe('streaming');
+    s.handleEvent({ type: 'agent_end' } as never);
+    expect(s.phase).toBe('awaitingInput');
+  });
+
+});

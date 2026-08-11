@@ -195,6 +195,27 @@ export class SessionManager {
     return this.ensureRunning(id);
   }
 
+  /* ---------------- models ---------------- */
+
+  async listModels(id: string): Promise<unknown> {
+    const session = await this.ensureRunning(id);
+    if (!session) throw new Error('Session not found');
+    return session.request({ type: 'get_available_models' });
+  }
+
+  async setModel(id: string, modelId: string): Promise<void> {
+    const session = await this.ensureRunning(id);
+    if (!session) throw new Error('Session not found');
+    await session.request({ type: 'set_model', modelId });
+  }
+
+  async cycleModel(id: string): Promise<string | null> {
+    const session = await this.ensureRunning(id);
+    if (!session) throw new Error('Session not found');
+    const data = await session.request<{ modelId?: string }>({ type: 'cycle_model' });
+    return data.modelId ?? null;
+  }
+
   /** Raw external pi instances (for /api/status). */
   getLiveInstances(): LiveInstance[] {
     return this.liveCache.instances;
@@ -453,7 +474,9 @@ export class SessionManager {
 
   async create(name: string): Promise<Session> {
     if (this.runningCount >= this.options.maxAgents) {
-      if (!this.evictIdle()) throw new BusyError();
+      // No idle-eviction: a single user's attached sessions must never be
+      // killed (mid-turn eviction was a bug source). Hard cap only.
+      throw new BusyError();
     }
     const id = this.nextId();
     const session = new Session(
@@ -498,7 +521,7 @@ export class SessionManager {
     const meta = this.buildIndex().get(id);
     if (!meta) return null;
     if (this.runningCount >= this.options.maxAgents) {
-      if (!this.evictIdle()) return null;
+      return null; // hard cap only — never evict an attached session
     }
     const session = this.sessionFromMeta(meta, 'pi');
     this.sessions.set(id, session);
@@ -573,6 +596,8 @@ export class SessionManager {
           lastActivityAt: meta.lastActivityAt,
           lastMessageAt: meta.lastMessageAt,
           error: null,
+          phase: meta.live ? 'streaming' : 'idle',
+          owner: meta.live ? 'terminal' : 'none',
           source: 'pi',
           workdir: meta.workdir,
           active: meta.active,
@@ -607,6 +632,8 @@ export class SessionManager {
           lastActivityAt: meta.lastActivityAt,
           lastMessageAt: meta.lastMessageAt,
           error: null,
+          phase: meta.live ? 'streaming' : 'idle',
+          owner: meta.live ? 'terminal' : 'none',
           source: 'pi',
           workdir: meta.workdir,
           active: meta.active,
@@ -650,6 +677,8 @@ export class SessionManager {
       lastActivityAt: meta.lastActivityAt,
       lastMessageAt: meta.lastMessageAt,
       error: null,
+      phase: meta.live ? 'streaming' : 'idle',
+      owner: meta.live ? 'terminal' : 'none',
       source: 'pi',
       workdir: meta.workdir,
       active: meta.active,
@@ -847,16 +876,6 @@ export class SessionManager {
   }
 
   /* ---------------- maintenance ---------------- */
-
-  /** Kill the oldest idle agent to free a slot. */
-  private evictIdle(): boolean {
-    const idle = [...this.sessions.values()]
-      .filter((s) => s.running && !s.busy && Date.now() - s.lastActivityAt > 60_000)
-      .sort((a, b) => a.lastActivityAt - b.lastActivityAt);
-    if (idle.length === 0) return false;
-    idle[0]!.stop();
-    return true;
-  }
 
   private sweepIdle(): void {
     const now = Date.now();

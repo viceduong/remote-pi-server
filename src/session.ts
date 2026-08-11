@@ -5,7 +5,7 @@ import type { ChildProcess } from 'node:child_process';
 import type { Logger } from 'pino';
 import { spawnPiProcess } from './pi.js';
 import { mapAgentMessage } from './history.js';
-import type { AgentMessage, AgentState, RpcEvent, RpcResponse, SessionSummary } from './types.js';
+import type { AgentMessage, AgentState, RpcEvent, RpcResponse, SessionPhase, SessionSummary } from './types.js';
 
 const EVENT_RING_CAPACITY = 500;
 const RPC_TIMEOUT_MS = 10_000;
@@ -51,6 +51,8 @@ export class Session {
   busy = false;
   /** Last turn_start timestamp (queue-delivery watchdog uses it). */
   lastTurnStartAt = 0;
+  /** Runtime phase derived from the owner's event stream. */
+  phase: SessionPhase = 'idle';
   /** Read-only mirror mode: file watcher only, no pi process (convertible). */
   readOnly = false;
   model: string | null = null;
@@ -147,8 +149,12 @@ export class Session {
     if (obj.type === 'turn_start') {
       this.busy = true;
       this.lastTurnStartAt = Date.now();
+      this.phase = 'streaming';
     }
-    else if (obj.type === 'turn_end' || obj.type === 'agent_end') this.busy = false;
+    else if (obj.type === 'turn_end' || obj.type === 'agent_end') {
+      this.busy = false;
+      this.phase = 'awaitingInput';
+    }
     else if (obj.type === 'message_update') {
       // NOTE: do NOT clear busy on per-message 'done'/'error' — a turn with
       // tool loops emits several messages before turn_end; clearing busy here
@@ -230,6 +236,7 @@ export class Session {
       this.proc = null;
       this.closed = true;
       this.busy = false;
+      this.phase = 'terminated';
       for (const p of this.pending.values()) {
         clearTimeout(p.timer);
         p.reject(new Error('Agent exited'));
@@ -401,6 +408,8 @@ export class Session {
       lastActivityAt: this.lastActivityAt,
       lastMessageAt: this.lastActivityAt,
       error: this.error,
+      phase: this.phase,
+      owner: this.proc ? 'bridge' : 'none',
       source: this.source,
       workdir: this.workdir,
       active: this.busy || this.lastActivityAt > Date.now() - 5 * 60_000 && this.running,

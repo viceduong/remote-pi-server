@@ -66,13 +66,8 @@ describe('spawn failure surfacing', () => {
     await expect(manager.create('boom')).rejects.toThrow(/failed to start|exited before/);
   }, 30_000);
 
-  it('create() rejects BusyError when capacity is exhausted and none idle', async () => {
-    // No real pi here — force the busy path by stubbing evictIdle to fail.
-    manager = makeManager();
-    vi.spyOn(manager as unknown as { evictIdle: () => boolean }, 'evictIdle').mockReturnValue(false);
-    // Occupying all slots with stopped-but-counted sessions: runningCount only
-    // counts running processes, so simulate via maxAgents=1 and one real spawn
-    // failure is unnecessary — test the guard directly instead.
+  it('create() rejects BusyError at the hard capacity (no eviction)', async () => {
+    // Ownership model: no idle-eviction — the hard cap is a plain 503.
     manager = makeManager();
     const spy = vi.spyOn(manager as unknown as { runningCount: number }, 'runningCount', 'get');
     spy.mockReturnValue(2);
