@@ -159,6 +159,42 @@ export class SessionManager {
     }
   }
 
+  /**
+   * Session for SSE attachment: host-owned sessions get a READ-ONLY mirror
+   * (file watcher only — NO second pi process, so the agent context never
+   * diverges). Bridge-owned sessions spawn normally. A turn later converts
+   * the mirror into a real agent (explicit takeover).
+   */
+  async sessionForSSE(id: string): Promise<Session | null> {
+    const existing = this.sessions.get(id);
+    if (existing) {
+      if (!existing.running && !existing.readOnly) {
+        await existing.start();
+      }
+      return existing;
+    }
+    const meta = this.buildIndex().get(id);
+    if (!meta) return null;
+    if (this.liveCache.mapped.has(id)) {
+      const mirror = new Session(
+        id,
+        meta.name,
+        meta.file,
+        this.options.bin,
+        meta.workdir ?? this.options.workdir,
+        this.options.sessionDir,
+        this.options.extraArgs,
+        this.options.log.child({ mirror: true }),
+        'pi',
+        true, // readOnly
+      );
+      this.sessions.set(id, mirror);
+      await mirror.start();
+      return mirror;
+    }
+    return this.ensureRunning(id);
+  }
+
   /** Raw external pi instances (for /api/status). */
   getLiveInstances(): LiveInstance[] {
     return this.liveCache.instances;
@@ -450,6 +486,12 @@ export class SessionManager {
   async ensureRunning(id: string): Promise<Session | null> {
     const live = this.sessions.get(id);
     if (live) {
+      // Read-only mirror -> explicit takeover: convert in place so the SSE
+      // subscribers (app) keep receiving agent events on the same Session.
+      if (live.readOnly) {
+        live.readOnly = false;
+        this.options.log.info({ sessionId: id }, 'takeover: mirror -> real agent');
+      }
       if (!live.running) await live.start();
       return live;
     }
@@ -627,6 +669,39 @@ export class SessionManager {
     for (const s of this.sessions.values()) s.stop();
   }
 
+  /**
+   * Send a turn and guarantee delivery: when pi drops a followUp (queued
+   * prompt never scheduled after the current turn ends), resend as a direct
+   * prompt. Runs fire-and-forget after returning 202.
+   */
+  async sendQueuedWithWatchdog(session: Session, message: string): Promise<void> {
+    const baseTurn = session.lastTurnStartAt;
+    try {
+      await session.request({ type: 'prompt', message, streamingBehavior: 'followUp' });
+    } catch {
+      return; // send failed outright — client already saw the queued banner
+    }
+    const deadline = Date.now() + 90_000;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 1500));
+      if (!session.running) return;
+      try {
+        const st = await session.request<{ isStreaming?: boolean }>({ type: 'get_state' });
+        session.busy = st.isStreaming === true;
+      } catch {
+        return;
+      }
+      if (!session.busy) break;
+    }
+    if (!session.busy && session.lastTurnStartAt <= baseTurn) {
+      // The queued prompt never ran — deliver it directly.
+      this.options.log.warn({ sessionId: session.id }, 'followUp dropped — resending as prompt');
+      try {
+        await session.request({ type: 'prompt', message });
+      } catch { /* best effort */ }
+    }
+  }
+
   /* ---------------- history ---------------- */
 
   /**
@@ -776,7 +851,7 @@ export class SessionManager {
   /** Kill the oldest idle agent to free a slot. */
   private evictIdle(): boolean {
     const idle = [...this.sessions.values()]
-      .filter((s) => s.running && !s.busy)
+      .filter((s) => s.running && !s.busy && Date.now() - s.lastActivityAt > 60_000)
       .sort((a, b) => a.lastActivityAt - b.lastActivityAt);
     if (idle.length === 0) return false;
     idle[0]!.stop();

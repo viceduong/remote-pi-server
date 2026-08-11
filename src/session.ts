@@ -49,6 +49,10 @@ export class Session {
   createdAt = Date.now();
   lastActivityAt = Date.now();
   busy = false;
+  /** Last turn_start timestamp (queue-delivery watchdog uses it). */
+  lastTurnStartAt = 0;
+  /** Read-only mirror mode: file watcher only, no pi process (convertible). */
+  readOnly = false;
   model: string | null = null;
   messageCount = 0;
   error: string | null = null;
@@ -79,12 +83,14 @@ export class Session {
     private readonly extraArgs: string[],
     private readonly log: Logger,
     source: 'app' | 'pi' = 'app',
+    readOnly = false,
   ) {
     this.id = id;
     this.name = name || 'New session';
     this.file = file;
     this.workdir = workdir;
     this.source = source;
+    this.readOnly = readOnly;
   }
 
   get running(): boolean {
@@ -136,13 +142,17 @@ export class Session {
     else entry.reject(new Error(obj.error ?? `RPC error: ${obj.command}`));
   }
 
-  private handleEvent(obj: RpcEvent): void {
+  handleEvent(obj: RpcEvent): void {
     this.lastActivityAt = Date.now();
-    if (obj.type === 'turn_start') this.busy = true;
+    if (obj.type === 'turn_start') {
+      this.busy = true;
+      this.lastTurnStartAt = Date.now();
+    }
     else if (obj.type === 'turn_end' || obj.type === 'agent_end') this.busy = false;
     else if (obj.type === 'message_update') {
-      const ev = obj.assistantMessageEvent as { type?: string } | undefined;
-      if (ev && (ev.type === 'done' || ev.type === 'error')) this.busy = false;
+      // NOTE: do NOT clear busy on per-message 'done'/'error' — a turn with
+      // tool loops emits several messages before turn_end; clearing busy here
+      // made mid-turn agents look idle and get evicted/killed.
     }
     if (obj.type === 'agent_end') {
       this.error = null;
@@ -181,8 +191,16 @@ export class Session {
 
   /* ---------------- lifecycle ---------------- */
 
+  /** Read-only mirror: watch the file for host activity, spawn nothing. */
+  async startReadOnly(): Promise<void> {
+    if (this.proc) return;
+    this.fileOffset = 0;
+    this.startFileWatch();
+  }
+
   /** Spawn the pi process and prime session metadata via get_state. */
   async start(): Promise<void> {
+    if (this.readOnly) return this.startReadOnly();
     if (this.proc) return;
     const args = [
       '--mode', 'rpc',

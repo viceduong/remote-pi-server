@@ -116,18 +116,21 @@ export function registerRoutes(
 
     let queued = false;
     let behavior = body.data.streamingBehavior;
-    if (session.busy && !behavior) {
-      // The busy flag can go stale (process respawned mid-turn, missed events).
-      // Verify against the live process before queueing — otherwise we queue
-      // behind an idle agent and the follow-up never fires.
+    const busyNow = session.busy;
+    if (busyNow && !behavior) {
+      // The busy flag can go stale; verify against the live process. If the
+      // check fails, DON'T queue — an unverifiable agent must not swallow
+      // the message in a followUp that never fires.
+      let verifiedBusy = session.busy;
       try {
         const st = await session.request<{ isStreaming?: boolean }>({ type: 'get_state' });
-        session.busy = st.isStreaming === true;
+        verifiedBusy = st.isStreaming === true;
       } catch {
-        /* keep busy as-is */
+        verifiedBusy = false;
       }
-      if (session.busy) {
-        behavior = 'followUp'; // queue until the agent finishes
+      session.busy = verifiedBusy;
+      if (verifiedBusy) {
+        behavior = 'followUp';
         queued = true;
       }
     }
@@ -135,6 +138,10 @@ export function registerRoutes(
       const cmd: Record<string, unknown> = { type: 'prompt', message: body.data.message };
       if (behavior) cmd.streamingBehavior = behavior;
       await session.request(cmd, 8000);
+      if (queued) {
+        // Guarantee the queued prompt eventually runs (pi can drop followUps).
+        void manager.sendQueuedWithWatchdog(session, body.data.message).catch(() => {});
+      }
       return reply.code(202).send({ accepted: true, queued });
     } catch (err) {
       return reply.code(409).send({ error: (err as Error).message });
@@ -229,7 +236,8 @@ export function registerRoutes(
   fastify.get('/api/sessions/:id/events', async (req, reply) => {
     const id = parseId(req, reply);
     if (!id) return;
-    const session = await manager.ensureRunning(id);
+    // Host-owned sessions attach as a read-only mirror (no second agent).
+    const session = await manager.sessionForSSE(id);
     if (!session) return reply.code(404).send({ error: 'Session not found' });
     attachSse(req, reply, session, log);
   });
