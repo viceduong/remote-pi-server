@@ -741,6 +741,9 @@ export class SessionManager {
   async fork(id: string, entryId: string, name?: string): Promise<{ session: SessionSummary; text: string | null } | null> {
     const src = await this.ensureRunning(id);
     if (!src) return null;
+    if (src.busy || src.phase === 'streaming') {
+      throw new SpawnError('Agent is busy — fork when the current turn finishes');
+    }
     const srcFile = src.file;
     const srcName = src.name;
 
@@ -880,7 +883,8 @@ export class SessionManager {
   private sweepIdle(): void {
     const now = Date.now();
     for (const s of this.sessions.values()) {
-      if (s.running && !s.busy && now - s.lastActivityAt > this.options.idleKillMs) {
+      if (s.running && !s.busy && s.phase !== 'streaming'
+          && now - s.lastActivityAt > this.options.idleKillMs) {
         this.options.log.info({ sessionId: s.id }, 'idle timeout, stopping agent');
         s.stop();
       }

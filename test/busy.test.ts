@@ -61,3 +61,16 @@ describe('session phase state machine', () => {
   });
 
 });
+
+describe('mid-turn protection (phase-authoritative busy)', () => {
+  it('a prompt during a tool gap is treated as busy (never raw-sent)', () => {
+    const s = makeSession();
+    s.handleEvent({ type: 'turn_start' } as never);
+    // Tool gap: no deltas flowing, but phase stays streaming.
+    expect(s.phase).toBe('streaming');
+    // The turn-route guard would see busyNow = busy || phase==='streaming'.
+    expect(s.busy || s.phase === 'streaming').toBe(true);
+    s.handleEvent({ type: 'turn_end' } as never);
+    expect(s.busy || s.phase === 'streaming').toBe(false);
+  });
+});

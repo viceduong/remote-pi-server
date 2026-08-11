@@ -116,21 +116,27 @@ export function registerRoutes(
 
     let queued = false;
     let behavior = body.data.streamingBehavior;
-    const busyNow = session.busy;
-    if (session.phase === 'streaming') session.busy = true;
+    // Phase is the AUTHORITATIVE busy signal: it persists through tool
+    // execution gaps where get_state.isStreaming flickers false. Sending a
+    // raw prompt while truly mid-turn makes pi ABORT the running turn.
+    const busyNow = session.busy || session.phase === 'streaming';
     if (busyNow && !behavior) {
-      // The busy flag can go stale; verify against the live process. If the
-      // check fails, DON'T queue — an unverifiable agent must not swallow
-      // the message in a followUp that never fires.
-      let verifiedBusy = session.busy;
-      try {
-        const st = await session.request<{ isStreaming?: boolean }>({ type: 'get_state' });
-        verifiedBusy = st.isStreaming === true;
-      } catch {
-        verifiedBusy = false;
+      if (session.phase === 'streaming') {
+        session.busy = true; // trust the phase — never raw-prompt mid-turn
+      } else {
+        // busy flag stale but phase says idle — verify once; on failure do NOT
+        // queue (an unverifiable agent must not swallow a followUp).
+        let verifiedBusy = session.busy;
+        try {
+          const st = await session.request<{ isStreaming?: boolean }>({ type: 'get_state' });
+          verifiedBusy = st.isStreaming === true;
+        } catch {
+          verifiedBusy = false;
+        }
+        session.busy = verifiedBusy;
+        if (verifiedBusy) session.phase = 'streaming';
       }
-      session.busy = verifiedBusy;
-      if (verifiedBusy) {
+      if (session.busy) {
         behavior = 'followUp';
         queued = true;
       }
@@ -242,6 +248,12 @@ export function registerRoutes(
     if (!id) return;
     const body = ForkSchema.safeParse(req.body ?? {});
     if (!body.success) return reply.code(400).send({ error: 'Invalid body', issues: body.error.issues });
+
+    // Fork stops the source process (pi forks in place) — NEVER mid-turn.
+    const forkSession = manager.find(id);
+    if (forkSession?.phase === 'streaming') {
+      return reply.code(409).send({ error: 'Agent is busy — fork when it finishes' });
+    }
 
     // Default to the last user message entry in the session file.
     let entryId = body.data.entryId;
