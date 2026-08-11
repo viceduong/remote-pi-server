@@ -491,6 +491,7 @@ export class SessionManager {
     );
     this.sessions.set(id, session);
     this.invalidateIndex();
+    this.wireQueue(session);
     await session.start();
     this.throwIfDead(session);
     return session;
@@ -525,6 +526,7 @@ export class SessionManager {
     }
     const session = this.sessionFromMeta(meta, 'pi');
     this.sessions.set(id, session);
+    this.wireQueue(session);
     await session.start();
     this.throwIfDead(session);
     return session;
@@ -699,36 +701,29 @@ export class SessionManager {
   }
 
   /**
-   * Send a turn and guarantee delivery: when pi drops a followUp (queued
-   * prompt never scheduled after the current turn ends), resend as a direct
-   * prompt. Runs fire-and-forget after returning 202.
+   * Server-owned prompt queue. Queued messages are held here (never only
+   * optimistic on the client), dispatched as a direct prompt the moment the
+   * current turn ends, and surfaced as `pending` in /messages — so they can
+   * never vanish on reload and never double-send.
    */
-  async sendQueuedWithWatchdog(session: Session, message: string): Promise<void> {
-    const baseTurn = session.lastTurnStartAt;
-    try {
-      await session.request({ type: 'prompt', message, streamingBehavior: 'followUp' });
-    } catch {
-      return; // send failed outright — client already saw the queued banner
-    }
-    const deadline = Date.now() + 90_000;
-    while (Date.now() < deadline) {
-      await new Promise((r) => setTimeout(r, 1500));
-      if (!session.running) return;
-      try {
-        const st = await session.request<{ isStreaming?: boolean }>({ type: 'get_state' });
-        session.busy = st.isStreaming === true;
-      } catch {
-        return;
-      }
-      if (!session.busy) break;
-    }
-    if (!session.busy && session.lastTurnStartAt <= baseTurn) {
-      // The queued prompt never ran — deliver it directly.
-      this.options.log.warn({ sessionId: session.id }, 'followUp dropped — resending as prompt');
-      try {
-        await session.request({ type: 'prompt', message });
-      } catch { /* best effort */ }
-    }
+  enqueuePrompt(session: Session, message: string): void {
+    session.queue.push(message);
+  }
+
+  /** Dispatch the next queued prompt when the agent is ready. */
+  private dispatchQueued(session: Session): void {
+    const text = session.queue.shift();
+    if (!text || session.busy || session.phase === 'streaming') return;
+    this.options.log.info({ sessionId: session.id }, 'dispatching queued prompt');
+    void session.request({ type: 'prompt', message: text }).catch(() => {
+      // Put it back if the dispatch failed — never lose a queued message.
+      session.queue.unshift(text);
+    });
+  }
+
+  /** Wire a session's queue to its turn_end events. */
+  private wireQueue(session: Session): void {
+    session.onIdle = () => this.dispatchQueued(session);
   }
 
   /* ---------------- history ---------------- */

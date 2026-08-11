@@ -142,14 +142,14 @@ export function registerRoutes(
       }
     }
     try {
-      const cmd: Record<string, unknown> = { type: 'prompt', message: body.data.message };
-      if (behavior) cmd.streamingBehavior = behavior;
-      await session.request(cmd, 8000);
       if (queued) {
-        // Guarantee the queued prompt eventually runs (pi can drop followUps).
-        void manager.sendQueuedWithWatchdog(session, body.data.message).catch(() => {});
+        // Server-owned queue: held, dispatched on turn_end, never lost.
+        manager.enqueuePrompt(session, body.data.message);
+        return reply.code(202).send({ accepted: true, queued: true });
       }
-      return reply.code(202).send({ accepted: true, queued });
+      const cmd: Record<string, unknown> = { type: 'prompt', message: body.data.message };
+      await session.request(cmd, 8000);
+      return reply.code(202).send({ accepted: true, queued: false });
     } catch (err) {
       return reply.code(409).send({ error: (err as Error).message });
     }
@@ -170,6 +170,9 @@ export function registerRoutes(
         : all.slice(-limit);
       return {
         messages: page,
+        // Queued-but-not-yet-written prompts (server-owned queue): the client
+        // renders them as pending so they never vanish on reload.
+        pending: before ? undefined : session.queue.map((text) => ({ text, queuedAt: Date.now() })),
         hasMore: before
           ? all.some((m) => (m.timestamp ?? 0) < (page[0]?.timestamp ?? 0))
           : all.length > limit,

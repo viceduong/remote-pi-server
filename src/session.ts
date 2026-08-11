@@ -51,6 +51,11 @@ export class Session {
   busy = false;
   /** Last turn_start timestamp (queue-delivery watchdog uses it). */
   lastTurnStartAt = 0;
+  /** Server-owned prompt queue (dispatched on turn_end — messages never
+   *  vanish and never double-send). */
+  queue: string[] = [];
+  /** Called when a turn completes and the agent is ready for the next prompt. */
+  onIdle: (() => void) | null = null;
   /** Runtime phase derived from the owner's event stream. */
   phase: SessionPhase = 'idle';
   /** Read-only mirror mode: file watcher only, no pi process (convertible). */
@@ -62,6 +67,7 @@ export class Session {
   private proc: ChildProcess | null = null;
   private buffer = '';
   private readonly ring: RingRecord[] = [];
+  private readonly stderrTail: string[] = [];
   private readonly sinks = new Set<EventSink>();
   private readonly pending = new Map<string, PendingRpc>();
   private seq = 0;
@@ -154,6 +160,7 @@ export class Session {
     else if (obj.type === 'turn_end' || obj.type === 'agent_end') {
       this.busy = false;
       this.phase = 'awaitingInput';
+      if (this.onIdle) this.onIdle();
     }
     else if (obj.type === 'message_update') {
       // NOTE: do NOT clear busy on per-message 'done'/'error' — a turn with
@@ -223,8 +230,12 @@ export class Session {
     this.stopping = false;
 
     child.stdout?.on('data', (d: Buffer) => this.onStdoutChunk(d));
-    child.stderr?.on('data', (d: Buffer) =>
-      this.log.debug({ sessionId: this.id, chunk: d.toString().trim() }, 'pi stderr'));
+    child.stderr?.on('data', (d: Buffer) => {
+      const line = d.toString().trim();
+      this.stderrTail.push(line);
+      if (this.stderrTail.length > 40) this.stderrTail.shift();
+      this.log.debug({ sessionId: this.id, chunk: line }, 'pi stderr');
+    });
 
     child.on('error', (err) => {
       this.error = err.message;
@@ -232,6 +243,24 @@ export class Session {
     });
 
     child.on('close', (code) => {
+      const unexpected = code !== 0 && !this.stopping;
+      if (unexpected) {
+        this.log.error(
+          { sessionId: this.id, code, stderr: this.stderrTail.slice(-20) },
+          'pi exited unexpectedly',
+        );
+        for (const sink of this.sinks) {
+          sink.send({
+            seq: ++this.seq,
+            type: 'agent_crashed',
+            data: { type: 'agent_crashed', code, stderr: this.stderrTail.slice(-20) },
+          });
+        }
+        // Auto-recovery: respawn (resume) shortly after an unexpected exit.
+        setTimeout(() => {
+          if (!this.proc) void this.start().catch(() => {});
+        }, 1000);
+      }
       this.log.info({ sessionId: this.id, code }, 'pi exited');
       this.proc = null;
       this.closed = true;
