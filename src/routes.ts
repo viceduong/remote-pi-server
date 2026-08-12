@@ -191,7 +191,7 @@ export function registerRoutes(
         messages: page,
         // Queued-but-not-yet-written prompts (server-owned queue): the client
         // renders them as pending so they never vanish on reload.
-        pending: before ? undefined : session.queue.map((text) => ({ text, queuedAt: Date.now() })),
+        pending: before ? undefined : session.queue.map((item) => ({ text: item.message, queuedAt: item.queuedAt })),
         hasMore: before
           ? all.some((m) => (m.timestamp ?? 0) < (page[0]?.timestamp ?? 0))
           : all.length > limit,
