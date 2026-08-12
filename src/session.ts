@@ -263,6 +263,22 @@ export class Session {
     });
 
     child.on('close', (code) => {
+      // ALARM: any exit while the agent was mid-turn is logged as ERROR even
+      // if our own stop() did it (the guards should prevent that — if this
+      // fires, a caller is stopping a streaming agent and we need to know).
+      if (this.phase === 'streaming' || this.busy) {
+        this.log.error(
+          { sessionId: this.id, code, stopping: this.stopping, phase: this.phase, busy: this.busy },
+          'agent stopped MID-TURN',
+        );
+        for (const sink of this.sinks) {
+          sink.send({
+            seq: ++this.seq,
+            type: 'agent_crashed',
+            data: { type: 'agent_crashed', code, midTurn: true },
+          });
+        }
+      }
       const unexpected = code !== 0 && !this.stopping;
       if (unexpected) {
         this.log.error(
