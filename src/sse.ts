@@ -4,12 +4,16 @@ import type { FastifyBaseLogger } from 'fastify';
 import type { Session } from './session.js';
 
 const KEEPALIVE_MS = 15_000;
+/** Slow-consumer cap: if a sink queues more than this many frames, the client
+ *  is too slow — drop the connection (it will reconnect + replay). */
+const MAX_PENDING_FRAMES = 300;
 
 /**
- * Server-Sent Events connection. Writes `event:/id:/data:` frames directly to
- * the raw socket — gzipped (event payloads can be MBs; URLSession
- * decompresses transparently). Sends keepalive comments while idle so
- * proxies/NAT don't drop the connection. Respects Last-Event-ID replay.
+ * Server-Sent Events connection. Writes `event:/id:/data:` frames through a
+ * gzip stream with proper backpressure: when the socket is congested
+ * (gzip.write returns false) frames are queued in a bounded buffer and
+ * flushed on 'drain'; a client that outruns the cap is disconnected rather
+ * than unboundedly buffering in memory.
  */
 export function attachSse(
   req: FastifyRequest,
@@ -21,7 +25,6 @@ export function attachSse(
   const raw = reply.raw;
   const gzip = zlib.createGzip({ level: zlib.constants.Z_BEST_SPEED });
   gzip.pipe(raw);
-  const write = (chunk: string | Buffer): void => { gzip.write(chunk); };
 
   raw.writeHead(200, {
     'Content-Type': 'text/event-stream; charset=utf-8',
@@ -30,26 +33,60 @@ export function attachSse(
     'Content-Encoding': 'gzip',
     'X-Accel-Buffering': 'no',
   });
-  write(': connected\n\n');
+
+  let closed = false;
+  let paused = false;
+  const pending: string[] = [];
+
+  const flush = (): void => {
+    while (!paused && pending.length > 0) {
+      const frame = pending.shift()!;
+      if (!gzip.write(frame)) {
+        paused = true;
+        gzip.once('drain', flush);
+        break;
+      }
+      gzip.flush(); // zlib holds small frames until the buffer fills — flush
+      // each frame so clients receive SSE events incrementally.
+    }
+  };
+
+  const sendFrame = (frame: string): void => {
+    if (closed) return;
+    if (paused) {
+      pending.push(frame);
+      if (pending.length > MAX_PENDING_FRAMES) cleanup(); // too slow — reconnect + replay
+      return;
+    }
+    const ok = gzip.write(frame);
+    gzip.flush(); // zlib holds small frames until the buffer fills — flush each
+    // frame so clients receive SSE events incrementally.
+    if (!ok) {
+      paused = true;
+      gzip.once('drain', flush);
+    }
+  };
+
+  sendFrame(': connected\n\n');
 
   // Replay missed events if the client sends Last-Event-ID.
   const lastIdHeader = req.headers['last-event-id'];
   const lastId = lastIdHeader ? Number.parseInt(String(lastIdHeader), 10) : -1;
   if (lastId >= 0) {
     for (const record of session.replayAfter(lastId)) {
-      write(encodeFrame(record.type, record.seq, record.data));
+      sendFrame(encodeFrame(record.type, record.seq, record.data));
     }
   }
 
   const sink = {
     send(record: { type: string; seq: number; data: unknown }): void {
-      write(encodeFrame(record.type, record.seq, record.data));
+      sendFrame(encodeFrame(record.type, record.seq, record.data));
     },
   };
 
   const keepalive = setInterval(() => {
     try {
-      write(': keepalive\n\n');
+      sendFrame(': keepalive\n\n');
     } catch {
       cleanup();
     }
@@ -59,6 +96,8 @@ export function attachSse(
   session.subscribe(sink);
 
   function cleanup(): void {
+    if (closed) return;
+    closed = true;
     clearInterval(keepalive);
     session.unsubscribe(sink);
     try {

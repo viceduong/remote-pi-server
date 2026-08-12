@@ -186,7 +186,8 @@ export class Session {
       for (const sink of this.sinks) sink.send({ seq: ++this.seq, type: obj.type, data: obj });
       return;
     }
-    const record: RingRecord = { seq: ++this.seq, type: obj.type, data: obj };
+    const wire = this.trimEventForWire(obj);
+    const record: RingRecord = { seq: ++this.seq, type: wire.type, data: wire };
     this.ring.push(record);
     let bytes = 0;
     for (const r of this.ring) bytes += JSON.stringify(r.data).length;
@@ -326,6 +327,21 @@ export class Session {
   }
 
   /* ---------------- SSE fan-out ---------------- */
+
+  /**
+   * Bandwidth trim: pi's message_update carries the growing partial message
+   * PLUS the delta. The app consumes only the delta for text/thinking streams,
+   * so ship just the role (keeps tool-vs-assistant routing correct).
+   */
+  private trimEventForWire(obj: RpcEvent): RpcEvent {
+    if (obj.type !== 'message_update') return obj;
+    const ev = obj.assistantMessageEvent as { type?: string } | undefined;
+    if (ev && (ev.type === 'text_delta' || ev.type === 'thinking_delta')) {
+      const msg = obj.message as { role?: string } | undefined;
+      return { ...obj, message: { role: msg?.role } };
+    }
+    return obj;
+  }
 
   /** Fan a synthetic event out to current subscribers (queue_update etc.). */
   broadcast(type: string, data: Record<string, unknown>): void {
