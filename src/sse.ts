@@ -1,3 +1,4 @@
+import zlib from 'node:zlib';
 import type { FastifyReply, FastifyRequest } from 'fastify';
 import type { FastifyBaseLogger } from 'fastify';
 import type { Session } from './session.js';
@@ -6,8 +7,9 @@ const KEEPALIVE_MS = 15_000;
 
 /**
  * Server-Sent Events connection. Writes `event:/id:/data:` frames directly to
- * the raw socket. Sends keepalive comments while idle so proxies/NAT don't
- * drop the connection. Respects Last-Event-ID replay via the session ring.
+ * the raw socket — gzipped (event payloads can be MBs; URLSession
+ * decompresses transparently). Sends keepalive comments while idle so
+ * proxies/NAT don't drop the connection. Respects Last-Event-ID replay.
  */
 export function attachSse(
   req: FastifyRequest,
@@ -17,32 +19,37 @@ export function attachSse(
 ): void {
   reply.hijack();
   const raw = reply.raw;
+  const gzip = zlib.createGzip({ level: zlib.constants.Z_BEST_SPEED });
+  gzip.pipe(raw);
+  const write = (chunk: string | Buffer): void => { gzip.write(chunk); };
+
   raw.writeHead(200, {
     'Content-Type': 'text/event-stream; charset=utf-8',
     'Cache-Control': 'no-cache, no-transform',
     Connection: 'keep-alive',
+    'Content-Encoding': 'gzip',
     'X-Accel-Buffering': 'no',
   });
-  raw.write(': connected\n\n');
+  write(': connected\n\n');
 
   // Replay missed events if the client sends Last-Event-ID.
   const lastIdHeader = req.headers['last-event-id'];
   const lastId = lastIdHeader ? Number.parseInt(String(lastIdHeader), 10) : -1;
   if (lastId >= 0) {
     for (const record of session.replayAfter(lastId)) {
-      raw.write(encodeFrame(record.type, record.seq, record.data));
+      write(encodeFrame(record.type, record.seq, record.data));
     }
   }
 
   const sink = {
     send(record: { type: string; seq: number; data: unknown }): void {
-      raw.write(encodeFrame(record.type, record.seq, record.data));
+      write(encodeFrame(record.type, record.seq, record.data));
     },
   };
 
   const keepalive = setInterval(() => {
     try {
-      raw.write(': keepalive\n\n');
+      write(': keepalive\n\n');
     } catch {
       cleanup();
     }
@@ -55,7 +62,7 @@ export function attachSse(
     clearInterval(keepalive);
     session.unsubscribe(sink);
     try {
-      raw.end();
+      gzip.end();
     } catch { /* already closed */ }
   }
 

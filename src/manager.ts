@@ -74,6 +74,9 @@ export class SessionManager {
   private readonly sessions = new Map<string, Session>();
   private readonly options: SessionManagerOptions;
   private indexCache: { at: number; entries: Map<string, SessionFileMeta> } | null = null;
+  /** Read-only mirrors for host-owned sessions — kept OUT of `sessions` so
+   *  they never pollute the session list/index metadata. */
+  private readonly mirrors = new Map<string, Session>();
   private readonly fileCache = new Map<string, { mtimeMs: number; size: number; meta: SessionFileMeta }>();
   private liveCache: { at: number; instances: LiveInstance[]; mapped: Map<string, number> } = {
     at: 0,
@@ -174,6 +177,8 @@ export class SessionManager {
       }
       return existing;
     }
+    const oldMirror = this.mirrors.get(id);
+    if (oldMirror) return oldMirror;
     const meta = this.buildIndex().get(id);
     if (!meta) return null;
     if (this.liveCache.mapped.has(id)) {
@@ -189,7 +194,7 @@ export class SessionManager {
         'pi',
         true, // readOnly
       );
-      this.sessions.set(id, mirror);
+      this.mirrors.set(id, mirror);
       await mirror.start();
       return mirror;
     }
@@ -533,6 +538,17 @@ export class SessionManager {
       if (!live.running) await live.start();
       return live;
     }
+    const mirror = this.mirrors.get(id);
+    if (mirror) {
+      // Takeover of a host-owned mirror (kept out of `sessions`): convert it
+      // in place and move it into the managed map — SSE continuity preserved.
+      mirror.readOnly = false;
+      this.mirrors.delete(id);
+      this.sessions.set(id, mirror);
+      this.options.log.info({ sessionId: id }, 'takeover: mirror -> real agent');
+      if (!mirror.running) await mirror.start();
+      return mirror;
+    }
     const meta = this.buildIndex().get(id);
     if (!meta) return null;
     if (this.runningCount >= this.options.maxAgents) {
@@ -712,6 +728,8 @@ export class SessionManager {
 
   stopAll(): void {
     for (const s of this.sessions.values()) s.stop();
+    for (const m of this.mirrors.values()) m.stop();
+    this.mirrors.clear();
   }
 
   /**
@@ -731,6 +749,13 @@ export class SessionManager {
       error: null,
     };
     session.queue.push(item);
+    if (session.queue.filter((i) => i.status === 'queued' || i.status === 'running').length > 50) {
+      // Bound the durable file: drop finished items older than a day.
+      const cutoff = Date.now() - 86_400_000;
+      session.queue = session.queue.filter(
+        (i) => i.status === 'queued' || i.status === 'running' || (i.completedAt ?? 0) > cutoff,
+      );
+    }
     this.persistQueue(session);
     session.broadcast('queue_update', { items: session.queue });
     return item;
@@ -943,8 +968,27 @@ export class SessionManager {
     }
   }
 
-  /** Parse the session JSONL tail directly (same entry shape pi serves). */
+  private historyCache = new Map<string, { mtimeMs: number; size: number; messages: ChatMessage[] }>();
+
+  /** Parse the session JSONL tail directly (same entry shape pi serves).
+   *  Cached by (mtime,size) so polling/pagination don't re-parse unchanged
+   *  files (a 2MB file parse per request adds up). */
   private historyFromFile(file: string): ChatMessage[] {
+    const stat = fs.statSync(file);
+    const cached = this.historyCache.get(file);
+    if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+      return cached.messages;
+    }
+    const messages = this.parseHistoryFile(file);
+    this.historyCache.set(file, { mtimeMs: stat.mtimeMs, size: stat.size, messages });
+    if (this.historyCache.size > 200) {
+      const oldest = this.historyCache.keys().next().value as string;
+      this.historyCache.delete(oldest);
+    }
+    return messages;
+  }
+
+  private parseHistoryFile(file: string): ChatMessage[] {
     const stat = fs.statSync(file);
     const TAIL = 16 * 1024 * 1024;
     const start = Math.max(0, stat.size - TAIL);

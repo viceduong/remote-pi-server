@@ -46,12 +46,14 @@ export function registerRoutes(
 
   fastify.get('/api/status', async () => {
     const liveInstances = manager.getLiveInstances();
+    const mem = process.memoryUsage();
     return {
       ...publicConfig,
       maxAgents: config.REMOTE_PI_MAX_AGENTS,
       runningAgents: manager.runningCount,
       liveInstances,
       externalAgents: liveInstances.length,
+      memory: { heapUsedMB: Math.round(mem.heapUsed / 1048576), rssMB: Math.round(mem.rss / 1048576) },
       sessions: manager.list(),
     };
   });
