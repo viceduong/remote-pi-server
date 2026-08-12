@@ -195,6 +195,19 @@ export class SessionManager {
     return this.ensureRunning(id);
   }
 
+  /* ---------------- rename ---------------- */
+
+  /** Rename a session: pi persists it via set_session_name (session_renamed
+   *  entry) so the file — and every surface reading it — syncs. */
+  async rename(id: string, name: string): Promise<SessionSummary | null> {
+    const session = await this.ensureRunning(id);
+    if (!session) return null;
+    session.name = name;
+    await session.request({ type: 'set_session_name', name });
+    this.invalidateIndex();
+    return session.toSummary();
+  }
+
   /* ---------------- models ---------------- */
 
   async listModels(id: string): Promise<unknown> {

@@ -197,6 +197,21 @@ export function registerRoutes(
     }
   });
 
+  const RenameSchema = z.object({ name: z.string().min(1).max(80) });
+  fastify.post('/api/sessions/:id/name', async (req, reply) => {
+    const id = parseId(req, reply);
+    if (!id) return;
+    const body = RenameSchema.safeParse(req.body);
+    if (!body.success) return reply.code(400).send({ error: 'Invalid body' });
+    try {
+      const session = await manager.rename(id, body.data.name);
+      if (!session) return reply.code(404).send({ error: 'Session not found' });
+      return { session };
+    } catch (err) {
+      return reply.code(409).send({ error: (err as Error).message });
+    }
+  });
+
   fastify.get('/api/sessions/:id/models', async (req, reply) => {
     const id = parseId(req, reply);
     if (!id) return;

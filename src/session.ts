@@ -8,6 +8,8 @@ import { mapAgentMessage } from './history.js';
 import type { AgentMessage, AgentState, RpcEvent, RpcResponse, SessionPhase, SessionSummary } from './types.js';
 
 const EVENT_RING_CAPACITY = 500;
+/** Ring is byte-capped too — 500 × 2MB payloads would OOM the server. */
+const EVENT_RING_MAX_BYTES = 8 * 1024 * 1024;
 const RPC_TIMEOUT_MS = 10_000;
 const FILE_WATCH_DEBOUNCE_MS = 250;
 
@@ -174,10 +176,23 @@ export class Session {
     }
     if (obj.type === 'error') this.error = String((obj.error as { message?: string } | string) ?? 'agent error');
 
+    // file_update payloads are live-only (replay would double-append in the
+    // app) and can be huge — keep them OUT of the replay ring entirely.
+    if (obj.type === 'file_update') {
+      for (const sink of this.sinks) sink.send({ seq: ++this.seq, type: obj.type, data: obj });
+      return;
+    }
     const record: RingRecord = { seq: ++this.seq, type: obj.type, data: obj };
     this.ring.push(record);
-    if (this.ring.length > EVENT_RING_CAPACITY) {
-      this.ring.splice(0, this.ring.length - EVENT_RING_CAPACITY);
+    let bytes = 0;
+    for (const r of this.ring) bytes += JSON.stringify(r.data).length;
+    if (this.ring.length > EVENT_RING_CAPACITY || bytes > EVENT_RING_MAX_BYTES) {
+      const excess = Math.min(this.ring.length - EVENT_RING_CAPACITY, this.ring.length - 10);
+      if (excess > 0) this.ring.splice(0, excess);
+      while (this.ring.length > 10 && bytes > EVENT_RING_MAX_BYTES) {
+        bytes -= JSON.stringify(this.ring[0]!.data).length;
+        this.ring.shift();
+      }
     }
     for (const sink of this.sinks) sink.send(record);
   }
@@ -406,16 +421,13 @@ export class Session {
           if (entry.id) msgWithId.id = entry.id;
           const mapped = mapAgentMessage(msgWithId);
           if (!mapped) continue;
-          const rec: RingRecord = {
-            seq: ++this.seq,
-            type: 'file_update',
-            data: { type: 'file_update', message: mapped } as RpcEvent,
-          };
-          this.ring.push(rec);
-          if (this.ring.length > EVENT_RING_CAPACITY) {
-            this.ring.splice(0, this.ring.length - EVENT_RING_CAPACITY);
+          for (const sink of this.sinks) {
+            sink.send({
+              seq: ++this.seq,
+              type: 'file_update',
+              data: { type: 'file_update', message: mapped } as RpcEvent,
+            });
           }
-          for (const sink of this.sinks) sink.send(rec);
         } catch { /* skip malformed line */ }
       }
     } catch {
