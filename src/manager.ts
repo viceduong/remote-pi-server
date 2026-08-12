@@ -969,6 +969,8 @@ export class SessionManager {
   }
 
   private historyCache = new Map<string, { mtimeMs: number; size: number; messages: ChatMessage[] }>();
+  private historyCacheBytes = 0;
+  private static readonly HISTORY_CACHE_MAX_BYTES = 100 * 1024 * 1024;
 
   /** Parse the session JSONL tail directly (same entry shape pi serves).
    *  Cached by (mtime,size) so polling/pagination don't re-parse unchanged
@@ -980,9 +982,17 @@ export class SessionManager {
       return cached.messages;
     }
     const messages = this.parseHistoryFile(file);
+    // Byte-cap the cache, not just entry count: parsed arrays of big sessions
+    // are MBs each, and 200 of them would balloon past the heap limit.
+    let bytes = 0;
+    for (const m of messages) bytes += (m.text?.length ?? 0) + 64;
+    this.historyCacheBytes += bytes;
     this.historyCache.set(file, { mtimeMs: stat.mtimeMs, size: stat.size, messages });
-    if (this.historyCache.size > 200) {
+    while (this.historyCache.size > 0 && this.historyCacheBytes > SessionManager.HISTORY_CACHE_MAX_BYTES) {
       const oldest = this.historyCache.keys().next().value as string;
+      const old = this.historyCache.get(oldest);
+      if (!old) break;
+      this.historyCacheBytes -= old.messages.reduce((acc, m) => acc + (m.text?.length ?? 0) + 64, 0);
       this.historyCache.delete(oldest);
     }
     return messages;
