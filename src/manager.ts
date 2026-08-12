@@ -7,6 +7,7 @@ import { mapAgentMessage } from './history.js';
 import { manglePath } from './paths.js';
 import type { AgentMessage, AgentState, ChatMessage, LiveInstance, SessionSummary } from './types.js';
 import { probeLivePiInstances, type LivePiInstance } from './live.js';
+import { queueFilePath, type QueueItem } from './queue.js';
 
 export interface SessionManagerOptions {
   sessionDir: string;
@@ -719,24 +720,111 @@ export class SessionManager {
    * current turn ends, and surfaced as `pending` in /messages — so they can
    * never vanish on reload and never double-send.
    */
-  enqueuePrompt(session: Session, message: string): void {
-    session.queue.push(message);
+  enqueuePrompt(session: Session, message: string): QueueItem {
+    const item: QueueItem = {
+      id: crypto.randomUUID().replace(/-/g, '').slice(0, 16),
+      message,
+      status: 'queued',
+      queuedAt: Date.now(),
+      startedAt: null,
+      completedAt: null,
+      error: null,
+    };
+    session.queue.push(item);
+    this.persistQueue(session);
+    session.broadcast('queue_update', { items: session.queue });
+    return item;
   }
 
   /** Dispatch the next queued prompt when the agent is ready. */
   private dispatchQueued(session: Session): void {
-    const text = session.queue.shift();
-    if (!text || session.busy || session.phase === 'streaming') return;
+    const item = session.queue.shift();
+    if (!item || session.busy || session.phase === 'streaming') return;
+    item.status = 'running';
+    item.startedAt = Date.now();
+    this.persistQueue(session);
+    session.broadcast('queue_update', { items: session.queue });
     this.options.log.info({ sessionId: session.id }, 'dispatching queued prompt');
-    void session.request({ type: 'prompt', message: text }).catch(() => {
-      // Put it back if the dispatch failed — never lose a queued message.
-      session.queue.unshift(text);
+    void session.request({ type: 'prompt', message: item.message }).catch((err) => {
+      // Put it back if the dispatch failed — never lose a queued message —
+      // and retry shortly (the agent may not be fully ready yet).
+      this.options.log.warn({ sessionId: session.id, err: (err as Error).message }, 'queue dispatch failed, retrying');
+      item.status = 'queued';
+      item.startedAt = null;
+      session.queue.unshift(item);
+      this.persistQueue(session);
+      session.broadcast('queue_update', { items: session.queue });
+      setTimeout(() => this.dispatchQueued(session), 2000);
     });
   }
 
-  /** Wire a session's queue to its turn_end events. */
+  /** Wire a session's queue to its turn_end events + restore persisted state. */
   private wireQueue(session: Session): void {
+    this.restoreQueue(session);
     session.onIdle = () => this.dispatchQueued(session);
+    if (session.queue.length) this.dispatchQueued(session);
+  }
+
+  private persistQueue(session: Session): void {
+    try {
+      const file = queueFilePath(this.options.sessionDir, session.file);
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, JSON.stringify(session.queue));
+    } catch (err) {
+      this.options.log.warn({ err: (err as Error).message }, 'queue persist failed');
+    }
+  }
+
+  private restoreQueue(session: Session): void {
+    try {
+      const file = queueFilePath(this.options.sessionDir, session.file);
+      if (!fs.existsSync(file)) return;
+      const parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as QueueItem[];
+      if (Array.isArray(parsed)) {
+        session.queue = parsed.filter((i) => i && typeof i.id === 'string' && typeof i.message === 'string');
+      }
+    } catch { /* corrupt -> ignore */ }
+  }
+
+  /** Queue contents for a session (API). File-first: works even before the
+   *  session is loaded into memory (e.g. right after a server restart). */
+  getQueueItems(id: string): QueueItem[] | null {
+    const session = this.find(id);
+    if (!session) return null;
+    const file = queueFilePath(this.options.sessionDir, session.file);
+    if (!fs.existsSync(file)) return session.queue;
+    try {
+      return JSON.parse(fs.readFileSync(file, 'utf8')) as QueueItem[];
+    } catch {
+      return [];
+    }
+  }
+
+  /** Cancel a queued item. Returns false if unknown/not queued. */
+  cancelQueueItem(id: string, itemId: string): boolean {
+    const items = this.getQueueItems(id);
+    if (!items) return false;
+    const idx = items.findIndex((i) => i.id === itemId && i.status === 'queued');
+    if (idx < 0) return false;
+    items.splice(idx, 1);
+    // Persist to disk, then sync the in-memory session queue if loaded.
+    try {
+      const session = this.find(id);
+      const file = session ? queueFilePath(this.options.sessionDir, session.file) : null;
+      if (file) {
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        fs.writeFileSync(file, JSON.stringify(items));
+      }
+    } catch (err) {
+      this.options.log.warn({ err: (err as Error).message }, 'queue persist failed');
+    }
+    const session = this.sessions.get(id);
+    if (session) {
+      const i2 = session.queue.findIndex((i) => i.id === itemId);
+      if (i2 >= 0) session.queue.splice(i2, 1);
+      session.broadcast('queue_update', { items: session.queue });
+    }
+    return true;
   }
 
   /* ---------------- history ---------------- */

@@ -141,18 +141,37 @@ export function registerRoutes(
         queued = true;
       }
     }
+    let queueItemId: string | null = null;
     try {
       if (queued) {
         // Server-owned queue: held, dispatched on turn_end, never lost.
-        manager.enqueuePrompt(session, body.data.message);
-        return reply.code(202).send({ accepted: true, queued: true });
+        const item = manager.enqueuePrompt(session, body.data.message);
+        queueItemId = item.id;
+        return reply.code(202).send({ accepted: true, queued: true, queueItemId });
       }
       const cmd: Record<string, unknown> = { type: 'prompt', message: body.data.message };
       await session.request(cmd, 8000);
-      return reply.code(202).send({ accepted: true, queued: false });
+      return reply.code(202).send({ accepted: true, queued: false, queueItemId });
     } catch (err) {
       return reply.code(409).send({ error: (err as Error).message });
     }
+  });
+
+  fastify.get('/api/sessions/:id/queue', async (req, reply) => {
+    const id = parseId(req, reply);
+    if (!id) return;
+    const items = manager.getQueueItems(id);
+    if (!items) return reply.code(404).send({ error: 'Session not found' });
+    return { items };
+  });
+
+  fastify.delete('/api/sessions/:id/queue/:itemId', async (req, reply) => {
+    const id = parseId(req, reply);
+    if (!id) return;
+    const itemId = String((req.params as { itemId?: string }).itemId ?? '');
+    const ok = manager.cancelQueueItem(id, itemId);
+    if (!ok) return reply.code(404).send({ error: 'Queued item not found' });
+    return { ok: true };
   });
 
   fastify.get('/api/sessions/:id/messages', async (req, reply) => {

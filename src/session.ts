@@ -6,6 +6,7 @@ import type { Logger } from 'pino';
 import { spawnPiProcess } from './pi.js';
 import { mapAgentMessage } from './history.js';
 import type { AgentMessage, AgentState, RpcEvent, RpcResponse, SessionPhase, SessionSummary } from './types.js';
+import type { QueueItem } from './queue.js';
 
 const EVENT_RING_CAPACITY = 500;
 /** Ring is byte-capped too — 500 × 2MB payloads would OOM the server. */
@@ -54,8 +55,8 @@ export class Session {
   /** Last turn_start timestamp (queue-delivery watchdog uses it). */
   lastTurnStartAt = 0;
   /** Server-owned prompt queue (dispatched on turn_end — messages never
-   *  vanish and never double-send). */
-  queue: string[] = [];
+   *  vanish and never double-send). Durable: persisted to disk. */
+  queue: QueueItem[] = [];
   /** Called when a turn completes and the agent is ready for the next prompt. */
   onIdle: (() => void) | null = null;
   /** Runtime phase derived from the owner's event stream. */
@@ -162,7 +163,10 @@ export class Session {
     else if (obj.type === 'turn_end' || obj.type === 'agent_end') {
       this.busy = false;
       this.phase = 'awaitingInput';
-      if (this.onIdle) this.onIdle();
+      // Dispatch the queue only on agent_end: pi's internal isStreaming stays
+      // true between turn_end and agent_end, and a prompt sent there is
+      // rejected ("already processing").
+      if (obj.type === 'agent_end') this.onIdle?.();
     }
     else if (obj.type === 'message_update') {
       // NOTE: do NOT clear busy on per-message 'done'/'error' — a turn with
@@ -322,6 +326,13 @@ export class Session {
   }
 
   /* ---------------- SSE fan-out ---------------- */
+
+  /** Fan a synthetic event out to current subscribers (queue_update etc.). */
+  broadcast(type: string, data: Record<string, unknown>): void {
+    for (const sink of this.sinks) {
+      sink.send({ seq: ++this.seq, type, data: { type, ...data } as RpcEvent });
+    }
+  }
 
   subscribe(sink: EventSink): void {
     this.sinks.add(sink);
