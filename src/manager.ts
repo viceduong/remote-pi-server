@@ -944,6 +944,14 @@ export class SessionManager {
     }
   }
 
+  /** Per-session SSE sink counts (zombie-connection forensics). */
+  sinkCounts(): Record<string, number> {
+    const out: Record<string, number> = {};
+    for (const [id, s] of this.sessions) out[id] = s.sinkCount();
+    for (const [id, s] of this.mirrors) out[id] = s.sinkCount();
+    return out;
+  }
+
   async history(session: Session): Promise<ChatMessage[]> {
     try {
       const messages = this.historyFromFile(session.file);

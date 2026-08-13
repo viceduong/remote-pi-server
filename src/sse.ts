@@ -36,6 +36,7 @@ export function attachSse(
 
   let closed = false;
   let paused = false;
+  let pausedAt = 0;
   const pending: string[] = [];
 
   const flush = (): void => {
@@ -43,6 +44,7 @@ export function attachSse(
       const frame = pending.shift()!;
       if (!gzip.write(frame)) {
         paused = true;
+        pausedAt = Date.now();
         gzip.once('drain', flush);
         break;
       }
@@ -63,6 +65,7 @@ export function attachSse(
     // frame so clients receive SSE events incrementally.
     if (!ok) {
       paused = true;
+      pausedAt = Date.now();
       gzip.once('drain', flush);
     }
   };
@@ -81,6 +84,9 @@ export function attachSse(
   const sink = {
     send(record: { type: string; seq: number; data: unknown }): void {
       sendFrame(encodeFrame(record.type, record.seq, record.data));
+    },
+    close(): void {
+      cleanup();
     },
   };
 

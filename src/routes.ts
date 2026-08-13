@@ -54,6 +54,7 @@ export function registerRoutes(
       liveInstances,
       externalAgents: liveInstances.length,
       memory: { heapUsedMB: Math.round(mem.heapUsed / 1048576), rssMB: Math.round(mem.rss / 1048576) },
+      sinks: manager.sinkCounts(),
       sessions: manager.list(),
     };
   });

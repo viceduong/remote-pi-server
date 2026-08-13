@@ -49,6 +49,25 @@ async function main(): Promise<void> {
 
   await app.listen({ host: config.REMOTE_PI_HOST, port: config.REMOTE_PI_PORT });
 
+  // Memory + sink telemetry: the growth curve proves a leak or a fix. The
+  // 8GB OOM crashes (this turn's find) were the cause of the app-wide
+  // "renders unreliably" — the server died, SSE died with it.
+  const memTimer = setInterval(() => {
+    const mem = process.memoryUsage();
+    const sinks = manager.sinkCounts();
+    const sinkTotal = Object.values(sinks).reduce((a, b) => a + b, 0);
+    logger.info(
+      {
+        heapMB: Math.round(mem.heapUsed / 1048576),
+        rssMB: Math.round(mem.rss / 1048576),
+        sinkTotal,
+        sessions: Object.keys(sinks).length,
+      },
+      'telemetry',
+    );
+  }, 5 * 60_000);
+  memTimer.unref();
+
   logger.info({
     pi: piVersion ?? 'NOT FOUND (check PI_BIN / PATH)',
     url: `http://${config.REMOTE_PI_HOST}:${config.REMOTE_PI_PORT}`,

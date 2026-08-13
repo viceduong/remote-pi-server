@@ -24,6 +24,7 @@ export interface RingRecord {
 /** Destination for streamed events (SSE connection). */
 export interface EventSink {
   send(record: RingRecord): void;
+  close?(): void;
 }
 
 interface PendingRpc {
@@ -72,6 +73,18 @@ export class Session {
   private readonly ring: RingRecord[] = [];
   private readonly stderrTail: string[] = [];
   private readonly sinks = new Set<EventSink>();
+
+  sinkCount(): number {
+    return this.sinks.size;
+  }
+
+  closeOldestSink(): void {
+    const oldest = this.sinks.values().next().value as EventSink | undefined;
+    if (oldest) {
+      this.sinks.delete(oldest);
+      oldest.close?.();
+    }
+  }
   private readonly pending = new Map<string, PendingRpc>();
   private seq = 0;
   private rpcCounter = 0;
