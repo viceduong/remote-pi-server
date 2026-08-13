@@ -194,6 +194,9 @@ export function registerRoutes(
         // Queued-but-not-yet-written prompts (server-owned queue): the client
         // renders them as pending so they never vanish on reload.
         pending: before ? undefined : session.queue.map((item) => ({ text: item.message, queuedAt: item.queuedAt })),
+        // Working indicator: derived server-side so mirrors (TUI-owned
+        // sessions) also show it — RPC events don't exist for them.
+        working: before ? undefined : await manager.working(session),
         hasMore: before
           ? all.some((m) => (m.timestamp ?? 0) < (page[0]?.timestamp ?? 0))
           : all.length > limit,

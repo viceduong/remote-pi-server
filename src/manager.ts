@@ -925,6 +925,25 @@ export class SessionManager {
    * re-serializes every message). Falls back to RPC/temp-pi if the file is
    * unreadable.
    */
+  /**
+   * Server-derived working flag: our own process is mid-turn, or the file's
+   * last entry is a user prompt awaiting a reply and the file changed within
+   * the working window. Works for mirrors (TUI-owned sessions) where RPC
+   * events never reach clients.
+   */
+  async working(s: Session): Promise<boolean> {
+    if (s.busy || s.phase === 'streaming') return true;
+    try {
+      const stat = await fs.promises.stat(s.file);
+      if (Date.now() - stat.mtimeMs > 120_000) return false;
+      const messages = await this.history(s);
+      const last = messages[messages.length - 1];
+      return !!last && last.role === 'user';
+    } catch {
+      return false;
+    }
+  }
+
   async history(session: Session): Promise<ChatMessage[]> {
     try {
       const messages = this.historyFromFile(session.file);

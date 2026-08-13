@@ -455,6 +455,8 @@ export class Session {
       }
       this.fileOffset = stat.size;
       const text = buf.toString('utf8');
+      const mappedList: ReturnType<typeof mapAgentMessage>[] = [];
+      let lastRole: string | undefined;
       for (const line of text.split('\n')) {
         if (!line.trim()) continue;
         try {
@@ -464,14 +466,24 @@ export class Session {
           if (entry.id) msgWithId.id = entry.id;
           const mapped = mapAgentMessage(msgWithId);
           if (!mapped) continue;
-          for (const sink of this.sinks) {
-            sink.send({
-              seq: ++this.seq,
-              type: 'file_update',
-              data: { type: 'file_update', message: mapped } as RpcEvent,
-            });
-          }
+          lastRole = mapped.role;
+          mappedList.push(mapped);
         } catch { /* skip malformed line */ }
+      }
+      if (mappedList.length === 0) return;
+      // Server-derived working flag: file just changed + last entry is a user
+      // prompt awaiting a reply (or our own process is mid-turn). Survives
+      // client reconnects mid-turn (file_update events aren't replayable).
+      const fresh = Date.now() - stat.mtimeMs < 120_000;
+      const working = this.busy || this.phase === 'streaming' || (fresh && lastRole === 'user');
+      for (const mapped of mappedList) {
+        for (const sink of this.sinks) {
+          sink.send({
+            seq: ++this.seq,
+            type: 'file_update',
+            data: { type: 'file_update', message: mapped, working } as RpcEvent,
+          });
+        }
       }
     } catch {
       this.stopFileWatch();
