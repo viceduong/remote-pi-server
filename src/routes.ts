@@ -95,8 +95,10 @@ export function registerRoutes(
     if (!body.success) return reply.code(400).send({ error: 'Invalid body', issues: body.error.issues });
 
     // Write guard (pi-threads external-writer pattern): an external pi process
-    // owns this session — refusing prevents interleaved JSONL writes.
-    if (manager.isExternallyLive(id)) {
+    // owns this session — refusing prevents interleaved JSONL writes unless
+    // the client explicitly forces a takeover (iOS "Take over" button).
+    const force = (req.query as { force?: string }).force === '1' || (req.query as { force?: string }).force === 'true';
+    if (manager.isExternallyLive(id) && !force) {
       return reply.code(409).send({
         error: manager.isHostWriting(id)
           ? 'The host terminal is actively working on this session right now. Let it finish, then retry.'
