@@ -386,7 +386,10 @@ export class Session {
   }
 
   private async refreshState(): Promise<void> {
-    const st = await this.request<AgentState>({ type: 'get_state' });
+    // Extension-heavy Pi startups can take >10s before RPC is responsive.
+    // State priming is advisory; give it a longer window without weakening
+    // normal command timeouts.
+    const st = await this.request<AgentState>({ type: 'get_state' }, 30_000);
     if (st.sessionId) this.file = st.sessionFile ?? this.file;
     if (st.sessionName) this.name = st.sessionName;
     if (st.model) this.model = `${st.model.provider}/${st.model.modelId ?? st.model.id ?? ''}`;
