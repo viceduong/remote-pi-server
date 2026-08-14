@@ -750,11 +750,16 @@ export class SessionManager {
    * current turn ends, and surfaced as `pending` in /messages — so they can
    * never vanish on reload and never double-send.
    */
-  enqueuePrompt(session: Session, message: string): QueueItem {
+  enqueuePrompt(session: Session, message: string, clientMessageId?: string): QueueItem {
+    if (clientMessageId) {
+      const existing = session.queue.find((item) => item.clientMessageId === clientMessageId);
+      if (existing) return existing;
+    }
     const activeCount = session.queue.filter((i) => i.status === 'queued' || i.status === 'running').length;
     if (activeCount >= 50) throw new Error('Prompt queue is full');
     const item: QueueItem = {
       id: crypto.randomUUID().replace(/-/g, '').slice(0, 16),
+      ...(clientMessageId ? { clientMessageId } : {}),
       message,
       status: 'queued',
       queuedAt: Date.now(),
@@ -773,6 +778,11 @@ export class SessionManager {
     this.persistQueue(session);
     session.broadcast('queue_update', { items: session.queue });
     return item;
+  }
+
+  /** Trigger queue delivery after an idempotent submission. */
+  dispatchQueuedNow(session: Session): void {
+    this.dispatchQueued(session);
   }
 
   /** Dispatch the next queued prompt when the agent is ready. */
@@ -840,11 +850,17 @@ export class SessionManager {
   private persistQueue(session: Session): void {
     try {
       const file = queueFilePath(this.options.sessionDir, session.file);
-      fs.mkdirSync(path.dirname(file), { recursive: true });
-      fs.writeFileSync(file, JSON.stringify(session.queue));
+      this.writeQueueFile(file, session.queue);
     } catch (err) {
       this.options.log.warn({ err: (err as Error).message }, 'queue persist failed');
     }
+  }
+
+  private writeQueueFile(file: string, items: QueueItem[]): void {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const temp = `${file}.${process.pid}.tmp`;
+    fs.writeFileSync(temp, JSON.stringify(items));
+    fs.renameSync(temp, file);
   }
 
   private restoreQueue(session: Session): void {
@@ -886,8 +902,7 @@ export class SessionManager {
       const session = this.find(id);
       const file = session ? queueFilePath(this.options.sessionDir, session.file) : null;
       if (file) {
-        fs.mkdirSync(path.dirname(file), { recursive: true });
-        fs.writeFileSync(file, JSON.stringify(items));
+        this.writeQueueFile(file, items);
       }
     } catch (err) {
       this.options.log.warn({ err: (err as Error).message }, 'queue persist failed');

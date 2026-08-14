@@ -13,6 +13,8 @@ export type QueueStatus = 'queued' | 'running' | 'done' | 'failed';
 
 export interface QueueItem {
   id: string;
+  /** Client-generated idempotency key; optional for legacy API clients. */
+  clientMessageId?: string;
   message: string;
   status: QueueStatus;
   queuedAt: number;

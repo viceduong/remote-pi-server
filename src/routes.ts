@@ -14,6 +14,8 @@ const CreateSessionSchema = z.object({
 const TurnSchema = z.object({
   message: z.string().min(1).max(50_000),
   streamingBehavior: z.enum(['steer', 'followUp']).optional(),
+  // Client-generated idempotency key; legacy clients may omit it.
+  clientMessageId: z.string().regex(/^[A-Za-z0-9._:-]{1,128}$/).optional(),
 });
 
 // App-created ids are 16-hex; discovered pi session ids are UUIDs or <ts>_<uuid>.
@@ -144,6 +146,21 @@ export function registerRoutes(
     }
     let queueItemId: string | null = null;
     try {
+      // Idempotent clients use the durable queue even when the agent is idle.
+      // A lost HTTP response is therefore safe to retry.
+      if (body.data.clientMessageId && !body.data.streamingBehavior) {
+        const item = manager.enqueuePrompt(session, body.data.message, body.data.clientMessageId);
+        queueItemId = item.id;
+        if (item.status === 'failed') {
+          return reply.code(409).send({ error: item.error ?? 'Previously failed idempotent turn', code: 'turn_failed' });
+        }
+        manager.dispatchQueuedNow(session);
+        return reply.code(202).send({
+          accepted: true,
+          queued: item.status === 'queued' || item.status === 'running',
+          queueItemId,
+        });
+      }
       if (queued) {
         // Server-owned queue: held, dispatched on turn_end, never lost.
         const item = manager.enqueuePrompt(session, body.data.message);
@@ -205,7 +222,12 @@ export function registerRoutes(
         messages: page,
         // Queued-but-not-yet-written prompts (server-owned queue): the client
         // renders them as pending so they never vanish on reload.
-        pending: before ? undefined : session.queue.map((item) => ({ text: item.message, queuedAt: item.queuedAt })),
+        pending: before ? undefined : session.queue.map((item) => ({
+          id: item.id,
+          clientMessageId: item.clientMessageId ?? null,
+          text: item.message,
+          queuedAt: item.queuedAt,
+        })),
         // Working indicator: derived server-side so mirrors (TUI-owned
         // sessions) also show it — RPC events don't exist for them.
         working: before ? undefined : await manager.working(session),
