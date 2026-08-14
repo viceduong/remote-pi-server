@@ -7,9 +7,11 @@ import path from 'node:path';
  */
 const EnvSchema = z.object({
   REMOTE_PI_PORT: z.coerce.number().int().min(1).max(65535).default(8787),
-  REMOTE_PI_HOST: z.string().min(1).default('0.0.0.0'),
-  /** Empty string disables auth (LAN dev only — not recommended). */
+  // Bind loopback by default. Network exposure requires explicit host + token.
+  REMOTE_PI_HOST: z.string().min(1).default('127.0.0.1'),
+  /** Empty string is allowed only for loopback development. */
   REMOTE_PI_TOKEN: z.string().default(''),
+  REMOTE_PI_ALLOW_ANONYMOUS: z.string().default('0').transform((v) => v === '1' || v.toLowerCase() === 'true'),
   REMOTE_PI_NAME: z.string().min(1).optional(),
   REMOTE_PI_WORKDIR: z.string().min(1).default(process.cwd()),
   REMOTE_PI_SESSION_DIR: z.string().min(1).optional(),
@@ -29,7 +31,17 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Env {
       .join('\n');
     throw new Error(`Invalid configuration:\n${details}`);
   }
-  return parsed.data;
+  const config = parsed.data;
+  const loopback = config.REMOTE_PI_HOST === '127.0.0.1'
+    || config.REMOTE_PI_HOST === 'localhost'
+    || config.REMOTE_PI_HOST === '::1';
+  if (config.REMOTE_PI_TOKEN === 'CHANGE_ME') {
+    throw new Error('REMOTE_PI_TOKEN must be replaced; refusing placeholder secret');
+  }
+  if (!loopback && !config.REMOTE_PI_TOKEN && !config.REMOTE_PI_ALLOW_ANONYMOUS) {
+    throw new Error('REMOTE_PI_TOKEN is required when REMOTE_PI_HOST is not loopback');
+  }
+  return config;
 }
 
 /** pi's real default session storage (~/.pi/agent/sessions). */

@@ -30,8 +30,10 @@ describe('session busy tracking (mid-turn safety)', () => {
     s.handleEvent({ type: 'message_update', assistantMessageEvent: { type: 'done' } } as never);
     expect(s.busy).toBe(true);
 
-    // Only turn_end / agent_end clears it.
+    // turn_end is an internal gap; agent_end clears the reservation.
     s.handleEvent({ type: 'turn_end' } as never);
+    expect(s.busy).toBe(true);
+    s.handleEvent({ type: 'agent_end' } as never);
     expect(s.busy).toBe(false);
   });
 
@@ -58,6 +60,7 @@ describe('session phase state machine', () => {
     expect(s.phase).toBe('streaming');
     s.handleEvent({ type: 'agent_end' } as never);
     expect(s.phase).toBe('awaitingInput');
+    expect(s.busy).toBe(false);
   });
 
 });
@@ -71,6 +74,6 @@ describe('mid-turn protection (phase-authoritative busy)', () => {
     // The turn-route guard would see busyNow = busy || phase==='streaming'.
     expect(s.busy || s.phase === 'streaming').toBe(true);
     s.handleEvent({ type: 'turn_end' } as never);
-    expect(s.busy || s.phase === 'streaming').toBe(false);
+    expect(s.busy || s.phase === 'streaming').toBe(true);
   });
 });

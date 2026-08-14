@@ -56,13 +56,13 @@ interface SessionFileMeta {
 }
 
 const META_READ_LIMIT = 4096;
-const MESSAGE_SCAN_LIMIT = 2 * 1024 * 1024;
 const ACTIVE_WINDOW_MS = 5 * 60_000;
 /** A session file touched within this window means the agent is working NOW. */
 const WRITING_WINDOW_MS = 30_000;
 const INDEX_TTL_MS = 3_000;
 const PROBE_TTL_MS = 5_000;
 const MAX_LISTED = 250;
+const MAX_FILE_CACHE = 2_000;
 
 /**
  * Owns the session lifecycle and — importantly — discovers **all** pi sessions
@@ -77,6 +77,7 @@ export class SessionManager {
   /** Read-only mirrors for host-owned sessions — kept OUT of `sessions` so
    *  they never pollute the session list/index metadata. */
   private readonly mirrors = new Map<string, Session>();
+  private readonly startLocks = new Map<string, Promise<Session | null>>();
   private readonly fileCache = new Map<string, { mtimeMs: number; size: number; meta: SessionFileMeta }>();
   private liveCache: { at: number; instances: LiveInstance[]; mapped: Map<string, number> } = {
     at: 0,
@@ -172,9 +173,7 @@ export class SessionManager {
   async sessionForSSE(id: string): Promise<Session | null> {
     const existing = this.sessions.get(id);
     if (existing) {
-      if (!existing.running && !existing.readOnly) {
-        await existing.start();
-      }
+      if (!existing.running && !existing.readOnly) return this.ensureRunning(id);
       return existing;
     }
     const oldMirror = this.mirrors.get(id);
@@ -333,12 +332,19 @@ export class SessionManager {
         }
         const cached = this.fileCache.get(full);
         if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+          this.fileCache.delete(full);
+          this.fileCache.set(full, cached);
           out.set(cached.meta.id, cached.meta);
           continue;
         }
         const meta = this.readMeta(full, stat);
         if (meta) {
+          this.fileCache.delete(full);
           this.fileCache.set(full, { mtimeMs: stat.mtimeMs, size: stat.size, meta });
+          while (this.fileCache.size > MAX_FILE_CACHE) {
+            const oldest = this.fileCache.keys().next().value as string;
+            this.fileCache.delete(oldest);
+          }
           out.set(meta.id, meta);
         }
       }
@@ -365,7 +371,6 @@ export class SessionManager {
     let sessionName: string | null = null;
     let createdAt = Math.round(stat.mtimeMs);
     let messageCount = 0;
-    let scanned = 0;
     let lastMessageAt: number | null = null;
 
     const text = head.toString('utf8');
@@ -387,21 +392,9 @@ export class SessionManager {
         }
       } catch { /* skip unparseable line */ }
     }
-    // Count messages across the WHOLE file (2MB windows undercount big
-    // sessions). Cached per-file, so the scan cost is amortized.
-    {
-      const fd = fs.openSync(file, 'r');
-      const rest = Buffer.alloc(stat.size);
-      const n = fs.readSync(fd, rest, 0, rest.length, 0);
-      fs.closeSync(fd);
-      const hay = rest.subarray(0, n).toString('utf8');
-      let idx = hay.indexOf('"type":"message"');
-      while (idx >= 0) {
-        messageCount++;
-        idx = hay.indexOf('"type":"message"', idx + 1);
-        if (++scanned > 100_000) break;
-      }
-    }
+    // Count parsed JSONL entries in bounded chunks. Substring counting was
+    // wrong for whitespace/content and Buffer.alloc(stat.size) could OOM.
+    messageCount = this.countMessageEntries(file);
     // Last message timestamp: parse the tail line-by-line (a regex can match
     // `"type":"message"` inside message CONTENT and report a stale time).
     {
@@ -527,8 +520,21 @@ export class SessionManager {
 
   /** Resume any session (managed or discovered) by id. */
   async ensureRunning(id: string): Promise<Session | null> {
+    const existing = this.startLocks.get(id);
+    if (existing) return existing;
+    const pending = this.ensureRunningUnlocked(id);
+    this.startLocks.set(id, pending);
+    try {
+      return await pending;
+    } finally {
+      if (this.startLocks.get(id) === pending) this.startLocks.delete(id);
+    }
+  }
+
+  private async ensureRunningUnlocked(id: string): Promise<Session | null> {
     const live = this.sessions.get(id);
     if (live) {
+      if (live.readOnly && this.runningCount >= this.options.maxAgents) throw new BusyError();
       // Read-only mirror -> explicit takeover: convert in place so the SSE
       // subscribers (app) keep receiving agent events on the same Session.
       if (live.readOnly) {
@@ -540,6 +546,7 @@ export class SessionManager {
     }
     const mirror = this.mirrors.get(id);
     if (mirror) {
+      if (this.runningCount >= this.options.maxAgents) throw new BusyError();
       // Takeover of a host-owned mirror (kept out of `sessions`): convert it
       // in place and move it into the managed map — SSE continuity preserved.
       mirror.readOnly = false;
@@ -593,18 +600,23 @@ export class SessionManager {
 
   delete(id: string, purge: boolean): boolean {
     const session = this.sessions.get(id);
-    let file = session?.file;
+    const mirror = this.mirrors.get(id);
+    let file = session?.file ?? mirror?.file;
     if (session) {
       session.stop();
       this.sessions.delete(id);
-    } else if (!file) {
-      file = this.buildIndex().get(id)?.file;
     }
+    if (mirror) {
+      mirror.stop();
+      this.mirrors.delete(id);
+    }
+    if (!file) file = this.buildIndex().get(id)?.file;
     if (purge && file) {
       try { fs.unlinkSync(file); } catch { /* already gone */ }
+      try { fs.unlinkSync(queueFilePath(this.options.sessionDir, file)); } catch { /* already gone */ }
     }
     this.invalidateIndex();
-    return session !== undefined || file !== undefined;
+    return session !== undefined || mirror !== undefined || file !== undefined;
   }
 
   list(): SessionSummary[] {
@@ -739,6 +751,8 @@ export class SessionManager {
    * never vanish on reload and never double-send.
    */
   enqueuePrompt(session: Session, message: string): QueueItem {
+    const activeCount = session.queue.filter((i) => i.status === 'queued' || i.status === 'running').length;
+    if (activeCount >= 50) throw new Error('Prompt queue is full');
     const item: QueueItem = {
       id: crypto.randomUUID().replace(/-/g, '').slice(0, 16),
       message,
@@ -763,20 +777,19 @@ export class SessionManager {
 
   /** Dispatch the next queued prompt when the agent is ready. */
   private dispatchQueued(session: Session): void {
-    const item = session.queue.shift();
-    if (!item || session.busy || session.phase === 'streaming') return;
+    if (session.busy || session.phase === 'streaming') return;
+    const item = session.queue.find((candidate) => candidate.status === 'queued');
+    if (!item || !session.reservePrompt()) return;
     item.status = 'running';
     item.startedAt = Date.now();
     this.persistQueue(session);
     session.broadcast('queue_update', { items: session.queue });
     this.options.log.info({ sessionId: session.id }, 'dispatching queued prompt');
     void session.request({ type: 'prompt', message: item.message }).catch((err) => {
-      // Put it back if the dispatch failed — never lose a queued message —
-      // and retry shortly (the agent may not be fully ready yet).
       this.options.log.warn({ sessionId: session.id, err: (err as Error).message }, 'queue dispatch failed, retrying');
+      session.releasePrompt();
       item.status = 'queued';
       item.startedAt = null;
-      session.queue.unshift(item);
       this.persistQueue(session);
       session.broadcast('queue_update', { items: session.queue });
       setTimeout(() => this.dispatchQueued(session), 2000);
@@ -786,8 +799,42 @@ export class SessionManager {
   /** Wire a session's queue to its turn_end events + restore persisted state. */
   private wireQueue(session: Session): void {
     this.restoreQueue(session);
-    session.onIdle = () => this.dispatchQueued(session);
-    if (session.queue.length) this.dispatchQueued(session);
+    session.onIdle = () => {
+      this.completeRunning(session);
+      this.dispatchQueued(session);
+    };
+    session.onExit = () => {
+      // A running queued item was not delivered to a completed turn. Return
+      // it to queued state so restart/crash cannot lose the prompt.
+      let changed = false;
+      for (const item of session.queue) {
+        if (item.status === 'running') {
+          item.status = 'queued';
+          item.startedAt = null;
+          changed = true;
+        }
+      }
+      if (changed) {
+        this.persistQueue(session);
+        session.broadcast('queue_update', { items: session.queue });
+      }
+    };
+    if (session.queue.some((item) => item.status === 'queued')) this.dispatchQueued(session);
+  }
+
+  private completeRunning(session: Session): void {
+    let changed = false;
+    for (const item of session.queue) {
+      if (item.status === 'running') {
+        item.status = 'done';
+        item.completedAt = Date.now();
+        changed = true;
+      }
+    }
+    if (changed) {
+      this.persistQueue(session);
+      session.broadcast('queue_update', { items: session.queue });
+    }
   }
 
   private persistQueue(session: Session): void {
@@ -806,7 +853,9 @@ export class SessionManager {
       if (!fs.existsSync(file)) return;
       const parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as QueueItem[];
       if (Array.isArray(parsed)) {
-        session.queue = parsed.filter((i) => i && typeof i.id === 'string' && typeof i.message === 'string');
+        session.queue = parsed
+          .filter((i) => i && typeof i.id === 'string' && typeof i.message === 'string')
+          .map((i) => i.status === 'running' ? { ...i, status: 'queued', startedAt: null } : i);
       }
     } catch { /* corrupt -> ignore */ }
   }
@@ -867,7 +916,9 @@ export class SessionManager {
     }
     const srcFile = src.file;
     const srcName = src.name;
+    let clone: Session | null = null;
 
+    try {
     // 1) pi `clone`: duplicate the current branch into a new session/file.
     await src.request({ type: 'clone' });
     const st = await src.request<AgentState>({ type: 'get_state' });
@@ -881,7 +932,7 @@ export class SessionManager {
 
     // 3) boot the clone on its own file.
     const cloneId = this.nextId();
-    const clone = new Session(
+    clone = new Session(
       cloneId,
       name || `${srcName} (fork)`,
       cloneFile,
@@ -892,6 +943,7 @@ export class SessionManager {
       this.options.log.child({ fork: true }),
     );
     this.sessions.set(cloneId, clone);
+    this.wireQueue(clone);
     await clone.start();
     this.throwIfDead(clone);
 
@@ -911,11 +963,41 @@ export class SessionManager {
       this.options.log,
     );
     this.sessions.set(src.id, restored);
+    this.wireQueue(restored);
     await restored.start();
     this.throwIfDead(restored);
 
     this.invalidateIndex();
     return { session: clone.toSummary(), text: data.text ?? null };
+    } catch (err) {
+      if (clone) {
+        clone.stop();
+        this.sessions.delete(clone.id);
+      }
+      // Restore source ownership if clone/fork failed after detachment.
+      if (!this.sessions.has(src.id)) {
+        const restored = new Session(
+          src.id,
+          srcName,
+          srcFile,
+          this.options.bin,
+          src.workdir,
+          this.options.sessionDir,
+          this.options.extraArgs,
+          this.options.log,
+        );
+        this.sessions.set(src.id, restored);
+        this.wireQueue(restored);
+        try {
+          await restored.start();
+          this.throwIfDead(restored);
+        } catch (restoreErr) {
+          this.options.log.error({ sessionId: src.id, err: (restoreErr as Error).message }, 'source restore failed after fork error');
+        }
+      }
+      this.invalidateIndex();
+      throw err;
+    }
   }
 
 
@@ -1006,51 +1088,96 @@ export class SessionManager {
     const stat = fs.statSync(file);
     const cached = this.historyCache.get(file);
     if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+      // Touch entry for true LRU eviction.
+      this.historyCache.delete(file);
+      this.historyCache.set(file, cached);
       return cached.messages;
     }
     const messages = this.parseHistoryFile(file);
-    // Byte-cap the cache, not just entry count: parsed arrays of big sessions
-    // are MBs each, and 200 of them would balloon past the heap limit.
-    let bytes = 0;
-    for (const m of messages) bytes += (m.text?.length ?? 0) + 64;
+    // Replace old accounting before overwriting a changed file. The old code
+    // leaked the previous byte estimate on every file update.
+    if (cached) this.historyCacheBytes -= this.estimateMessagesBytes(cached.messages);
+    const bytes = this.estimateMessagesBytes(messages);
     this.historyCacheBytes += bytes;
     this.historyCache.set(file, { mtimeMs: stat.mtimeMs, size: stat.size, messages });
     while (this.historyCache.size > 0 && this.historyCacheBytes > SessionManager.HISTORY_CACHE_MAX_BYTES) {
       const oldest = this.historyCache.keys().next().value as string;
       const old = this.historyCache.get(oldest);
       if (!old) break;
-      this.historyCacheBytes -= old.messages.reduce((acc, m) => acc + (m.text?.length ?? 0) + 64, 0);
+      this.historyCacheBytes -= this.estimateMessagesBytes(old.messages);
       this.historyCache.delete(oldest);
     }
     return messages;
   }
 
-  private parseHistoryFile(file: string): ChatMessage[] {
-    const stat = fs.statSync(file);
-    const TAIL = 16 * 1024 * 1024;
-    const start = Math.max(0, stat.size - TAIL);
+  private estimateMessagesBytes(messages: ChatMessage[]): number {
+    return messages.reduce((total, message) => {
+      const calls = message.toolCalls.reduce((n, call) => n + call.name.length + JSON.stringify(call.arguments).length + 64, 0);
+      return total + (message.text?.length ?? 0) + (message.thinking?.length ?? 0) + calls + 128;
+    }, 0);
+  }
+
+  private countMessageEntries(file: string): number {
     const fd = fs.openSync(file, 'r');
-    const buf = Buffer.alloc(stat.size - start);
+    const chunk = Buffer.alloc(1024 * 1024);
+    let carry = '';
+    let count = 0;
+    const consume = (line: string) => {
+      if (!line.trim() || count >= 100_000) return;
+      try {
+        const entry = JSON.parse(line) as { type?: string };
+        if (entry.type === 'message') count++;
+      } catch { /* partial/corrupt line */ }
+    };
     try {
-      fs.readSync(fd, buf, 0, buf.length, start);
+      let n = 0;
+      do {
+        n = fs.readSync(fd, chunk, 0, chunk.length, null);
+        if (!n) break;
+        const text = carry + chunk.subarray(0, n).toString('utf8');
+        const lines = text.split('\n');
+        carry = lines.pop() ?? '';
+        for (const line of lines) consume(line);
+      } while (count < 100_000);
+      if (count < 100_000) consume(carry);
     } finally {
       fs.closeSync(fd);
     }
+    return count;
+  }
+
+  private parseHistoryFile(file: string): ChatMessage[] {
+    const fd = fs.openSync(file, 'r');
+    const chunk = Buffer.alloc(1024 * 1024);
     const out: ChatMessage[] = [];
-    const lines = buf.toString('utf8').split('\n');
-    for (const line of lines) {
-      if (!line.trim()) continue;
+    let carry = '';
+    const consume = (line: string) => {
+      if (!line.trim()) return;
       let entry: { type?: string; id?: string; message?: AgentMessage };
       try {
-        entry = JSON.parse(line) as { type?: string; message?: AgentMessage };
+        entry = JSON.parse(line) as { type?: string; id?: string; message?: AgentMessage };
       } catch {
-        continue;
+        return;
       }
-      if (entry.type !== 'message' || !entry.message) continue;
+      if (entry.type !== 'message' || !entry.message) return;
       const msgWithId = { ...entry.message } as AgentMessage;
       if (entry.id) msgWithId.id = entry.id;
       const mapped = mapAgentMessage(msgWithId);
       if (mapped) out.push(mapped);
+    };
+    try {
+      let n = 0;
+      do {
+        n = fs.readSync(fd, chunk, 0, chunk.length, null);
+        if (!n) break;
+        const text = carry + chunk.subarray(0, n).toString('utf8');
+        const lines = text.split('\n');
+        carry = lines.pop() ?? '';
+        for (const line of lines) consume(line);
+      } while (n > 0);
+      consume(carry);
+    } finally {
+      fs.closeSync(fd);
     }
     return out;
   }

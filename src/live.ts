@@ -58,73 +58,27 @@ function readProcCwd(pid: number): string | null {
 /* ---------------- Windows ---------------- */
 
 async function probeWindows(): Promise<LivePiInstance[]> {
+  // Keep this probe dependency-free. The old embedded C# PEB reader used
+  // invalid array declarations, so Add-Type failed and live protection became
+  // silently disabled. Recency mapping remains safe as a fallback when cwd is
+  // unavailable; the command line is still retained for diagnostics.
   const script = `
 $ErrorActionPreference = 'SilentlyContinue'
-$items = Get-CimInstance Win32_Process -Filter "Name='node.exe'" |
-  Where-Object { $_.CommandLine -match 'pi-coding-agent' } |
+$items = Get-CimInstance Win32_Process |
+  Where-Object { $_.Name -in @('node.exe','cmd.exe') -and $_.CommandLine -match 'pi-coding-agent[\\\\/]dist[\\\\/]cli\\.js' } |
   ForEach-Object {
     [PSCustomObject]@{
-      pid = $_.ProcessId
+      pid = [int]$_.ProcessId
       started = $_.CreationDate
-      args = $_.CommandLine
-      cwd = (Get-ProcessCwd $_.ProcessId)
+      args = [string]$_.CommandLine
+      cwd = $null
     }
   }
 $items | ConvertTo-Json -Compress
 `;
-  // P/Invoke helper for process cwd (NtQueryInformationProcess -> PEB -> RTL_USER_PROCESS_PARAMETERS).
-  const helper = `
-function Get-ProcessCwd([int]$ProcId) {
-  $sig = @'
-using System;
-using System.Runtime.InteropServices;
-public static class ProcCwd {
-  [StructLayout(LayoutKind.Sequential)] public struct PROCESS_BASIC_INFORMATION {
-    public IntPtr ExitStatus; public IntPtr PebBaseAddress; public IntPtr AffinityMask;
-    public IntPtr BasePriority; public IntPtr UniqueProcessId; public IntPtr InheritedFromUniqueProcessId;
-  }
-  [StructLayout(LayoutKind.Sequential)] public struct UNICODE_STRING {
-    public ushort Length; public ushort MaxLength; public IntPtr Buffer;
-  }
-  [StructLayout(LayoutKind.Sequential)] public struct RTL_USER_PROCESS_PARAMETERS {
-    public byte Reserved1[16]; public IntPtr Reserved2[10];
-    public UNICODE_STRING ImagePathName; public UNICODE_STRING CommandLine;
-  }
-  [StructLayout(LayoutKind.Sequential)] public struct PEB {
-    public byte Reserved1[2]; public byte BeingDebugged; public byte Reserved2[1];
-    public IntPtr Reserved3[2]; public IntPtr Ldr; public IntPtr ProcessParameters;
-  }
-  [DllImport("kernel32.dll", SetLastError=true)] public static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
-  [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h);
-  [DllImport("ntdll.dll")] public static extern int NtQueryInformationProcess(IntPtr h, int cls, ref PROCESS_BASIC_INFORMATION info, int len, out int ret);
-  [DllImport("kernel32.dll")] public static extern bool ReadProcessMemory(IntPtr h, IntPtr addr, out IntPtr buf, IntPtr size, out IntPtr read);
-  [DllImport("kernel32.dll")] public static extern bool ReadProcessMemory(IntPtr h, IntPtr addr, byte[] buf, IntPtr size, out IntPtr read);
-  public static string Cwd(int pid) {
-    IntPtr h = OpenProcess(0x0400, false, pid);
-    if (h == IntPtr.Zero) return null;
-    try {
-      PROCESS_BASIC_INFORMATION pbi = new PROCESS_BASIC_INFORMATION();
-      int ret;
-      if (NtQueryInformationProcess(h, 0, ref pbi, Marshal.SizeOf(pbi), out ret) != 0) return null;
-      IntPtr paramsAddr;
-      IntPtr read;
-      if (!ReadProcessMemory(h, pbi.PebBaseAddress, out paramsAddr, new IntPtr(IntPtr.Size), out read)) return null;
-      if (IntPtr.Size == 8) paramsAddr = Marshal.ReadIntPtr(paramsAddr, 0x20);
-      else paramsAddr = Marshal.ReadIntPtr(paramsAddr, 0x10);
-      byte[] buf = new byte[1024];
-      if (!ReadProcessMemory(h, paramsAddr, buf, new IntPtr(buf.Length), out read)) return null;
-      return System.Text.Encoding.Unicode.GetString(buf).Split('\\0')[0];
-    } finally { CloseHandle(h); }
-  }
-}
-'@
-  Add-Type -TypeDefinition $sig
-  try { return [ProcCwd]::Cwd($ProcId) } catch { return $null }
-}
-`;
   const { stdout } = await execFileAsync(
     'powershell',
-    ['-NoProfile', '-NonInteractive', '-Command', `${helper}\n${script}`],
+    ['-NoProfile', '-NonInteractive', '-Command', script],
     { maxBuffer: 4 * 1024 * 1024, windowsHide: true },
   );
   try {

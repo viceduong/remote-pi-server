@@ -3,7 +3,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import type { ChildProcess } from 'node:child_process';
 import type { Logger } from 'pino';
-import { spawnPiProcess } from './pi.js';
+import { killPiProcess, spawnPiProcess } from './pi.js';
 import { mapAgentMessage } from './history.js';
 import type { AgentMessage, AgentState, RpcEvent, RpcResponse, SessionPhase, SessionSummary } from './types.js';
 import type { QueueItem } from './queue.js';
@@ -13,6 +13,7 @@ const EVENT_RING_CAPACITY = 500;
 const EVENT_RING_MAX_BYTES = 8 * 1024 * 1024;
 const RPC_TIMEOUT_MS = 10_000;
 const FILE_WATCH_DEBOUNCE_MS = 250;
+const MAX_RPC_LINE_BYTES = 16 * 1024 * 1024;
 
 /** One event record in the replay ring. */
 export interface RingRecord {
@@ -60,6 +61,8 @@ export class Session {
   queue: QueueItem[] = [];
   /** Called when a turn completes and the agent is ready for the next prompt. */
   onIdle: (() => void) | null = null;
+  /** Called whenever the child exits so durable queue state can recover. */
+  onExit: (() => void) | null = null;
   /** Runtime phase derived from the owner's event stream. */
   phase: SessionPhase = 'idle';
   /** Read-only mirror mode: file watcher only, no pi process (convertible). */
@@ -71,6 +74,7 @@ export class Session {
   private proc: ChildProcess | null = null;
   private buffer = '';
   private readonly ring: RingRecord[] = [];
+  private ringBytes = 0;
   private readonly stderrTail: string[] = [];
   private readonly sinks = new Set<EventSink>();
 
@@ -89,12 +93,15 @@ export class Session {
   private seq = 0;
   private rpcCounter = 0;
   private stopping = false;
+  private restartTimer: NodeJS.Timeout | null = null;
+  private promptReserved = false;
   /** True once the child process has terminated (spawn failure or exit). */
   closed = false;
 
   /* ----- file-tail live push (host/other-client activity) ----- */
   private fileWatcher: fs.FSWatcher | null = null;
   private fileOffset = 0;
+  private fileRemainder = '';
   private watchTimer: NodeJS.Timeout | null = null;
 
   constructor(
@@ -126,13 +133,27 @@ export class Session {
     return this.proc?.pid ?? null;
   }
 
+  reservePrompt(): boolean {
+    if (this.promptReserved || this.busy || this.phase === 'streaming') return false;
+    this.promptReserved = true;
+    return true;
+  }
+
+  releasePrompt(): void {
+    this.promptReserved = false;
+  }
+
   /* ---------------- RPC plumbing ---------------- */
 
   /** Send a fire-and-forget command (e.g. abort). */
   send(obj: Record<string, unknown>): boolean {
     if (!this.proc?.stdin || this.proc.stdin.destroyed) return false;
-    this.proc.stdin.write(`${JSON.stringify(obj)}\n`);
-    return true;
+    try {
+      this.proc.stdin.write(`${JSON.stringify(obj)}\n`);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /** Send a command and await its `response` record. */
@@ -153,7 +174,13 @@ export class Session {
         reject,
         timer,
       });
-      proc.stdin.write(`${JSON.stringify({ ...obj, id })}\n`);
+      try {
+        proc.stdin.write(`${JSON.stringify({ ...obj, id })}\n`);
+      } catch (err) {
+        clearTimeout(timer);
+        this.pending.delete(id);
+        reject(err as Error);
+      }
     });
   }
 
@@ -173,13 +200,16 @@ export class Session {
       this.lastTurnStartAt = Date.now();
       this.phase = 'streaming';
     }
-    else if (obj.type === 'turn_end' || obj.type === 'agent_end') {
+    else if (obj.type === 'turn_end') {
+      // Pi can still be internally processing between turn_end and agent_end.
+      // Keep busy=true so a concurrent prompt cannot enter that gap.
+      this.phase = 'awaitingInput';
+    }
+    else if (obj.type === 'agent_end') {
       this.busy = false;
       this.phase = 'awaitingInput';
-      // Dispatch the queue only on agent_end: pi's internal isStreaming stays
-      // true between turn_end and agent_end, and a prompt sent there is
-      // rejected ("already processing").
-      if (obj.type === 'agent_end') this.onIdle?.();
+      this.promptReserved = false;
+      this.onIdle?.();
     }
     else if (obj.type === 'message_update') {
       // NOTE: do NOT clear busy on per-message 'done'/'error' — a turn with
@@ -196,27 +226,29 @@ export class Session {
     // file_update payloads are live-only (replay would double-append in the
     // app) and can be huge — keep them OUT of the replay ring entirely.
     if (obj.type === 'file_update') {
-      for (const sink of this.sinks) sink.send({ seq: ++this.seq, type: obj.type, data: obj });
+      const record: RingRecord = { seq: ++this.seq, type: obj.type, data: obj };
+      for (const sink of this.sinks) sink.send(record);
       return;
     }
     const wire = this.trimEventForWire(obj);
     const record: RingRecord = { seq: ++this.seq, type: wire.type, data: wire };
     this.ring.push(record);
-    let bytes = 0;
-    for (const r of this.ring) bytes += JSON.stringify(r.data).length;
-    if (this.ring.length > EVENT_RING_CAPACITY || bytes > EVENT_RING_MAX_BYTES) {
-      const excess = Math.min(this.ring.length - EVENT_RING_CAPACITY, this.ring.length - 10);
-      if (excess > 0) this.ring.splice(0, excess);
-      while (this.ring.length > 10 && bytes > EVENT_RING_MAX_BYTES) {
-        bytes -= JSON.stringify(this.ring[0]!.data).length;
-        this.ring.shift();
-      }
+    this.ringBytes += Buffer.byteLength(JSON.stringify(record.data));
+    while (this.ring.length > EVENT_RING_CAPACITY || this.ringBytes > EVENT_RING_MAX_BYTES) {
+      const oldest = this.ring.shift();
+      if (!oldest) break;
+      this.ringBytes -= Buffer.byteLength(JSON.stringify(oldest.data));
     }
     for (const sink of this.sinks) sink.send(record);
   }
 
   private onStdoutChunk(chunk: Buffer): void {
     this.buffer += chunk.toString('utf8');
+    if (Buffer.byteLength(this.buffer, 'utf8') > MAX_RPC_LINE_BYTES) {
+      const newline = this.buffer.indexOf('\n');
+      this.buffer = newline >= 0 ? this.buffer.slice(newline + 1) : '';
+      this.log.warn({ sessionId: this.id }, 'pi RPC line exceeded safety limit');
+    }
     let idx: number;
     while ((idx = this.buffer.indexOf('\n')) >= 0) {
       const line = this.buffer.slice(0, idx).replace(/\r$/, '');
@@ -241,6 +273,7 @@ export class Session {
   async startReadOnly(): Promise<void> {
     if (this.proc) return;
     this.fileOffset = 0;
+    this.fileRemainder = '';
     this.startFileWatch();
   }
 
@@ -258,9 +291,17 @@ export class Session {
     this.log.info({ sessionId: this.id }, `spawn pi ${this.bin} ${args.join(' ')}`);
 
     const child = spawnPiProcess(this.bin, args, this.workdir);
+    if (this.restartTimer) {
+      clearTimeout(this.restartTimer);
+      this.restartTimer = null;
+    }
     this.proc = child;
     this.buffer = '';
     this.stopping = false;
+    this.promptReserved = false;
+    this.closed = false;
+    this.error = null;
+    this.phase = 'idle';
 
     child.stdout?.on('data', (d: Buffer) => this.onStdoutChunk(d));
     child.stderr?.on('data', (d: Buffer) => {
@@ -275,53 +316,63 @@ export class Session {
       this.log.error({ sessionId: this.id, err: err.message }, 'pi spawn failed');
     });
 
-    child.on('close', (code) => {
+    child.on('close', (code, signal) => {
       // ALARM: any exit while the agent was mid-turn is logged as ERROR even
       // if our own stop() did it (the guards should prevent that — if this
       // fires, a caller is stopping a streaming agent and we need to know).
       if (this.phase === 'streaming' || this.busy) {
         this.log.error(
-          { sessionId: this.id, code, stopping: this.stopping, phase: this.phase, busy: this.busy },
+          { sessionId: this.id, code, signal, stopping: this.stopping, phase: this.phase, busy: this.busy },
           'agent stopped MID-TURN',
         );
-        for (const sink of this.sinks) {
-          sink.send({
-            seq: ++this.seq,
-            type: 'agent_crashed',
-            data: { type: 'agent_crashed', code, midTurn: true },
-          });
-        }
+        const crashRecord = {
+          seq: ++this.seq,
+          type: 'agent_crashed',
+          data: { type: 'agent_crashed', code, midTurn: true } as RpcEvent,
+        };
+        for (const sink of this.sinks) sink.send(crashRecord);
       }
-      const unexpected = code !== 0 && !this.stopping;
+      // Signal exits report code=null. They are still unexpected unless our
+      // own stop() initiated them, and must be recovered.
+      const unexpected = !this.stopping && (code !== 0 || signal !== null);
       if (unexpected) {
         this.log.error(
           { sessionId: this.id, code, stderr: this.stderrTail.slice(-20) },
           'pi exited unexpectedly',
         );
-        for (const sink of this.sinks) {
-          sink.send({
-            seq: ++this.seq,
-            type: 'agent_crashed',
-            data: { type: 'agent_crashed', code, stderr: this.stderrTail.slice(-20) },
-          });
-        }
+        const crashRecord = {
+          seq: ++this.seq,
+          type: 'agent_crashed',
+          data: { type: 'agent_crashed', code, stderr: this.stderrTail.slice(-20) } as RpcEvent,
+        };
+        for (const sink of this.sinks) sink.send(crashRecord);
         // Auto-recovery: respawn (resume) shortly after an unexpected exit.
-        setTimeout(() => {
-          if (!this.proc) void this.start().catch(() => {});
+        this.restartTimer = setTimeout(() => {
+          this.restartTimer = null;
+          if (!this.proc && !this.stopping) void this.start().catch(() => {});
         }, 1000);
       }
-      this.log.info({ sessionId: this.id, code }, 'pi exited');
+      this.log.info({ sessionId: this.id, code, signal }, 'pi exited');
       this.proc = null;
       this.closed = true;
       this.busy = false;
+      this.promptReserved = false;
       this.phase = 'terminated';
       for (const p of this.pending.values()) {
         clearTimeout(p.timer);
         p.reject(new Error('Agent exited'));
       }
       this.pending.clear();
-      for (const sink of this.sinks) sink.send({ seq: ++this.seq, type: 'agent_exited', data: { type: 'agent_exited', code } });
-      this.sinks.clear();
+      this.onExit?.();
+      const exitRecord = {
+        seq: ++this.seq,
+        type: 'agent_exited',
+        data: { type: 'agent_exited', code } as RpcEvent,
+      };
+      for (const sink of [...this.sinks]) {
+        sink.send(exitRecord);
+        sink.close?.();
+      }
     });
 
     // Give the RPC endpoint a beat to boot, then prime metadata.
@@ -340,19 +391,24 @@ export class Session {
     if (st.sessionName) this.name = st.sessionName;
     if (st.model) this.model = `${st.model.provider}/${st.model.modelId ?? st.model.id ?? ''}`;
     if (typeof st.messageCount === 'number') this.messageCount = st.messageCount;
-    if (st.isStreaming) this.busy = true;
+    if (st.isStreaming) {
+      this.busy = true;
+      this.phase = 'streaming';
+    }
   }
 
   /** Terminate the child process. Safe to call multiple times. */
   stop(): void {
-    if (!this.proc || this.stopping) return;
+    if (this.restartTimer) {
+      clearTimeout(this.restartTimer);
+      this.restartTimer = null;
+    }
     this.stopping = true;
-    try {
-      this.proc.stdin?.end();
-    } catch { /* ignore */ }
-    try {
-      this.proc.kill();
-    } catch { /* ignore */ }
+    this.promptReserved = false;
+    const proc = this.proc;
+    if (!proc) return;
+    try { proc.stdin?.end(); } catch { /* ignore */ }
+    killPiProcess(proc);
   }
 
   /* ---------------- SSE fan-out ---------------- */
@@ -381,12 +437,14 @@ export class Session {
 
   subscribe(sink: EventSink): void {
     this.sinks.add(sink);
-    if (this.sinks.size === 1) this.startFileWatch();
+    // Bridge-owned sessions already stream canonical RPC events. Watching
+    // their own JSONL duplicates every message; mirrors alone need the tailer.
+    if (this.sinks.size === 1 && this.readOnly) this.startFileWatch();
   }
 
   unsubscribe(sink: EventSink): void {
     this.sinks.delete(sink);
-    if (this.sinks.size === 0) this.stopFileWatch();
+    if (this.sinks.size === 0 && this.readOnly) this.stopFileWatch();
   }
 
   /** Replay events after `lastSeq` (for Last-Event-ID). */
@@ -399,7 +457,8 @@ export class Session {
     this.stopFileWatch();
     this.file = newFile;
     this.fileOffset = 0;
-    if (this.sinks.size > 0) this.startFileWatch();
+    this.fileRemainder = '';
+    if (this.sinks.size > 0 && this.readOnly) this.startFileWatch();
   }
 
   /* ----- file-watch live push ----- */
@@ -424,8 +483,10 @@ export class Session {
       this.fileWatcher.on('error', () => this.stopFileWatch());
       try {
         this.fileOffset = fs.statSync(this.file).size;
+        this.fileRemainder = '';
       } catch {
         this.fileOffset = 0; // file not created yet
+        this.fileRemainder = '';
       }
     } catch {
       this.fileWatcher = null;
@@ -455,8 +516,9 @@ export class Session {
     try {
       const stat = fs.statSync(this.file);
       if (stat.size < this.fileOffset) {
-        this.fileOffset = stat.size; // file rewritten (compaction) — skip burst
-        return;
+        // Compaction/rewrite: restart from a clean JSONL boundary.
+        this.fileOffset = 0;
+        this.fileRemainder = '';
       }
       if (stat.size === this.fileOffset) return;
       const fd = fs.openSync(this.file, 'r');
@@ -466,11 +528,13 @@ export class Session {
       } finally {
         fs.closeSync(fd);
       }
-      this.fileOffset = stat.size;
-      const text = buf.toString('utf8');
+      const text = this.fileRemainder + buf.toString('utf8');
+      const parts = text.split('\n');
+      this.fileRemainder = parts.pop() ?? '';
+      this.fileOffset = stat.size - Buffer.byteLength(this.fileRemainder, 'utf8');
       const mappedList: ReturnType<typeof mapAgentMessage>[] = [];
       let lastRole: string | undefined;
-      for (const line of text.split('\n')) {
+      for (const line of parts) {
         if (!line.trim()) continue;
         try {
           const entry = JSON.parse(line) as { type?: string; id?: string; message?: AgentMessage };

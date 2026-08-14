@@ -28,7 +28,7 @@ export function registerRoutes(
   fastify.addHook('onRequest', async (req, reply) => {
     if (req.url === '/api/health') return;
     if (!authorized(req, config.REMOTE_PI_TOKEN)) {
-      reply.code(401).send({ error: 'Unauthorized' });
+      return reply.code(401).send({ error: 'Unauthorized' });
     }
   });
 
@@ -93,20 +93,14 @@ export function registerRoutes(
     if (!body.success) return reply.code(400).send({ error: 'Invalid body', issues: body.error.issues });
 
     // Write guard (pi-threads external-writer pattern): an external pi process
-    // owns this session — refusing prevents interleaved JSONL writes. force=1
-    // only bypasses while the host agent is IDLE (not actively writing), so
-    // app and host turns can never run concurrently.
-    const force = (req.query as { force?: string }).force === '1';
+    // owns this session — refusing prevents interleaved JSONL writes.
     if (manager.isExternallyLive(id)) {
-      const hostWriting = manager.isHostWriting(id);
-      if (!force || hostWriting) {
-        return reply.code(409).send({
-          error: hostWriting
-            ? 'The host terminal is actively working on this session right now. Let it finish, then retry.'
-            : 'Session is live on the host (an external pi process is using it). Stop it there, or resume anyway with ?force=1.',
-          code: 'session_live',
-        });
-      }
+      return reply.code(409).send({
+        error: manager.isHostWriting(id)
+          ? 'The host terminal is actively working on this session right now. Let it finish, then retry.'
+          : 'Session is live on the host. Stop the host Pi process before sending from RemotePi.',
+        code: 'session_live',
+      });
     }
 
     try {
@@ -140,8 +134,12 @@ export function registerRoutes(
         if (verifiedBusy) session.phase = 'streaming';
       }
       if (session.busy) {
-        behavior = 'followUp';
-        queued = true;
+        // Explicit steer/followUp is delegated to Pi; otherwise use the
+        // durable server queue. Never raw-send a prompt during a turn.
+        if (!behavior) {
+          behavior = 'followUp';
+          queued = true;
+        }
       }
     }
     let queueItemId: string | null = null;
@@ -152,8 +150,21 @@ export function registerRoutes(
         queueItemId = item.id;
         return reply.code(202).send({ accepted: true, queued: true, queueItemId });
       }
+      // Reserve idle sessions before the RPC write so concurrent HTTP requests
+      // cannot both observe idle and send two prompts.
+      const reserved = busyNow && behavior ? true : session.reservePrompt();
+      if (!reserved) {
+        const item = manager.enqueuePrompt(session, body.data.message);
+        return reply.code(202).send({ accepted: true, queued: true, queueItemId: item.id });
+      }
       const cmd: Record<string, unknown> = { type: 'prompt', message: body.data.message };
-      await session.request(cmd, 8000);
+      if (behavior) cmd.streamingBehavior = behavior;
+      try {
+        await session.request(cmd, 8000);
+      } catch (err) {
+        session.releasePrompt();
+        throw err;
+      }
       return reply.code(202).send({ accepted: true, queued: false, queueItemId });
     } catch (err) {
       return reply.code(409).send({ error: (err as Error).message });
@@ -226,6 +237,7 @@ export function registerRoutes(
   fastify.post('/api/sessions/:id/name', async (req, reply) => {
     const id = parseId(req, reply);
     if (!id) return;
+    if (rejectExternalMutation(manager, id, reply)) return;
     const body = RenameSchema.safeParse(req.body);
     if (!body.success) return reply.code(400).send({ error: 'Invalid body' });
     try {
@@ -240,6 +252,7 @@ export function registerRoutes(
   fastify.get('/api/sessions/:id/models', async (req, reply) => {
     const id = parseId(req, reply);
     if (!id) return;
+    if (rejectExternalMutation(manager, id, reply)) return;
     try {
       const data = await manager.listModels(id);
       return { models: data };
@@ -252,6 +265,7 @@ export function registerRoutes(
   fastify.post('/api/sessions/:id/models', async (req, reply) => {
     const id = parseId(req, reply);
     if (!id) return;
+    if (rejectExternalMutation(manager, id, reply)) return;
     const body = SetModelSchema.safeParse(req.body);
     if (!body.success) return reply.code(400).send({ error: 'Invalid body' });
     try {
@@ -265,6 +279,7 @@ export function registerRoutes(
   fastify.post('/api/sessions/:id/models/cycle', async (req, reply) => {
     const id = parseId(req, reply);
     if (!id) return;
+    if (rejectExternalMutation(manager, id, reply)) return;
     try {
       const modelId = await manager.cycleModel(id);
       return { modelId };
@@ -276,9 +291,11 @@ export function registerRoutes(
   fastify.post('/api/sessions/:id/abort', async (req, reply) => {
     const id = parseId(req, reply);
     if (!id) return;
+    if (manager.isExternallyLive(id)) return reply.code(409).send({ error: 'Session is owned by host Pi', code: 'session_live' });
     const session = manager.find(id);
-    if (session) session.send({ type: 'abort' });
-    return { ok: true };
+    if (!session) return reply.code(404).send({ error: 'Session not found' });
+    const ok = session.send({ type: 'abort' });
+    return { ok };
   });
 
   const ForkSchema = z.object({
@@ -289,6 +306,7 @@ export function registerRoutes(
   fastify.post('/api/sessions/:id/fork', async (req, reply) => {
     const id = parseId(req, reply);
     if (!id) return;
+    if (rejectExternalMutation(manager, id, reply)) return;
     const body = ForkSchema.safeParse(req.body ?? {});
     if (!body.success) return reply.code(400).send({ error: 'Invalid body', issues: body.error.issues });
 
@@ -319,6 +337,7 @@ export function registerRoutes(
   fastify.delete('/api/sessions/:id', async (req, reply) => {
     const id = parseId(req, reply);
     if (!id) return;
+    if (rejectExternalMutation(manager, id, reply)) return;
     const { purge } = (req.query as { purge?: string });
     const removed = manager.delete(id, purge === '1');
     if (!removed) return reply.code(404).send({ error: 'Session not found' });
@@ -344,6 +363,12 @@ function parseId(req: FastifyRequest, reply: {
     return null;
   }
   return id.data;
+}
+
+function rejectExternalMutation(manager: SessionManager, id: string, reply: { code: (code: number) => { send: (body: unknown) => unknown } }): boolean {
+  if (!manager.isExternallyLive(id)) return false;
+  reply.code(409).send({ error: 'Session is owned by host Pi', code: 'session_live' });
+  return true;
 }
 
 function authorized(req: FastifyRequest, token: string): boolean {

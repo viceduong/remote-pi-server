@@ -5,7 +5,7 @@ describe('loadConfig', () => {
   it('applies defaults', () => {
     const c = loadConfig({});
     expect(c.REMOTE_PI_PORT).toBe(8787);
-    expect(c.REMOTE_PI_HOST).toBe('0.0.0.0');
+    expect(c.REMOTE_PI_HOST).toBe('127.0.0.1');
     expect(c.REMOTE_PI_MAX_AGENTS).toBe(4);
     expect(c.PI_BIN).toBe('pi');
   });
@@ -21,6 +21,11 @@ describe('loadConfig', () => {
     expect(c.REMOTE_PI_TOKEN).toBe('secret');
     expect(c.REMOTE_PI_MAX_AGENTS).toBe(2);
     expect(c.REMOTE_PI_EXTRA_ARGS).toBe('--no-tools --plan');
+  });
+
+  it('requires auth for non-loopback binding', () => {
+    expect(() => loadConfig({ REMOTE_PI_HOST: '0.0.0.0' })).toThrow(/REMOTE_PI_TOKEN is required/);
+    expect(() => loadConfig({ REMOTE_PI_HOST: '0.0.0.0', REMOTE_PI_ALLOW_ANONYMOUS: '1' })).not.toThrow();
   });
 
   it('fails fast on invalid values', () => {

@@ -36,6 +36,21 @@ describe('mapAgentMessage', () => {
     expect(m?.toolCalls[0]?.arguments).toEqual({ path: 'a.ts' });
   });
 
+  it('keeps assistant tool-call messages as assistant', () => {
+    const m = mapAgentMessage({
+      role: 'assistant',
+      content: [{ type: 'toolCall', id: 't1', name: 'bash', arguments: { command: 'ls' } }],
+    });
+    expect(m?.role).toBe('assistant');
+    expect(m?.toolCalls).toHaveLength(1);
+  });
+
+  it('maps string tool results safely', () => {
+    const m = mapAgentMessage({ role: 'toolResult', toolName: 'bash', content: 'output' });
+    expect(m?.role).toBe('tool');
+    expect(m?.text).toBe('output');
+  });
+
   it('marks tool result messages', () => {
     const m = mapAgentMessage({
       role: 'tool',

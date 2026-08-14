@@ -24,10 +24,11 @@ export function mapAgentMessage(msg: AgentMessage | null | undefined): ChatMessa
   // exclusively toolCall/toolResult blocks with no text is a tool message
   // even without toolName.
   const contentArr = Array.isArray(msg.content) ? (msg.content as ContentBlock[]) : [];
-  const toolOnlyContent =
-    contentArr.length > 0 &&
-    contentArr.every((b) => b.type === 'toolCall' || b.type === 'image');
-  const isToolResult = hasToolName || toolOnlyContent;
+  // Assistant tool-call messages must remain assistant messages. Treating a
+  // toolCall-only assistant message as a tool result orphaned later outputs
+  // and caused upstream "role tool must follow tool_calls" 400s.
+  const hasToolResultBlock = contentArr.some((b) => b.type === 'toolResult');
+  const isToolResult = hasToolName || msg.role === 'tool' || msg.role === 'toolResult' || hasToolResultBlock;
   // pi serves extension custom messages (e.g. context-prune summaries) with
   // role "custom" + customType — system notes, never user bubbles.
   const isSystemNote =
@@ -48,7 +49,9 @@ export function mapAgentMessage(msg: AgentMessage | null | undefined): ChatMessa
   };
 
   if (isToolResult) {
-    base.text = textBlocks(msg.content as ContentBlock[] | undefined);
+    base.text = typeof msg.content === 'string'
+      ? msg.content
+      : textBlocks(msg.content as ContentBlock[] | undefined);
     // Keep call args on tool messages so clients can still show them.
     for (const b of contentArr) {
       if (b.type === 'toolCall') {

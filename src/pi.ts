@@ -35,3 +35,16 @@ export function spawnPiProcess(
   }
   return spawn(bin, args, { cwd: workdir });
 }
+
+/** Kill the complete wrapper/process tree on Windows; child.kill() only kills
+ * cmd.exe and can leave pi writing the session file after takeover/delete. */
+export function killPiProcess(child: ChildProcess): void {
+  if (IS_WIN && child.pid) {
+    const killer = spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], {
+      windowsHide: true,
+      stdio: 'ignore',
+    });
+    killer.unref();
+  }
+  try { child.kill(); } catch { /* already exited */ }
+}

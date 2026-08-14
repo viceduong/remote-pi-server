@@ -50,7 +50,7 @@ export interface AgentMessage {
 }
 
 export interface ContentBlock {
-  type: 'text' | 'thinking' | 'toolCall' | 'image';
+  type: 'text' | 'thinking' | 'toolCall' | 'toolResult' | 'image';
   text?: string;
   thinking?: string;
   id?: string;

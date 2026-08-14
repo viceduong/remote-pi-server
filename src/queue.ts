@@ -7,6 +7,7 @@
  * can never vanish on reload and never double-send.
  */
 import path from 'node:path';
+import crypto from 'node:crypto';
 
 export type QueueStatus = 'queued' | 'running' | 'done' | 'failed';
 
@@ -27,5 +28,6 @@ export interface QueueItem {
  */
 export function queueFilePath(sessionDir: string, sessionFile: string): string {
   const base = path.basename(sessionFile).replace(/\.jsonl$/, '');
-  return path.join(sessionDir, '.queue', `${base}.json`);
+  const key = crypto.createHash('sha256').update(path.resolve(sessionFile)).digest('hex').slice(0, 16);
+  return path.join(sessionDir, '.queue', `${base}-${key}.json`);
 }
