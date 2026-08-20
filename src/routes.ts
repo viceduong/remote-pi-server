@@ -361,8 +361,9 @@ export function registerRoutes(
   fastify.delete('/api/sessions/:id', async (req, reply) => {
     const id = parseId(req, reply);
     if (!id) return;
-    if (rejectExternalMutation(manager, id, reply)) return;
-    const { purge } = (req.query as { purge?: string });
+    const { purge, force } = (req.query as { purge?: string, force?: string });
+    const isForce = force === '1' || force === 'true';
+    if (!isForce && rejectExternalMutation(manager, id, reply)) return;
     const removed = manager.delete(id, purge === '1');
     if (!removed) return reply.code(404).send({ error: 'Session not found' });
     return { ok: true };
