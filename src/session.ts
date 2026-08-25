@@ -1,10 +1,12 @@
 import { once } from 'node:events';
+import net from 'node:net';
 import path from 'node:path';
 import fs from 'node:fs';
 import type { ChildProcess } from 'node:child_process';
 import type { Logger } from 'pino';
 import { killPiProcess, spawnPiProcess } from './pi.js';
 import { mapAgentMessage } from './history.js';
+import type { Lease } from './lease.js';
 import type { AgentMessage, AgentState, RpcEvent, RpcResponse, SessionPhase, SessionSummary } from './types.js';
 import type { QueueItem } from './queue.js';
 
@@ -67,11 +69,17 @@ export class Session {
   phase: SessionPhase = 'idle';
   /** Read-only mirror mode: file watcher only, no pi process (convertible). */
   readOnly = false;
+  /** Queue hooks wired (idempotency flag for wireQueue). */
+  queueWired = false;
   model: string | null = null;
   messageCount = 0;
   error: string | null = null;
 
   private proc: ChildProcess | null = null;
+  /** Owner-proxy transport: live host TUI holding the session lease. */
+  private ownerSocket: net.Socket | null = null;
+  ownerLease: Lease | null = null;
+  private ownerBuffer = '';
   private buffer = '';
   private readonly ring: RingRecord[] = [];
   private ringBytes = 0;
@@ -125,7 +133,12 @@ export class Session {
   }
 
   get running(): boolean {
-    return this.proc !== null;
+    return this.proc !== null || this.ownerSocket !== null;
+  }
+
+  /** True while this session is proxied to a live host owner via IPC. */
+  get isProxy(): boolean {
+    return this.ownerSocket !== null;
   }
 
   /** Child pid of the live pi process (null when not running). */
@@ -147,6 +160,14 @@ export class Session {
 
   /** Send a fire-and-forget command (e.g. abort). */
   send(obj: Record<string, unknown>): boolean {
+    if (this.ownerSocket) {
+      try {
+        this.ownerSocket.write(`${JSON.stringify(obj)}\n`);
+        return true;
+      } catch {
+        return false;
+      }
+    }
     if (!this.proc?.stdin || this.proc.stdin.destroyed) return false;
     try {
       this.proc.stdin.write(`${JSON.stringify(obj)}\n`);
@@ -160,7 +181,8 @@ export class Session {
   request<T = unknown>(obj: Record<string, unknown>, timeoutMs = RPC_TIMEOUT_MS): Promise<T> {
     return new Promise<T>((resolve, reject) => {
       const proc = this.proc;
-      if (!proc?.stdin) {
+      const viaOwner = this.ownerSocket !== null && !proc?.stdin;
+      if (!proc?.stdin && !this.ownerSocket) {
         reject(new Error('Agent not running'));
         return;
       }
@@ -175,7 +197,11 @@ export class Session {
         timer,
       });
       try {
-        proc.stdin.write(`${JSON.stringify({ ...obj, id })}\n`);
+        const wire = viaOwner ? { ...obj, op: obj.type, type: undefined } : { ...obj, id };
+        if (viaOwner) (wire as Record<string, unknown>).id = id;
+        const line = JSON.stringify(wire);
+        if (viaOwner) this.ownerSocket!.write(line + '\n');
+        else proc!.stdin!.write(`${line}\n`);
       } catch (err) {
         clearTimeout(timer);
         this.pending.delete(id);
@@ -281,6 +307,7 @@ export class Session {
   async start(): Promise<void> {
     if (this.readOnly) return this.startReadOnly();
     if (this.proc) return;
+    if (this.ownerSocket) return; // proxy mode — already attached
     const args = [
       '--mode', 'rpc',
       '--session', this.file,
@@ -408,10 +435,98 @@ export class Session {
     }
     this.stopping = true;
     this.promptReserved = false;
+    const sock = this.ownerSocket;
+    if (sock) {
+      // Proxy mode: never kill the host owner — just drop our control pipe.
+      try { sock.end(); } catch { /* ignore */ }
+      this.ownerSocket = null;
+      this.busy = false;
+      this.phase = 'terminated';
+      for (const p of this.pending.values()) {
+        clearTimeout(p.timer);
+        p.reject(new Error('Owner connection closed'));
+      }
+      this.pending.clear();
+      return;
+    }
     const proc = this.proc;
     if (!proc) return;
     try { proc.stdin?.end(); } catch { /* ignore */ }
     killPiProcess(proc);
+  }
+
+  /**
+   * Attach to a live host TUI holding the session lease (owner-proxy mode).
+   * The owner extension speaks pi-rpc-shaped NDJSON over a local pipe/UDS,
+   * so responses/events flow through the exact same handleResponse /
+   * handleEvent pipeline used for spawned children.
+   */
+  async attachOwner(lease: Lease): Promise<void> {
+    if (this.proc) throw new Error('attachOwner: child already running');
+    if (!lease.ipc) throw new Error('attachOwner: lease has no ipc endpoint');
+    await new Promise<net.Socket>((resolve, reject) => {
+      const socket = net.connect(lease.ipc); // named pipe or UDS path both work
+      socket.once('connect', () => resolve(socket));
+      socket.once('error', (err) => reject(err));
+      setTimeout(() => reject(new Error('owner connect timeout')), 3000).unref();
+    }).then((socket) => {
+      this.ownerSocket = socket;
+      this.ownerLease = lease;
+      this.buffer = '';
+      this.ownerBuffer = '';
+      this.stopping = false;
+      this.closed = false;
+      this.error = null;
+      this.phase = 'idle';
+      this.log.info({ sessionId: this.id, ipc: lease.ipc }, 'attached to live owner');
+
+      socket.on('data', (d: Buffer) => this.onOwnerChunk(d));
+      socket.on('error', (err) => this.log.warn({ sessionId: this.id, err: err.message }, 'owner ipc error'));
+      socket.on('close', () => {
+        if (this.ownerSocket !== socket) return;
+        this.ownerSocket = null;
+        this.busy = false;
+        this.phase = 'terminated';
+        for (const p of this.pending.values()) {
+          clearTimeout(p.timer);
+          p.reject(new Error('Owner disconnected'));
+        }
+        this.pending.clear();
+        const exitRecord = {
+          seq: ++this.seq,
+          type: 'agent_exited',
+          data: { type: 'agent_exited', code: 0 } as RpcEvent,
+        };
+        for (const sink of [...this.sinks]) sink.send(exitRecord);
+        this.onExit?.();
+      });
+      // Prime metadata like spawn path does.
+      return this.request<{ isStreaming?: boolean }>({ type: 'get_state' })
+        .then((st) => {
+          this.busy = st.isStreaming === true;
+          if (st.isStreaming) this.phase = 'streaming';
+        })
+        .catch(() => {});
+    });
+  }
+
+  private onOwnerChunk(chunk: Buffer): void {
+    this.ownerBuffer += chunk.toString('utf8');
+    let idx: number;
+    while ((idx = this.ownerBuffer.indexOf('\n')) >= 0) {
+      const line = this.ownerBuffer.slice(0, idx).replace(/\r$/, '');
+      this.ownerBuffer = this.ownerBuffer.slice(idx + 1);
+      if (!line.trim()) continue;
+      let obj: unknown;
+      try {
+        obj = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      const r = obj as { type?: string };
+      if (r.type === 'response') this.handleResponse(obj as RpcResponse);
+      else this.handleEvent(obj as RpcEvent);
+    }
   }
 
   /* ---------------- SSE fan-out ---------------- */

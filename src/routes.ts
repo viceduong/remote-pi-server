@@ -94,11 +94,19 @@ export function registerRoutes(
     const body = TurnSchema.safeParse(req.body);
     if (!body.success) return reply.code(400).send({ error: 'Invalid body', issues: body.error.issues });
 
-    // Write guard (pi-threads external-writer pattern): an external pi process
-    // owns this session — refusing prevents interleaved JSONL writes unless
-    // the client explicitly forces a takeover (iOS "Take over" button).
+    // PATCH owner-proxy write-guard:
+    //  - valid lease ⇒ the host TUI is the single writer and we proxy to it;
+    //    no 409 needed (dual-write is structurally impossible now).
+    //  - externally live WITHOUT a lease (legacy host) ⇒ legacy 409 unless
+    //    force=1, which performs a graceful handshake-release then spawns.
     const force = (req.query as { force?: string }).force === '1' || (req.query as { force?: string }).force === 'true';
-    if (manager.isExternallyLive(id) && !force) {
+    const liveLease = manager.getLiveLeaseInfo(id);
+    if (liveLease && force) {
+      const released = await manager.handshakeRelease(id);
+      if (!released) {
+        return reply.code(409).send({ error: 'Host Pi did not release the session in time', code: 'session_live' });
+      }
+    } else if (!liveLease && manager.isExternallyLive(id) && !force) {
       return reply.code(409).send({
         error: manager.isHostWriting(id)
           ? 'The host terminal is actively working on this session right now. Let it finish, then retry.'
@@ -315,6 +323,14 @@ export function registerRoutes(
   fastify.post('/api/sessions/:id/abort', async (req, reply) => {
     const id = parseId(req, reply);
     if (!id) return;
+    // PATCH owner-proxy: leased sessions forward abort to the live owner.
+    if (manager.getLiveLeaseInfo(id)) {
+      try {
+        await manager.ensureRunning(id);
+        const s = manager.get(id);
+        if (s?.isProxy) return { ok: s.send({ type: 'abort' }) };
+      } catch { /* fall through to legacy handling */ }
+    }
     if (manager.isExternallyLive(id)) return reply.code(409).send({ error: 'Session is owned by host Pi', code: 'session_live' });
     const session = manager.find(id);
     if (!session) return reply.code(404).send({ error: 'Session not found' });

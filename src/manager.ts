@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import net from 'node:net';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import type { Logger } from 'pino';
@@ -7,6 +8,7 @@ import { mapAgentMessage } from './history.js';
 import { manglePath } from './paths.js';
 import type { AgentMessage, AgentState, ChatMessage, LiveInstance, SessionSummary } from './types.js';
 import { probeLivePiInstances, type LivePiInstance } from './live.js';
+import { readLease, isLeaseHeld, type Lease } from './lease.js';
 import { queueFilePath, type QueueItem } from './queue.js';
 
 export interface SessionManagerOptions {
@@ -181,6 +183,10 @@ export class SessionManager {
     const meta = this.buildIndex().get(id);
     if (!meta) return null;
     if (this.liveCache.mapped.has(id)) {
+      // PATCH owner-proxy: when the host TUI holds the lease, attach as proxy
+      // so SSE subscribers get real agent events instead of file-tail deltas.
+      const lease = readLease(meta.file);
+      if (lease && isLeaseHeld(lease)) return this.ensureRunning(id);
       const mirror = new Session(
         id,
         meta.name,
@@ -198,6 +204,45 @@ export class SessionManager {
       return mirror;
     }
     return this.ensureRunning(id);
+  }
+
+  /** Valid lease held by a live host process for this session, if any. */
+  getLiveLeaseInfo(id: string): Lease | null {
+    const meta = this.buildIndex().get(id);
+    if (!meta) return null;
+    const lease = readLease(meta.file);
+    return lease && isLeaseHeld(lease) ? lease : null;
+  }
+
+  /**
+   * Graceful takeover handshake: ask the live owner to abort + release its
+   * lease, then wait for the lease file to disappear. Never force-kills.
+   */
+  async handshakeRelease(id: string, timeoutMs = 8000): Promise<boolean> {
+    const meta = this.buildIndex().get(id);
+    if (!meta) return false;
+    const lease = readLease(meta.file);
+    if (!lease || !isLeaseHeld(lease) || !lease.ipc) return false;
+    await new Promise<void>((resolve) => {
+      const socket = net.connect(lease.ipc);
+      const send = (op: string) => socket.write(`${JSON.stringify({ id: `t${op}`, op })}\n`);
+      socket.once('connect', () => {
+        send('abort');
+        send('release');
+      });
+      socket.once('error', () => resolve());
+      setTimeout(() => {
+        try { socket.destroy(); } catch { /* ignore */ }
+        resolve();
+      }, 2000).unref();
+    });
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const cur = readLease(meta.file);
+      if (!cur || !isLeaseHeld(cur)) return true;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    return false;
   }
 
   /* ---------------- rename ---------------- */
@@ -532,6 +577,28 @@ export class SessionManager {
   }
 
   private async ensureRunningUnlocked(id: string): Promise<Session | null> {
+    // PATCH owner-proxy: a live host TUI holding the session lease is the
+    // single writer — proxy turns to it over IPC instead of ever spawning a
+    // rival child on the same JSONL. Falls through to legacy paths when no
+    // valid lease exists (unowned / stale-unclaimed files).
+    const leasedMeta = this.buildIndex().get(id);
+    if (leasedMeta) {
+      const lease = readLease(leasedMeta.file);
+      if (lease && isLeaseHeld(lease)) {
+        let s = this.sessions.get(id) ?? this.mirrors.get(id) ?? null;
+        if (s && s.isProxy && s.ownerLease && s.ownerLease.epoch === lease.epoch && s.running) return s;
+        if (!s) {
+          s = this.sessionFromMeta(leasedMeta, 'pi');
+        } else {
+          this.mirrors.delete(id);
+          s.readOnly = false;
+        }
+        this.sessions.set(id, s);
+        this.wireQueue(s);
+        await s.attachOwner(lease);
+        return s;
+      }
+    }
     const live = this.sessions.get(id);
     if (live) {
       if (live.readOnly && this.runningCount >= this.options.maxAgents) throw new BusyError();
@@ -808,6 +875,8 @@ export class SessionManager {
 
   /** Wire a session's queue to its turn_end events + restore persisted state. */
   private wireQueue(session: Session): void {
+    if (session.queueWired) return;
+    session.queueWired = true;
     this.restoreQueue(session);
     session.onIdle = () => {
       this.completeRunning(session);
