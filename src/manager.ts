@@ -1317,6 +1317,12 @@ export class SessionManager {
       // Queue watchdog: recover items stuck in `running` (dispatch write
       // lost, wedged process without onExit) so the queue keeps moving.
       if (s.queue.some((i) => i.status === 'running')) this.recoverStuckRunning(s);
+      // Queued items with no live agent (e.g. dispatch failed while the
+      // agent was stopped): restart the agent and dispatch — otherwise the
+      // item waits forever because onIdle never fires for a dead process.
+      if (!s.running && s.queue.some((i) => i.status === 'queued')) {
+        this.ensureRunning(s.id).then(() => this.dispatchQueued(s)).catch(() => { /* next sweep retries */ });
+      }
     }
   }
 }
