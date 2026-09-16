@@ -1276,6 +1276,9 @@ export class SessionManager {
         const text = carry + chunk.subarray(0, n).toString('utf8');
         const lines = text.split('\n');
         carry = lines.pop() ?? '';
+        // A single entry larger than 8MB (giant paste/base64) would grow
+        // `carry` unboundedly across chunks and OOM the service. Drop it.
+        if (carry.length > 8 * 1024 * 1024) carry = '';
         for (const line of lines) consume(line);
       } while (count < 100_000);
       if (count < 100_000) consume(carry);
@@ -1312,6 +1315,8 @@ export class SessionManager {
         const text = carry + chunk.subarray(0, n).toString('utf8');
         const lines = text.split('\n');
         carry = lines.pop() ?? '';
+        // Same OOM guard as countMessageEntries: drop monster single lines.
+        if (carry.length > 8 * 1024 * 1024) carry = '';
         for (const line of lines) consume(line);
       } while (n > 0);
       consume(carry);
