@@ -206,6 +206,21 @@ export function registerRoutes(
     return { items };
   });
 
+  // pi 0.85 get_session_stats: tokens, cost, context-window usage.
+  fastify.get('/api/sessions/:id/stats', async (req, reply) => {
+    const id = parseId(req, reply);
+    if (!id) return;
+    const session = manager.find(id);
+    if (!session) return reply.code(404).send({ error: 'Session not found' });
+    if (!session.running) return reply.code(409).send({ error: 'Session is not running' });
+    try {
+      const stats = await session.request<Record<string, unknown>>({ type: 'get_session_stats' }, 15_000);
+      return { stats };
+    } catch (err) {
+      return reply.code(502).send({ error: (err as Error).message });
+    }
+  });
+
   fastify.delete('/api/sessions/:id/queue/:itemId', async (req, reply) => {
     const id = parseId(req, reply);
     if (!id) return;
@@ -220,11 +235,34 @@ export function registerRoutes(
     if (!id) return;
     const session = manager.find(id);
     if (!session) return reply.code(404).send({ error: 'Session not found' });
-    // Pagination: ?limit=N (default 100, max 500) and ?before=<ts> (load older).
+    // Pagination: ?limit=N (default 100, max 500), ?before=<ts> (load older),
+    // and ?since=<entryId> (cursor reconnect — only entries AFTER that id).
     const limit = Math.min(Math.max(parseInt(String((req.query as { limit?: string }).limit ?? '100'), 10) || 100, 1), 500);
     const before = parseInt(String((req.query as { before?: string }).before ?? ''), 10) || undefined;
+    const since = String((req.query as { since?: string }).since ?? '') || undefined;
     try {
       const all = await manager.history(session);
+      if (since) {
+        // Durable cursor: return only rows strictly after the entry id the
+        // client last saw. Cheap reconnect for large sessions (no full refetch).
+        const at = all.findIndex((m) => m.id === since);
+        if (at >= 0) {
+          const tail = all.slice(at + 1);
+          return {
+            messages: tail.slice(-limit),
+            pending: session.queue.map((item) => ({
+              id: item.id,
+              clientMessageId: item.clientMessageId ?? null,
+              text: item.message,
+              queuedAt: item.queuedAt,
+            })),
+            working: await manager.working(session),
+            hasMore: false,
+            cursorMode: true,
+          };
+        }
+        // Unknown cursor (compaction/branch switch) — fall through to full fetch.
+      }
       const page = before
         ? all.filter((m) => (m.timestamp ?? 0) < before).slice(-limit)
         : all.slice(-limit);
@@ -244,6 +282,7 @@ export function registerRoutes(
         hasMore: before
           ? all.some((m) => (m.timestamp ?? 0) < (page[0]?.timestamp ?? 0))
           : all.length > limit,
+        cursorMode: false,
         total: all.length,
       };
     } catch (err) {
