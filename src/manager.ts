@@ -917,6 +917,10 @@ export class SessionManager {
       }
     }
     if (changed) {
+      // The stuck dispatch held the prompt reservation (agent_end never came
+      // — that's WHY it was stuck). Release it or every future dispatch is
+      // blocked at reservePrompt() forever.
+      session.releasePrompt();
       this.persistQueue(session);
       session.broadcast('queue_update', { items: session.queue });
       this.dispatchQueued(session);
