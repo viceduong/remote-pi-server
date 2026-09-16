@@ -895,11 +895,19 @@ export class SessionManager {
     const cutoff = Date.now() - SessionManager.STUCK_RUNNING_MS;
     let changed = false;
     for (const item of session.queue) {
-      if (item.status === 'running' && (item.startedAt ?? 0) < cutoff) {
-        item.status = 'queued';
-        item.startedAt = null;
+      if (item.status !== 'running') continue;
+      // Owner-proxy turns: the TUI's event stream may not surface agent_end
+      // reliably. When the session is verifiably idle AND newer activity
+      // exists than the dispatch, the turn finished — mark done.
+      const idleWithActivity = !session.busy && session.phase !== 'streaming'
+        && session.lastActivityAt > (item.startedAt ?? 0)
+        && Date.now() - (item.startedAt ?? 0) > 30_000;
+      if ((item.startedAt ?? 0) < cutoff || idleWithActivity) {
+        item.status = idleWithActivity ? 'done' : 'queued';
+        if (idleWithActivity) item.completedAt = Date.now();
+        else item.startedAt = null;
         changed = true;
-        this.options.log.warn({ sessionId: session.id, itemId: item.id }, 'stuck running item rolled back to queued');
+        this.options.log.warn({ sessionId: session.id, itemId: item.id, done: idleWithActivity }, 'stuck running item resolved');
       }
     }
     if (changed) {
