@@ -169,20 +169,27 @@ export function registerRoutes(
           accepted: true,
           queued: item.status === 'queued' || item.status === 'running',
           queueItemId,
+          queueDepth: session.queue.filter((i) => i.status === 'queued' || i.status === 'running').length,
         });
       }
       if (queued) {
         // Server-owned queue: held, dispatched on turn_end, never lost.
         const item = manager.enqueuePrompt(session, body.data.message);
         queueItemId = item.id;
-        return reply.code(202).send({ accepted: true, queued: true, queueItemId });
+        return reply.code(202).send({
+          accepted: true, queued: true, queueItemId,
+          queueDepth: session.queue.filter((i) => i.status === 'queued' || i.status === 'running').length,
+        });
       }
       // Reserve idle sessions before the RPC write so concurrent HTTP requests
       // cannot both observe idle and send two prompts.
       const reserved = busyNow && behavior ? true : session.reservePrompt();
       if (!reserved) {
         const item = manager.enqueuePrompt(session, body.data.message);
-        return reply.code(202).send({ accepted: true, queued: true, queueItemId: item.id });
+        return reply.code(202).send({
+          accepted: true, queued: true, queueItemId: item.id,
+          queueDepth: session.queue.filter((i) => i.status === 'queued' || i.status === 'running').length,
+        });
       }
       const cmd: Record<string, unknown> = { type: 'prompt', message: body.data.message };
       if (behavior) cmd.streamingBehavior = behavior;

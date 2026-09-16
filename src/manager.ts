@@ -873,6 +873,30 @@ export class SessionManager {
     });
   }
 
+  /**
+   * Stuck-running watchdog: an item stuck in `running` for over 10 minutes
+   * (dispatch RPC write lost, process wedged without onExit) blocks the
+   * whole queue. Roll it back to `queued` so dispatch can proceed.
+   */
+  private static readonly STUCK_RUNNING_MS = 10 * 60_000;
+  recoverStuckRunning(session: Session): void {
+    const cutoff = Date.now() - SessionManager.STUCK_RUNNING_MS;
+    let changed = false;
+    for (const item of session.queue) {
+      if (item.status === 'running' && (item.startedAt ?? 0) < cutoff) {
+        item.status = 'queued';
+        item.startedAt = null;
+        changed = true;
+        this.options.log.warn({ sessionId: session.id, itemId: item.id }, 'stuck running item rolled back to queued');
+      }
+    }
+    if (changed) {
+      this.persistQueue(session);
+      session.broadcast('queue_update', { items: session.queue });
+      this.dispatchQueued(session);
+    }
+  }
+
   /** Wire a session's queue to its turn_end events + restore persisted state. */
   private wireQueue(session: Session): void {
     if (session.queueWired) return;
@@ -880,6 +904,7 @@ export class SessionManager {
     this.restoreQueue(session);
     session.onIdle = () => {
       this.completeRunning(session);
+      this.recoverStuckRunning(session);
       this.dispatchQueued(session);
     };
     session.onExit = () => {
@@ -1276,6 +1301,9 @@ export class SessionManager {
         this.options.log.info({ sessionId: s.id }, 'idle timeout, stopping agent');
         s.stop();
       }
+      // Queue watchdog: recover items stuck in `running` (dispatch write
+      // lost, wedged process without onExit) so the queue keeps moving.
+      if (s.queue.some((i) => i.status === 'running')) this.recoverStuckRunning(s);
     }
   }
 }
