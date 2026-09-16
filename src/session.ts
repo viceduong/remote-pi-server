@@ -544,8 +544,17 @@ export class Session {
         continue;
       }
       const r = obj as { type?: string };
-      if (r.type === 'response') this.handleResponse(obj as RpcResponse);
-      else this.handleEvent(obj as RpcEvent);
+      if (r.type === 'response') {
+        this.handleResponse(obj as RpcResponse);
+      } else if (r.type === 'event') {
+        // Attached-socket frame from remote-pi-owner: {type:'event', seq,
+        // eventType, event}. Unwrap to the real event so busy tracking,
+        // the ring, and SSE fan-out see canonical event types.
+        const frame = obj as { event?: RpcEvent };
+        if (frame.event) this.handleEvent(frame.event);
+      } else {
+        this.handleEvent(obj as RpcEvent);
+      }
     }
   }
 

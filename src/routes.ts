@@ -168,6 +168,10 @@ export function registerRoutes(
         return reply.code(202).send({
           accepted: true,
           queued: item.status === 'queued' || item.status === 'running',
+          // True when the prompt went to the agent immediately (idle session)
+          // — the client must NOT render a queued chip in that case (it caused
+          // a double bubble: optimistic + queued for every new message).
+          dispatched: item.status === 'running',
           queueItemId,
           queueDepth: session.queue.filter((i) => i.status === 'queued' || i.status === 'running').length,
         });
