@@ -609,6 +609,9 @@ export class SessionManager {
         this.options.log.info({ sessionId: id }, 'takeover: mirror -> real agent');
       }
       if (!live.running) await live.start();
+      // Takeover must wire the queue: without onIdle the converted session
+      // never dispatches queued prompts (they sat queued forever).
+      this.wireQueue(live);
       return live;
     }
     const mirror = this.mirrors.get(id);
@@ -621,6 +624,9 @@ export class SessionManager {
       this.sessions.set(id, mirror);
       this.options.log.info({ sessionId: id }, 'takeover: mirror -> real agent');
       if (!mirror.running) await mirror.start();
+      // Takeover must wire the queue: without onIdle the converted session
+      // never dispatches queued prompts (they sat queued forever).
+      this.wireQueue(mirror);
       return mirror;
     }
     const meta = this.buildIndex().get(id);
