@@ -869,6 +869,18 @@ export class SessionManager {
       item.startedAt = null;
       this.persistQueue(session);
       session.broadcast('queue_update', { items: session.queue });
+      // "Agent not running" means the idle sweep stopped the process (or a
+      // mirror never spawned one). Retrying blind loops forever — restart
+      // the agent first, then dispatch.
+      if (!session.running) {
+        this.ensureRunning(session.id).then(() => {
+          this.dispatchQueued(session);
+        }).catch((restartErr) => {
+          this.options.log.warn({ sessionId: session.id, err: (restartErr as Error).message }, 'queue restart failed');
+          setTimeout(() => this.dispatchQueued(session), 5000);
+        });
+        return;
+      }
       setTimeout(() => this.dispatchQueued(session), 2000);
     });
   }
@@ -1296,7 +1308,8 @@ export class SessionManager {
   private sweepIdle(): void {
     const now = Date.now();
     for (const s of this.sessions.values()) {
-      if (s.running && !s.busy && s.phase !== 'streaming'
+      const hasPending = s.queue.some((i) => i.status === 'queued' || i.status === 'running');
+      if (s.running && !s.busy && s.phase !== 'streaming' && !hasPending
           && now - s.lastActivityAt > this.options.idleKillMs) {
         this.options.log.info({ sessionId: s.id }, 'idle timeout, stopping agent');
         s.stop();
