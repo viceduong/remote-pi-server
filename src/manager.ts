@@ -1343,8 +1343,8 @@ export class SessionManager {
           try {
             const items = JSON.parse(fs.readFileSync(path.join(queueDir, f), 'utf8')) as QueueItem[];
             if (!Array.isArray(items)) continue;
-            const hasQueued = items.some((i) => i.status === 'queued');
-            if (!hasQueued) continue;
+            const hasPending = items.some((i) => i.status === 'queued' || i.status === 'running');
+            if (!hasPending) continue;
             // Map the queue file back to its session id via the index.
             const base = f.replace(/\.json$/, '');
             for (const [sid, meta] of this.buildIndex()) {
