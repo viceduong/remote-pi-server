@@ -1324,6 +1324,34 @@ export class SessionManager {
         this.ensureRunning(s.id).then(() => this.dispatchQueued(s)).catch(() => { /* next sweep retries */ });
       }
     }
+    // Post-restart sweep: sessions not in memory still have durable queue
+    // files on disk. Discover them and wake their agents so queued prompts
+    // survive server restarts too.
+    try {
+      const queueDir = path.join(this.options.sessionDir, '.queue');
+      if (fs.existsSync(queueDir)) {
+        for (const f of fs.readdirSync(queueDir)) {
+          if (!f.endsWith('.json')) continue;
+          try {
+            const items = JSON.parse(fs.readFileSync(path.join(queueDir, f), 'utf8')) as QueueItem[];
+            if (!Array.isArray(items)) continue;
+            const hasQueued = items.some((i) => i.status === 'queued');
+            if (!hasQueued) continue;
+            // Map the queue file back to its session id via the index.
+            const base = f.replace(/\.json$/, '');
+            for (const [sid, meta] of this.buildIndex()) {
+              const key = crypto.createHash('sha256').update(path.resolve(meta.file)).digest('hex').slice(0, 16);
+              if (base === `${path.basename(meta.file).replace(/\.jsonl$/, '')}-${key}`) {
+                if (!this.sessions.has(sid)) {
+                  this.ensureRunning(sid).catch(() => { /* next sweep retries */ });
+                }
+                break;
+              }
+            }
+          } catch { /* corrupt queue file */ }
+        }
+      }
+    } catch { /* queue dir unreadable */ }
   }
 }
 
