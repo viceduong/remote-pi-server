@@ -469,7 +469,7 @@ export class Session {
       socket.once('connect', () => resolve(socket));
       socket.once('error', (err) => reject(err));
       setTimeout(() => reject(new Error('owner connect timeout')), 3000).unref();
-    }).then((socket) => {
+    }).then(async (socket) => {
       this.ownerSocket = socket;
       this.ownerLease = lease;
       this.buffer = '';
@@ -499,6 +499,26 @@ export class Session {
         };
         for (const sink of [...this.sinks]) sink.send(exitRecord);
         this.onExit?.();
+      });
+      // Handshake FIRST: the owner's IPC server rejects every op from
+      // un-helloed sockets with "not attached (hello required)". Send hello
+      // as a bridge attachment, await its response, then prime metadata.
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('owner hello timeout')), 3000).unref();
+        const onHello = (d: Buffer) => {
+          try {
+            const line = d.toString('utf8').split('\n')[0] ?? '';
+            const obj = JSON.parse(line) as { type?: string; success?: boolean };
+            if (obj.type === 'response') {
+              socket.removeListener('data', onHello);
+              clearTimeout(timer);
+              if (obj.success === false) { reject(new Error('owner hello rejected')); return; }
+              resolve();
+            }
+          } catch { /* partial line — wait for more */ }
+        };
+        socket.on('data', onHello);
+        socket.write(JSON.stringify({ id: 'hello', op: 'hello', type: 'bridge', lastSeq: 0 }) + '\n');
       });
       // Prime metadata like spawn path does.
       return this.request<{ isStreaming?: boolean }>({ type: 'get_state' })
