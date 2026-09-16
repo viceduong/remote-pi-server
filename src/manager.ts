@@ -905,9 +905,12 @@ export class SessionManager {
       // Owner-proxy turns: the TUI's event stream may not surface agent_end
       // reliably. When the session is verifiably idle AND newer activity
       // exists than the dispatch, the turn finished — mark done.
+      // 3-minute threshold: turns routinely run >30s; a too-eager check
+      // killed live turns, rolled them back to queued, and re-dispatched
+      // them (duplicate prompts reaching pi).
       const idleWithActivity = !session.busy && session.phase !== 'streaming'
         && session.lastActivityAt > (item.startedAt ?? 0)
-        && Date.now() - (item.startedAt ?? 0) > 30_000;
+        && Date.now() - (item.startedAt ?? 0) > 180_000;
       if ((item.startedAt ?? 0) < cutoff || idleWithActivity) {
         item.status = idleWithActivity ? 'done' : 'queued';
         if (idleWithActivity) item.completedAt = Date.now();
