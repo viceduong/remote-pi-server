@@ -3,6 +3,7 @@ import os from 'node:os';
 import type { FastifyBaseLogger, FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { BusyError, type SessionManager } from './manager.js';
+import type { ChatMessage } from './types.js';
 import { attachSse } from './sse.js';
 import type { Env } from './config.js';
 import type { ServerConfig } from './types.js';
@@ -274,9 +275,21 @@ export function registerRoutes(
         }
         // Unknown cursor (compaction/branch switch) — fall through to full fetch.
       }
+      // Focus-mode visibility filter (mirror of the iOS computeVisible):
+      // ?visible=1 returns only rows the app would render, so sessions whose
+      // tail is a huge tool loop still open with real content in one call.
+      const isVisible = (m: ChatMessage): boolean => {
+        if (m.role === 'tool' || m.toolName || m.system) return false;
+        const t = (m.text ?? '').trim();
+        const th = (m.thinking ?? '').trim();
+        if (m.role === 'assistant' && !t && !th) return false;
+        return true;
+      };
+      const wantVisible = (req.query as { visible?: string }).visible === '1';
+      const pool = wantVisible && !before ? all.filter(isVisible) : all;
       const page = before
         ? all.filter((m) => (m.timestamp ?? 0) < before).slice(-limit)
-        : all.slice(-limit);
+        : pool.slice(-limit);
       return {
         messages: page,
         // Queued-but-not-yet-written prompts (server-owned queue): the client
