@@ -879,6 +879,21 @@ export class SessionManager {
     if (session.busy || session.phase === 'streaming') return;
     const item = session.queue.find((candidate) => candidate.status === 'queued');
     if (!item || !session.reservePrompt()) return;
+    // Delivery-time dedupe: if this exact prompt text already exists as a
+    // user message in the session JSONL tail, the item was already delivered
+    // (crash-restart rollback, double-enqueue from offline flush + manual
+    // send). Mark done instead of re-sending — the #1 remaining source of
+    // duplicate user inputs.
+    if (this.sessionTailHasUserText(session, item.message)) {
+      item.status = 'done';
+      item.completedAt = Date.now();
+      this.persistQueue(session);
+      session.broadcast('queue_update', { items: session.queue });
+      this.options.log.info({ sessionId: session.id, itemId: item.id }, 'queued item already delivered, marked done');
+      session.releasePrompt();
+      this.dispatchQueued(session);
+      return;
+    }
     item.status = 'running';
     item.startedAt = Date.now();
     this.persistQueue(session);
@@ -1044,6 +1059,33 @@ export class SessionManager {
           .map((i) => i.status === 'running' ? { ...i, status: 'queued', startedAt: null } : i);
       }
     } catch { /* corrupt -> ignore */ }
+  }
+
+  /** True when the session JSONL tail already contains this user text. */
+  private sessionTailHasUserText(session: Session, message: string): boolean {
+    try {
+      const stat = fs.statSync(session.file);
+      const tailStart = Math.max(0, stat.size - 512 * 1024);
+      const fd = fs.openSync(session.file, 'r');
+      const buf = Buffer.alloc(stat.size - tailStart);
+      const n = fs.readSync(fd, buf, 0, buf.length, tailStart);
+      fs.closeSync(fd);
+      const want = message.trim();
+      for (const line of buf.subarray(0, n).toString('utf8').split('\n')) {
+        if (!line.trim()) continue;
+        try {
+          const entry = JSON.parse(line) as { type?: string; message?: { role?: string; content?: unknown } };
+          if (entry.type !== 'message' || entry.message?.role !== 'user') continue;
+          const c = entry.message.content;
+          const text = typeof c === 'string' ? c
+            : Array.isArray(c)
+              ? (c as { type?: string; text?: string }[]).filter((b) => b.type === 'text').map((b) => b.text ?? '').join('')
+              : '';
+          if (text.trim() === want) return true;
+        } catch { /* skip */ }
+      }
+    } catch { /* file unreadable */ }
+    return false;
   }
 
   /** Queue contents for a session (API). File-first: works even before the
