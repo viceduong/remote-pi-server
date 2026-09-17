@@ -706,8 +706,13 @@ export class SessionManager {
   list(): SessionSummary[] {
     const index = this.buildIndex();
     const out: SessionSummary[] = [];
+    // Live sessions are keyed by their bridge id at create time but the
+    // index is keyed by pi's session id once the JSONL header lands — match
+    // by canonical file so a freshly created session never appears twice.
+    const liveByFile = new Map<string, Session>();
+    for (const s of this.sessions.values()) liveByFile.set(path.resolve(s.file), s);
     for (const meta of index.values()) {
-      const live = this.sessions.get(meta.id);
+      const live = this.sessions.get(meta.id) ?? liveByFile.get(path.resolve(meta.file));
       if (live) {
         const sum = live.toSummary();
         if (meta.lastMessageAt !== null) sum.lastMessageAt = meta.lastMessageAt;
