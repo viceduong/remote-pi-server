@@ -551,6 +551,17 @@ export class SessionManager {
     this.wireQueue(session);
     await session.start();
     this.throwIfDead(session);
+    // Re-key under pi's own session id once known (refreshState rewrites
+    // `file` after get_state). Without this, listPage (keyed by the pi id
+    // from buildIndex) misses the live session and emits a second, dead
+    // entry — the duplicate the iOS app saw after creating a session.
+    const piFile = session.file;
+    const piId = path.basename(piFile, '.jsonl');
+    if (piId !== id && !this.sessions.has(piId)) {
+      this.sessions.delete(id);
+      this.sessions.set(piId, session);
+      this.invalidateIndex();
+    }
     return session;
   }
 
