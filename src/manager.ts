@@ -1012,8 +1012,35 @@ export class SessionManager {
       if (!fs.existsSync(file)) return;
       const parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as QueueItem[];
       if (Array.isArray(parsed)) {
+        // A `running` item rolled back after a crash may have ALREADY been
+        // delivered (the turn completed before the restart) — re-dispatching
+        // it duplicates the user's input in the session. Drop items whose
+        // text already exists in the session JSONL tail.
+        const delivered = new Set<string>();
+        try {
+          const stat = fs.statSync(session.file);
+          const tailStart = Math.max(0, stat.size - 512 * 1024);
+          const fd = fs.openSync(session.file, 'r');
+          const buf = Buffer.alloc(stat.size - tailStart);
+          const n = fs.readSync(fd, buf, 0, buf.length, tailStart);
+          fs.closeSync(fd);
+          for (const line of buf.subarray(0, n).toString('utf8').split('\n')) {
+            if (!line.trim()) continue;
+            try {
+              const entry = JSON.parse(line) as { type?: string; message?: { role?: string; content?: unknown } };
+              if (entry.type !== 'message' || entry.message?.role !== 'user') continue;
+              const c = entry.message.content;
+              const text = typeof c === 'string' ? c
+                : Array.isArray(c)
+                  ? (c as { type?: string; text?: string }[]).filter((b) => b.type === 'text').map((b) => b.text ?? '').join('')
+                  : '';
+              if (text) delivered.add(text.trim());
+            } catch { /* skip */ }
+          }
+        } catch { /* file unreadable */ }
         session.queue = parsed
           .filter((i) => i && typeof i.id === 'string' && typeof i.message === 'string')
+          .filter((i) => !(i.status === 'running' && delivered.has(i.message.trim())))
           .map((i) => i.status === 'running' ? { ...i, status: 'queued', startedAt: null } : i);
       }
     } catch { /* corrupt -> ignore */ }
