@@ -757,8 +757,10 @@ export class SessionManager {
   listPage(limit: number, before?: number): { sessions: SessionSummary[]; hasMore: boolean; total: number } {
     const index = this.buildIndex();
     const out: SessionSummary[] = [];
+    const liveByFile = new Map<string, Session>();
+    for (const s of this.sessions.values()) liveByFile.set(path.resolve(s.file), s);
     for (const meta of index.values()) {
-      const live = this.sessions.get(meta.id);
+      const live = this.sessions.get(meta.id) ?? liveByFile.get(path.resolve(meta.file));
       if (live) {
         const sum = live.toSummary();
         if (meta.lastMessageAt !== null) sum.lastMessageAt = meta.lastMessageAt;
