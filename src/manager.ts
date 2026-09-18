@@ -1368,32 +1368,62 @@ export class SessionManager {
     }, 0);
   }
 
+  /** Strip lone UTF-16 surrogates from decoded text (Node crashes on
+   *  encode otherwise). Keeps valid pairs. */
+  private static sanitizeText(s: string): string {
+    let out = '';
+    let i = 0;
+    while (i < s.length) {
+      const code = s.charCodeAt(i);
+      if (code >= 0xd800 && code <= 0xdbff && i + 1 < s.length) {
+        const next = s.charCodeAt(i + 1);
+        if (next >= 0xdc00 && next <= 0xdfff) {
+          out += s[i]! + s[i + 1]!;
+          i += 2;
+          continue;
+        }
+        i += 1; // lone high surrogate: drop
+        continue;
+      }
+      if (code >= 0xdc00 && code <= 0xdfff) {
+        i += 1; // lone low surrogate: drop
+        continue;
+      }
+      out += s[i];
+      i += 1;
+    }
+    return out;
+  }
+
   private countMessageEntries(file: string): number {
+    // Byte-level scan: count '"type":"message"' occurrences. No string
+    // decoding - malformed UTF-8 / lone surrogates in session files
+    // crashed Node (StringBytes assertion) via toString(). Decode-free
+    // counting is immune; slight overcount (pattern inside message
+    // content) is acceptable for a display counter.
     const fd = fs.openSync(file, 'r');
+    const pattern = Buffer.from('"type":"message"', 'utf8');
     const chunk = Buffer.alloc(1024 * 1024);
-    let carry = '';
+    let carry = Buffer.alloc(0);
     let count = 0;
-    const consume = (line: string) => {
-      if (!line.trim() || count >= 100_000) return;
-      try {
-        const entry = JSON.parse(line) as { type?: string };
-        if (entry.type === 'message') count++;
-      } catch { /* partial/corrupt line */ }
-    };
     try {
       let n = 0;
       do {
         n = fs.readSync(fd, chunk, 0, chunk.length, null);
         if (!n) break;
-        const text = carry + chunk.subarray(0, n).toString('utf8');
-        const lines = text.split('\n');
-        carry = lines.pop() ?? '';
-        // A single entry larger than 8MB (giant paste/base64) would grow
-        // `carry` unboundedly across chunks and OOM the service. Drop it.
-        if (carry.length > 8 * 1024 * 1024) carry = '';
-        for (const line of lines) consume(line);
-      } while (count < 100_000);
-      if (count < 100_000) consume(carry);
+        const buf = Buffer.concat([carry, chunk.subarray(0, n)]);
+        let idx = 0;
+        let lastEnd = 0;
+        while (true) {
+          const hit = buf.indexOf(pattern, idx);
+          if (hit < 0) break;
+          count++;
+          idx = hit + pattern.length;
+          lastEnd = idx;
+        }
+        carry = buf.subarray(Math.max(lastEnd, buf.length - pattern.length));
+        if (carry.length > 4 * 1024 * 1024) carry = Buffer.alloc(0);
+      } while (n > 0);
     } finally {
       fs.closeSync(fd);
     }
@@ -1424,7 +1454,7 @@ export class SessionManager {
       do {
         n = fs.readSync(fd, chunk, 0, chunk.length, null);
         if (!n) break;
-        const text = carry + chunk.subarray(0, n).toString('utf8');
+        const text = SessionManager.sanitizeText(carry + chunk.subarray(0, n).toString('utf8'));
         const lines = text.split('\n');
         carry = lines.pop() ?? '';
         // Same OOM guard as countMessageEntries: drop monster single lines.
