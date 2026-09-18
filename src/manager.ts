@@ -793,7 +793,11 @@ export class SessionManager {
         });
       }
     }
-    const sorted = this.allSorted(out);
+    // Dedupe by id: two index metas can resolve to the same live session
+    // (bridge-id placeholder file + pi's own file after compaction/adopt).
+    const seen = new Set<string>();
+    const deduped = out.filter((x) => !seen.has(x.id) && seen.add(x.id));
+    const sorted = this.allSorted(deduped);
     const filtered = before ? sorted.filter((s) => (s.lastMessageAt ?? s.lastActivityAt) < before) : sorted;
     const page = filtered.slice(0, limit);
     return { sessions: page, hasMore: filtered.length > limit, total: sorted.length };
