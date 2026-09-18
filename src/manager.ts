@@ -851,7 +851,14 @@ export class SessionManager {
    * current turn ends, and surfaced as `pending` in /messages — so they can
    * never vanish on reload and never double-send.
    */
-  enqueuePrompt(session: Session, message: string, clientMessageId?: string): QueueItem {
+  enqueuePrompt(session: Session, rawMessage: string, clientMessageId?: string): QueueItem {
+    // Strip lone UTF-16 surrogates: iOS paste/emoji can produce them, and
+    // Node crashes hard (StringBytes::Encode assertion) when such strings
+    // hit Buffer/write paths - taking the whole service down.
+    const message = rawMessage.replace(/[\uD800-\uDFFF]/g, (ch) => {
+      const code = ch.codePointAt(0) ?? 0;
+      return code >= 0xd800 && code <= 0xdbff ? ch : '';
+    });
     if (clientMessageId) {
       const existing = session.queue.find((item) => item.clientMessageId === clientMessageId);
       if (existing) return existing;
