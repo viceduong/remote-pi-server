@@ -750,7 +750,12 @@ export class SessionManager {
         });
       }
     }
-    return this.allSorted(out).slice(0, MAX_LISTED);
+    // Two index metas can resolve to the same live session (bridge-id
+    // placeholder + pi's file): dedupe by id so the list never shows a
+    // session twice.
+    const seen = new Set<string>();
+    const deduped = out.filter((x) => !seen.has(x.id) && seen.add(x.id));
+    return this.allSorted(deduped).slice(0, MAX_LISTED);
   }
 
   /** Cursor-paginated session list: newest first, `before` = older than ts. */
