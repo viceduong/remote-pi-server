@@ -219,18 +219,28 @@ export function registerRoutes(
   });
 
   // pi 0.85 get_session_stats: tokens, cost, context-window usage.
+  // Last-known stats cache (per session file) so mirror/idle sessions still
+  // show the context/token/cost strip in the app.
+  const statsCache = new Map<string, Record<string, unknown>>();
   fastify.get('/api/sessions/:id/stats', async (req, reply) => {
     const id = parseId(req, reply);
     if (!id) return;
     const session = manager.find(id);
     if (!session) return reply.code(404).send({ error: 'Session not found' });
-    if (!session.running) return reply.code(409).send({ error: 'Session is not running' });
-    try {
-      const stats = await session.request<Record<string, unknown>>({ type: 'get_session_stats' }, 15_000);
-      return { stats };
-    } catch (err) {
-      return reply.code(502).send({ error: (err as Error).message });
+    if (session.running) {
+      try {
+        const stats = await session.request<Record<string, unknown>>({ type: 'get_session_stats' }, 15_000);
+        statsCache.set(id, stats);
+        return { stats };
+      } catch (err) {
+        const cached = statsCache.get(id);
+        if (cached) return { stats: cached, stale: true };
+        return reply.code(502).send({ error: (err as Error).message });
+      }
     }
+    const cached = statsCache.get(id);
+    if (cached) return { stats: cached, stale: true };
+    return reply.code(409).send({ error: 'Session is not running' });
   });
 
   fastify.delete('/api/sessions/:id/queue/:itemId', async (req, reply) => {
