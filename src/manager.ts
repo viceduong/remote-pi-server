@@ -557,10 +557,20 @@ export class SessionManager {
     // entry — the duplicate the iOS app saw after creating a session.
     const piFile = session.file;
     const piId = path.basename(piFile, '.jsonl');
-    if (piId !== id && !this.sessions.has(piId)) {
+    if (piId !== id) {
       this.sessions.delete(id);
       this.sessions.set(piId, session);
       this.invalidateIndex();
+      // pi writes its own uuid-named JSONL; the bridge-id placeholder file
+      // stays empty on disk and buildIndex surfaces it as a phantom dead
+      // session (the duplicate + blank entry in the iOS list). Remove it.
+      try {
+        const placeholder = this.sessionFile(id);
+        if (path.resolve(placeholder) !== path.resolve(piFile) && fs.existsSync(placeholder)) {
+          const sz = fs.statSync(placeholder).size;
+          if (sz === 0) fs.unlinkSync(placeholder);
+        }
+      } catch { /* best effort */ }
     }
     return session;
   }
