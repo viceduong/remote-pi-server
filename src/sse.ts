@@ -3,6 +3,7 @@ import type { FastifyReply, FastifyRequest } from 'fastify';
 import type { FastifyBaseLogger } from 'fastify';
 import type { Session } from './session.js';
 
+let seqCounter = 0;
 const KEEPALIVE_MS = 15_000;
 /** Slow-consumer cap: if a sink queues more than this many frames, the client
  *  is too slow — drop the connection (it will reconnect + replay). */
@@ -83,13 +84,58 @@ export function attachSse(
   const replay = lastId >= 0 ? session.replayAfter(lastId) : [];
 
   const skeleton = (req.query as { skeleton?: string }).skeleton === '1';
+
+  // Delta coalescing: text/thinking deltas stream at token rate; shipping
+  // each one is 5-8x more frames than needed. Buffer them per-sink and flush
+  // every 60ms as a single merged delta.
+  let deltaBuf: { kind: 'text' | 'thinking'; contentIndex: number; text: string; seq: number } | null = null;
+  let deltaTimer: NodeJS.Timeout | null = null;
+
+  function flushDeltas(): void {
+    deltaTimer = null;
+    const buf = deltaBuf;
+    if (!buf) return;
+    deltaBuf = null;
+    const kind = buf.kind, contentIndex = buf.contentIndex, text = buf.text;
+    // Use the seq of the LAST buffered delta so Last-Event-ID stays correct.
+    const frame = {
+      type: 'message_update',
+      seq: buf.seq,
+      data: {
+        type: 'message_update',
+        assistantMessageEvent: { type: kind + '_delta', contentIndex, delta: text },
+      },
+    };
+    sendFrame(encodeFrame(frame.type, frame.seq, frame.data));
+  }
+
   const sink = {
     skeleton,
     send(record: { type: string; seq: number; data: unknown }): void {
-      if (replaying) replayPending.push(record);
-      else sendFrame(encodeFrame(record.type, record.seq, record.data));
+      if (replaying) { replayPending.push(record); return; }
+      // Coalesce streaming deltas
+      if (record.type === 'message_update') {
+        const ev = (record.data as { assistantMessageEvent?: { type?: string; contentIndex?: number; delta?: string } }).assistantMessageEvent;
+        if (ev && (ev.type === 'text_delta' || ev.type === 'thinking_delta')) {
+          const kind = ev.type === 'text_delta' ? 'text' as const : 'thinking' as const;
+          if (deltaBuf && deltaBuf.kind === kind && deltaBuf.contentIndex === ev.contentIndex) {
+            deltaBuf.text += ev.delta ?? '';
+            deltaBuf.seq = record.seq;
+          } else {
+            flushDeltas();
+            deltaBuf = { kind, contentIndex: ev.contentIndex ?? 0, text: ev.delta ?? '', seq: record.seq };
+          }
+          if (!deltaTimer) deltaTimer = setTimeout(flushDeltas, 60);
+          return;
+        }
+        // Non-delta event: flush pending deltas FIRST to preserve order
+        flushDeltas();
+      }
+      sendFrame(encodeFrame(record.type, record.seq, record.data));
     },
     close(): void {
+      if (deltaTimer) clearTimeout(deltaTimer);
+      flushDeltas();
       cleanup();
     },
   };
