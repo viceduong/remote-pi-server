@@ -221,12 +221,28 @@ export class Session {
     else entry.reject(new Error(obj.error ?? `RPC error: ${obj.command}`));
   }
 
+  /** Push a lightweight status frame to skeleton sinks. Status is derived
+   *  server-side from the authoritative busy/phase/error fields. */
+  private pushStatus(): void {
+    const status = {
+      working: this.busy || this.phase === 'streaming',
+      phase: this.phase,
+      error: this.error,
+    };
+    const record = { seq: ++this.seq, type: 'agent_status', data: { type: 'agent_status', ...status } as unknown as RpcEvent };
+    for (const sink of this.sinks) {
+      if ((sink as { skeleton?: boolean }).skeleton) sink.send(record);
+    }
+  }
+
   handleEvent(obj: RpcEvent): void {
     this.lastActivityAt = Date.now();
     if (obj.type === 'turn_start') {
       this.busy = true;
       this.lastTurnStartAt = Date.now();
       this.phase = 'streaming';
+      this.error = null;
+      this.pushStatus();
     }
     else if (obj.type === 'turn_end') {
       // Pi can still be internally processing between turn_end and agent_end.
@@ -237,7 +253,11 @@ export class Session {
       this.busy = false;
       this.phase = 'awaitingInput';
       this.promptReserved = false;
+      this.pushStatus();
       this.onIdle?.();
+    }
+    else if (obj.type === 'agent_settled') {
+      this.pushStatus();
     }
     else if (obj.type === 'message_update') {
       // NOTE: do NOT clear busy on per-message 'done'/'error' — a turn with
@@ -249,7 +269,10 @@ export class Session {
       const msgs = obj.messages as unknown[] | undefined;
       if (Array.isArray(msgs)) this.messageCount = msgs.length;
     }
-    if (obj.type === 'error') this.error = String((obj.error as { message?: string } | string) ?? 'agent error');
+    if (obj.type === 'error') {
+      this.error = String((obj.error as { message?: string } | string) ?? 'agent error');
+      this.pushStatus();
+    }
 
     // file_update payloads are live-only (replay would double-append in the
     // app) and can be huge — keep them OUT of the replay ring entirely.
@@ -602,6 +625,14 @@ export class Session {
 
 
   /** Events whose payload is dominated by tool output text. */
+  /** True for tool-call/output events (focus clients drop them entirely). */
+  isToolEvent(record: { type: string; data: unknown }): boolean {
+    if (record.type.startsWith('tool_execution')) return true;
+    const msg = (record.data as { message?: { role?: string; toolName?: string } }).message;
+    if (msg?.role === 'tool' || msg?.role === 'toolResult' || msg?.toolName) return true;
+    return false;
+  }
+
   isToolHeavyEvent(record: { type: string; data: unknown }): boolean {
     if (record.type === 'tool_execution_update' || record.type === 'tool_execution_end') return true;
     if (record.type === 'message_end' || record.type === 'message_start') {

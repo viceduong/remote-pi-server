@@ -112,6 +112,21 @@ export function attachSse(
   const sink = {
     skeleton,
     send(record: { type: string; seq: number; data: unknown }): void {
+      // Skeleton clients: stream ONLY user input + assistant response.
+      // Tool events (calls, outputs, execution progress) are dropped — the
+      // assistant's prose already describes what it did.
+      const d = record.data as { message?: { role?: string; toolName?: string } };
+      if (
+        record.type === 'tool_execution_start' ||
+        record.type === 'tool_execution_update' ||
+        record.type === 'tool_execution_end' ||
+        (record.type === 'message_start' && d?.message?.role === 'tool') ||
+        (record.type === 'message_end' && d?.message?.role === 'tool') ||
+        (record.type === 'message_update' && d?.message?.role === 'tool') ||
+        (record.type === 'file_update' && (d?.message?.role === 'tool' || !!d?.message?.toolName))
+      ) {
+        return; // seq NOT advanced: reconnect replays nothing for dropped frames
+      }
       if (replaying) { replayPending.push(record); return; }
       // Coalesce streaming deltas
       if (record.type === 'message_update') {
@@ -143,6 +158,7 @@ export function attachSse(
   session.subscribe(sink);
   sendFrame(': connected\n\n');
   for (const record of replay) {
+    if (skeleton && session.isToolEvent(record)) continue; // focus: drop tool frames
     const data = skeleton && session.isToolHeavyEvent(record)
       ? session.skeletonizeRecordData(record.data) : record.data;
     sendFrame(encodeFrame(record.type, record.seq, data));
