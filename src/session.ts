@@ -584,8 +584,9 @@ export class Session {
     const m = msg as Record<string, unknown>;
     const content = m.content;
     if (typeof content === 'string') {
-      return { ...m, content: content.length > Session.SKELETON_BYTES
-        ? content.slice(0, Session.SKELETON_BYTES) : content };
+      if (content.length <= Session.SKELETON_BYTES) return m;
+      return { ...m, outputTruncated: true,
+        content: content.slice(0, Session.SKELETON_BYTES) };
     }
     if (Array.isArray(content)) {
       let truncated = false;
@@ -594,7 +595,7 @@ export class Session {
         truncated = true;
         return { ...b, text: b.text.slice(0, Session.SKELETON_BYTES), truncated: true };
       });
-      return truncated ? { ...m, content: blocks } : m;
+      return truncated ? { ...m, outputTruncated: true, content: blocks } : m;
     }
     return m;
   }
