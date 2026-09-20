@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 import os from 'node:os';
 import type { FastifyBaseLogger, FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
@@ -216,6 +217,48 @@ export function registerRoutes(
     const items = manager.getQueueItems(id);
     if (!items) return reply.code(404).send({ error: 'Session not found' });
     return { items };
+  });
+
+  // Full tool result for a toolCallId (skeleton mode fetch-on-expand).
+  // Reads the session JSONL tail — the authoritative persisted copy.
+  fastify.get('/api/sessions/:id/toolresult/:toolCallId', async (req, reply) => {
+    const id = parseId(req, reply);
+    if (!id) return;
+    const toolCallId = String((req.params as { toolCallId?: string }).toolCallId ?? '');
+    if (!toolCallId) return reply.code(400).send({ error: 'Missing toolCallId' });
+    const session = manager.find(id);
+    if (!session) return reply.code(404).send({ error: 'Session not found' });
+    try {
+      const stat = fs.statSync(session.file);
+      const tailStart = Math.max(0, stat.size - 4 * 1024 * 1024);
+      const fd = fs.openSync(session.file, 'r');
+      const buf = Buffer.alloc(stat.size - tailStart);
+      const n = fs.readSync(fd, buf, 0, buf.length, tailStart);
+      fs.closeSync(fd);
+      for (const line of buf.subarray(0, n).toString('utf8').split('\n')) {
+        if (!line.trim()) continue;
+        try {
+          const entry = JSON.parse(line) as { type?: string; message?: { role?: string; content?: unknown } };
+          if (entry.type !== 'message' || !entry.message) continue;
+          const msg = entry.message as { role?: string; toolName?: string; content?: unknown };
+          if (msg.role !== 'toolResult' && msg.role !== 'tool') continue;
+          // Match by position in the toolCalls of the preceding assistant? Simpler:
+          // the toolResult line itself carries the call context via its content blocks.
+          // pi JSONL: toolResult messages follow the assistant toolCall. We match by
+          // scanning for the toolCallId in the raw line.
+          if (!line.includes(toolCallId)) continue;
+          const text = typeof msg.content === 'string'
+            ? msg.content
+            : Array.isArray(msg.content)
+              ? (msg.content as { type?: string; text?: string }[]).filter((b) => b.type === 'text').map((b) => b.text ?? '').join('')
+              : '';
+          return { toolCallId, text, isError: Boolean((entry.message as { isError?: boolean }).isError) };
+        } catch { /* skip */ }
+      }
+      return reply.code(404).send({ error: 'Tool result not found' });
+    } catch (err) {
+      return reply.code(502).send({ error: (err as Error).message });
+    }
   });
 
   // pi 0.85 get_session_stats: tokens, cost, context-window usage.

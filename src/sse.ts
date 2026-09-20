@@ -82,7 +82,9 @@ export function attachSse(
   const lastId = lastIdHeader ? Number.parseInt(String(lastIdHeader), 10) : -1;
   const replay = lastId >= 0 ? session.replayAfter(lastId) : [];
 
+  const skeleton = (req.query as { skeleton?: string }).skeleton === '1';
   const sink = {
+    skeleton,
     send(record: { type: string; seq: number; data: unknown }): void {
       if (replaying) replayPending.push(record);
       else sendFrame(encodeFrame(record.type, record.seq, record.data));
@@ -95,7 +97,9 @@ export function attachSse(
   session.subscribe(sink);
   sendFrame(': connected\n\n');
   for (const record of replay) {
-    sendFrame(encodeFrame(record.type, record.seq, record.data));
+    const data = skeleton && session.isToolHeavyEvent(record)
+      ? session.skeletonizeRecordData(record.data) : record.data;
+    sendFrame(encodeFrame(record.type, record.seq, data));
   }
   replaying = false;
   for (const record of replayPending.splice(0).sort((a, b) => a.seq - b.seq)) {

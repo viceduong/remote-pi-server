@@ -28,6 +28,8 @@ export interface RingRecord {
 export interface EventSink {
   send(record: RingRecord): void;
   close?(): void;
+  /** When true, tool output payloads are truncated (focus-mode clients). */
+  skeleton?: boolean;
 }
 
 interface PendingRpc {
@@ -265,7 +267,13 @@ export class Session {
       if (!oldest) break;
       this.ringBytes -= Buffer.byteLength(JSON.stringify(oldest.data));
     }
-    for (const sink of this.sinks) sink.send(record);
+    for (const sink of this.sinks) {
+      if (sink.skeleton && this.isToolHeavyEvent(record)) {
+        sink.send({ ...record, data: this.skeletonizeRecordData(record.data) } as RingRecord);
+      } else {
+        sink.send(record);
+      }
+    }
   }
 
   private onStdoutChunk(chunk: Buffer): void {
@@ -565,7 +573,73 @@ export class Session {
    * PLUS the delta. The app consumes only the delta for text/thinking streams,
    * so ship just the role (keeps tool-vs-assistant routing correct).
    */
+  /** Skeleton mode: truncate tool output in streamed events. Full output is
+   *  persisted in the JSONL and fetchable via /toolresult/:toolCallId. */
+  skeleton = false;
+
+  private static SKELETON_BYTES = 256;
+
+  private skeletonizeToolMessage(msg: unknown): unknown {
+    if (!msg || typeof msg !== 'object') return msg;
+    const m = msg as Record<string, unknown>;
+    const content = m.content;
+    if (typeof content === 'string') {
+      return { ...m, content: content.length > Session.SKELETON_BYTES
+        ? content.slice(0, Session.SKELETON_BYTES) : content };
+    }
+    if (Array.isArray(content)) {
+      let truncated = false;
+      const blocks = (content as { type?: string; text?: string }[]).map((b) => {
+        if (b.type !== 'text' || !b.text || b.text.length <= Session.SKELETON_BYTES) return b;
+        truncated = true;
+        return { ...b, text: b.text.slice(0, Session.SKELETON_BYTES), truncated: true };
+      });
+      return truncated ? { ...m, content: blocks } : m;
+    }
+    return m;
+  }
+
+
+  /** Events whose payload is dominated by tool output text. */
+  isToolHeavyEvent(record: { type: string; data: unknown }): boolean {
+    if (record.type === 'tool_execution_update' || record.type === 'tool_execution_end') return true;
+    if (record.type === 'message_end' || record.type === 'message_start') {
+      const msg = (record.data as { message?: { role?: string } }).message;
+      return msg?.role === 'tool' || msg?.role === 'toolResult';
+    }
+    return false;
+  }
+
+  skeletonizeRecordData(data: unknown): unknown {
+    const d = data as Record<string, unknown>;
+    if (d.partialResult) return { ...d, partialResult: this.skeletonizeToolMessage(d.partialResult) };
+    if (d.result) return { ...d, result: this.skeletonizeToolMessage(d.result) };
+    if (d.message) return { ...d, message: this.skeletonizeToolMessage(d.message) };
+    return d;
+  }
+
   private trimEventForWire(obj: RpcEvent): RpcEvent {
+    // Skeleton mode: shrink tool result payloads before fan-out.
+    if (this.skeleton) {
+      if (obj.type === 'message_end' || obj.type === 'message_start') {
+        const msg = obj.message as { role?: string } | undefined;
+        if (msg && (msg.role === 'tool' || msg.role === 'toolResult')) {
+          return { ...obj, message: this.skeletonizeToolMessage(obj.message) };
+        }
+      }
+      if (obj.type === 'tool_execution_update') {
+        const partial = obj.partialResult as { content?: unknown } | undefined;
+        if (partial?.content) {
+          return { ...obj, partialResult: this.skeletonizeToolMessage(partial) };
+        }
+      }
+      if (obj.type === 'tool_execution_end') {
+        const result = obj.result as { content?: unknown } | undefined;
+        if (result?.content) {
+          return { ...obj, result: this.skeletonizeToolMessage(result) };
+        }
+      }
+    }
     if (obj.type !== 'message_update') return obj;
     const ev = obj.assistantMessageEvent as { type?: string } | undefined;
     if (ev && (ev.type === 'text_delta' || ev.type === 'thinking_delta')) {
