@@ -669,9 +669,22 @@ export class SessionManager {
 
   find(id: string): Session | null {
     if (this.sessions.has(id)) return this.sessions.get(id)!;
-    const meta = this.buildIndex().get(id);
-    if (!meta) return null;
-    return this.sessionFromMeta(meta, 'pi');
+    const index = this.buildIndex();
+    const meta = index.get(id);
+    if (meta) return this.sessionFromMeta(meta, 'pi');
+    // Fork/compaction fallback: pi can change a session's id (branch file).
+    // The app may still hold the OLD id. Match by id PREFIX against the
+    // index (both the key and the header id inside each file) and serve the
+    // newest match — turns blank 404s into the relocated session.
+    const prefix = id.slice(0, 8);
+    let best: SessionFileMeta | null = null;
+    for (const meta of index.values()) {
+      if (meta.id.startsWith(prefix)) {
+        if (!best || (meta.lastMessageAt ?? 0) > (best.lastMessageAt ?? 0)) best = meta;
+      }
+    }
+    if (best) return this.sessionFromMeta(best, 'pi');
+    return null;
   }
 
   private sessionFromMeta(meta: SessionFileMeta, source: 'app' | 'pi'): Session {
