@@ -117,12 +117,15 @@ export function registerRoutes(
       });
     }
 
+    let session;
     try {
-      await manager.ensureRunning(id);
+      // Use the RETURNED session: ensureRunning can re-key the map to pi's
+      // canonical id, which would make a follow-up get(id) miss (404).
+      session = await manager.ensureRunning(id);
     } catch (err) {
       return reply.code((err as { code?: number }).code ?? 409).send({ error: (err as Error).message });
     }
-    const session = manager.get(id) ?? null;
+    session ??= manager.get(id);
     if (!session) return reply.code(404).send({ error: 'Session not found' });
 
     let queued = false;
@@ -442,8 +445,7 @@ export function registerRoutes(
     // PATCH owner-proxy: leased sessions forward abort to the live owner.
     if (manager.getLiveLeaseInfo(id)) {
       try {
-        await manager.ensureRunning(id);
-        const s = manager.get(id);
+        const s = await manager.ensureRunning(id);
         if (s?.isProxy) return { ok: s.send({ type: 'abort' }) };
       } catch { /* fall through to legacy handling */ }
     }

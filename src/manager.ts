@@ -58,6 +58,12 @@ interface SessionFileMeta {
 }
 
 const META_READ_LIMIT = 4096;
+
+// Crash-safe decode: malformed UTF-8 / lone surrogates in session files
+// crashed Node (StringBytes assertion) via Buffer.toString(). TextDecoder
+// (encoding_rs) replaces invalid sequences instead of tripping the assert.
+const utf8Decoder = new TextDecoder('utf-8');
+const decodeUtf8 = (buf: Buffer): string => utf8Decoder.decode(buf);
 const ACTIVE_WINDOW_MS = 5 * 60_000;
 /** A session file touched within this window means the agent is working NOW. */
 const WRITING_WINDOW_MS = 30_000;
@@ -342,6 +348,15 @@ export class SessionManager {
       if (disk && disk.lastMessageAt !== null) {
         live.lastMessageAt = disk.lastMessageAt;
       }
+      // Any other index entry pointing at the SAME file is a stale identity
+      // of this live session (pre-rekey basename key) - drop it or the list
+      // shows the session twice.
+      const liveFile = path.resolve(s.file);
+      for (const k of [...entries.keys()]) {
+        if (k !== s.id && path.resolve(entries.get(k)!.file) === liveFile) {
+          entries.delete(k);
+        }
+      }
       entries.set(s.id, live);
     }
     // External pi agents currently owning a session (from the last probe).
@@ -418,7 +433,7 @@ export class SessionManager {
     let messageCount = 0;
     let lastMessageAt: number | null = null;
 
-    const text = head.toString('utf8');
+    const text = decodeUtf8(head);
     for (const line of text.split('\n')) {
       if (!line.trim()) continue;
       try {
@@ -448,7 +463,7 @@ export class SessionManager {
       const tail = Buffer.alloc(stat.size - tailStart);
       const n = fs.readSync(fd, tail, 0, tail.length, tailStart);
       fs.closeSync(fd);
-      const tailText = tail.subarray(0, n).toString('utf8');
+      const tailText = decodeUtf8(tail.subarray(0, n));
       for (const line of tailText.split('\n')) {
         if (!line.trim()) continue;
         try {
@@ -529,10 +544,61 @@ export class SessionManager {
 
   /* ---------------- lifecycle ---------------- */
 
+  /**
+   * Re-key a started session under pi's canonical id (session.piId - the
+   * JSONL header id). Keying by the file basename split one session into
+   * two identities: the map held the basename while buildIndex keyed the
+   * same file by its header id, so the app saw the session TWICE (duplicate
+   * entry) and sending to the twin spawned a rival child on a locked file
+   * (409). Returns the canonical map key.
+   */
+  private canonicalRekey(session: Session, key: string): string {
+    const piId = session.piId;
+    if (!piId || piId === key || this.sessions.get(key) !== session) return key;
+    this.sessions.delete(key);
+    this.sessions.set(piId, session);
+    // The bridge-id placeholder file (named by the old key) stays empty on
+    // disk and surfaces as a phantom dead session - remove it.
+    try {
+      const placeholder = this.sessionFile(key);
+      if (path.resolve(placeholder) !== path.resolve(session.file) && fs.existsSync(placeholder)) {
+        if (fs.statSync(placeholder).size === 0) fs.unlinkSync(placeholder);
+      }
+    } catch { /* best effort */ }
+    this.invalidateIndex();
+    this.options.log.info({ from: key, to: piId }, 'session re-keyed to canonical pi id');
+    return piId;
+  }
+
+  /**
+   * Free agent slots by stopping the stalest idle managed session (never
+   * busy/streaming/proxied/errored, queue empty, untouched for >60s).
+   * Sessions stay listed on disk - only the child process is released.
+   * Returns true if at least one slot is available afterwards.
+   */
+  private ensureAgentSlot(): boolean {
+    if (this.runningCount < this.options.maxAgents) return true;
+    const now = Date.now();
+    const evictable = [...this.sessions.values()]
+      .filter((x) => x.running
+        && !x.busy
+        && !x.isProxy
+        && x.phase !== 'streaming'
+        && !x.error
+        && x.queue.length === 0
+        && now - x.lastActivityAt > 60_000)
+      .sort((a, b) => a.lastActivityAt - b.lastActivityAt);
+    for (const victim of evictable) {
+      if (this.runningCount < this.options.maxAgents) break;
+      this.options.log.info({ sessionId: victim.id }, 'evicting idle agent to free a slot');
+      victim.stop();
+    }
+    return this.runningCount < this.options.maxAgents;
+  }
+
   async create(name: string): Promise<Session> {
-    if (this.runningCount >= this.options.maxAgents) {
-      // No idle-eviction: a single user's attached sessions must never be
-      // killed (mid-turn eviction was a bug source). Hard cap only.
+    if (!this.ensureAgentSlot()) {
+      // No eviction of attached/mid-turn sessions: hard cap only.
       throw new BusyError();
     }
     const id = this.nextId();
@@ -551,27 +617,10 @@ export class SessionManager {
     this.wireQueue(session);
     await session.start();
     this.throwIfDead(session);
-    // Re-key under pi's own session id once known (refreshState rewrites
-    // `file` after get_state). Without this, listPage (keyed by the pi id
-    // from buildIndex) misses the live session and emits a second, dead
-    // entry — the duplicate the iOS app saw after creating a session.
-    const piFile = session.file;
-    const piId = path.basename(piFile, '.jsonl');
-    if (piId !== id) {
-      this.sessions.delete(id);
-      this.sessions.set(piId, session);
-      this.invalidateIndex();
-      // pi writes its own uuid-named JSONL; the bridge-id placeholder file
-      // stays empty on disk and buildIndex surfaces it as a phantom dead
-      // session (the duplicate + blank entry in the iOS list). Remove it.
-      try {
-        const placeholder = this.sessionFile(id);
-        if (path.resolve(placeholder) !== path.resolve(piFile) && fs.existsSync(placeholder)) {
-          const sz = fs.statSync(placeholder).size;
-          if (sz === 0) fs.unlinkSync(placeholder);
-        }
-      } catch { /* best effort */ }
-    }
+    // Re-key under pi's canonical session id (JSONL header id from
+    // get_state) - NOT the file basename. buildIndex keys disk metas by the
+    // header id; a basename key made the same file appear under two ids.
+    this.canonicalRekey(session, id);
     return session;
   }
 
@@ -652,15 +701,23 @@ export class SessionManager {
     }
     const meta = this.buildIndex().get(id);
     if (!meta) return null;
-    if (this.runningCount >= this.options.maxAgents) {
+    if (!this.ensureAgentSlot()) {
       return null; // hard cap only — never evict an attached session
     }
     const session = this.sessionFromMeta(meta, 'pi');
     this.sessions.set(id, session);
     this.wireQueue(session);
-    await session.start();
-    this.throwIfDead(session);
-    return session;
+    try {
+      await session.start();
+      this.throwIfDead(session);
+    } catch (err) {
+      this.sessions.delete(id);
+      throw err;
+    }
+    // The disk meta id and pi's canonical id can differ (renamed/branch
+    // file) - normalize so later lookups by either id hit the same Session.
+    const canonical = this.canonicalRekey(session, id);
+    return this.sessions.get(canonical) ?? session;
   }
 
   get(id: string): Session | null {
@@ -777,8 +834,19 @@ export class SessionManager {
     const out: SessionSummary[] = [];
     const liveByFile = new Map<string, Session>();
     for (const s of this.sessions.values()) liveByFile.set(path.resolve(s.file), s);
+    const emittedLive = new Set<Session>();
+    const emittedFiles = new Set<string>();
     for (const meta of index.values()) {
-      const live = this.sessions.get(meta.id) ?? liveByFile.get(path.resolve(meta.file));
+      const fileKey = path.resolve(meta.file);
+      const live = this.sessions.get(meta.id) ?? liveByFile.get(fileKey);
+      // One session must never occupy two list rows: skip metas resolving
+      // to an already-emitted live session or an already-emitted file.
+      if (live) {
+        if (emittedLive.has(live)) continue;
+        emittedLive.add(live);
+      }
+      if (emittedFiles.has(fileKey)) continue;
+      emittedFiles.add(fileKey);
       if (live) {
         const sum = live.toSummary();
         if (meta.lastMessageAt !== null) sum.lastMessageAt = meta.lastMessageAt;
@@ -1080,7 +1148,7 @@ export class SessionManager {
           const buf = Buffer.alloc(stat.size - tailStart);
           const n = fs.readSync(fd, buf, 0, buf.length, tailStart);
           fs.closeSync(fd);
-          for (const line of buf.subarray(0, n).toString('utf8').split('\n')) {
+          for (const line of decodeUtf8(buf.subarray(0, n)).split('\n')) {
             if (!line.trim()) continue;
             try {
               const entry = JSON.parse(line) as { type?: string; message?: { role?: string; content?: unknown } };
@@ -1112,7 +1180,7 @@ export class SessionManager {
       const n = fs.readSync(fd, buf, 0, buf.length, tailStart);
       fs.closeSync(fd);
       const want = message.trim();
-      for (const line of buf.subarray(0, n).toString('utf8').split('\n')) {
+      for (const line of decodeUtf8(buf.subarray(0, n)).split('\n')) {
         if (!line.trim()) continue;
         try {
           const entry = JSON.parse(line) as { type?: string; message?: { role?: string; content?: unknown } };

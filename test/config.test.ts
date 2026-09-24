@@ -6,7 +6,7 @@ describe('loadConfig', () => {
     const c = loadConfig({});
     expect(c.REMOTE_PI_PORT).toBe(8787);
     expect(c.REMOTE_PI_HOST).toBe('127.0.0.1');
-    expect(c.REMOTE_PI_MAX_AGENTS).toBe(4);
+    expect(c.REMOTE_PI_MAX_AGENTS).toBe(6);
     expect(c.PI_BIN).toBe('pi');
   });
 

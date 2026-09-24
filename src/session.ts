@@ -67,6 +67,14 @@ export class Session {
   onIdle: (() => void) | null = null;
   /** Called whenever the child exits so durable queue state can recover. */
   onExit: (() => void) | null = null;
+
+  /**
+   * pi's own session id (JSONL header id, from get_state). The manager keys
+   * sessions by this once known — the file basename is just a storage name
+   * (the bridge placeholder id) and keying by it split one session into two
+   * list entries (the iOS duplicate + 409-on-send bug).
+   */
+  piId: string | null = null;
   /** Runtime phase derived from the owner's event stream. */
   phase: SessionPhase = 'idle';
   /** Read-only mirror mode: file watcher only, no pi process (convertible). */
@@ -448,7 +456,10 @@ export class Session {
     // State priming is advisory; give it a longer window without weakening
     // normal command timeouts.
     const st = await this.request<AgentState>({ type: 'get_state' }, 30_000);
-    if (st.sessionId) this.file = st.sessionFile ?? this.file;
+    if (st.sessionId) {
+      this.piId = st.sessionId;
+      this.file = st.sessionFile ?? this.file;
+    }
     if (st.sessionName) this.name = st.sessionName;
     if (st.model) this.model = `${st.model.provider}/${st.model.modelId ?? st.model.id ?? ''}`;
     if (typeof st.messageCount === 'number') this.messageCount = st.messageCount;

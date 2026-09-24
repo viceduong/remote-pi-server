@@ -15,7 +15,7 @@ const EnvSchema = z.object({
   REMOTE_PI_NAME: z.string().min(1).optional(),
   REMOTE_PI_WORKDIR: z.string().min(1).default(process.cwd()),
   REMOTE_PI_SESSION_DIR: z.string().min(1).optional(),
-  REMOTE_PI_MAX_AGENTS: z.coerce.number().int().min(1).max(16).default(4),
+  REMOTE_PI_MAX_AGENTS: z.coerce.number().int().min(1).max(16).default(6),
   REMOTE_PI_IDLE_KILL_MS: z.coerce.number().int().min(60_000).default(45 * 60_000),
   REMOTE_PI_EXTRA_ARGS: z.string().default(''),
   PI_BIN: z.string().min(1).default('pi'),
