@@ -288,6 +288,118 @@ export function registerRoutes(
       fs.writeFileSync(statsSidecar(file), JSON.stringify(sanitizeStats(stats)));
     } catch { /* best effort */ }
   };
+  // Estimate context usage for sessions whose agent RPC cannot serve stats
+  // (host-owned sessions proxied to owner extensions predating
+  // get_session_stats): context tokens come from the LAST assistant usage in
+  // the session file (pi's calculateContextTokens: totalTokens ||
+  // input+output+cacheRead+cacheWrite), the window from get_state's model.
+  // Verified context windows for models the owner proxy may report by id
+  // only (model_change entries carry provider+modelId, not the window).
+  const KNOWN_MODEL_CONTEXT_WINDOWS: Record<string, number> = {
+    'merge-gateway/zai/glm-5.3-flash': 1_000_000,
+    'zai/glm-5.3-flash': 1_000_000,
+    'glm-5.3-flash': 1_000_000,
+  };
+  const estimateContextUsage = async (
+    session: import('./session.js').Session,
+  ): Promise<Record<string, unknown> | null> => {
+    // Verified context windows for models reported by id only (model_change
+    // entries carry provider+modelId, not the window).
+    const KNOWN_MODEL_CONTEXT_WINDOWS: Record<string, number> = {
+      'merge-gateway/zai/glm-5.3-flash': 1_000_000,
+      'zai/glm-5.3-flash': 1_000_000,
+      'glm-5.3-flash': 1_000_000,
+    };
+    let contextWindow = 0;
+    let modelId: string | null = null;
+    // 1. Exact value when the agent can answer get_state (owner proxy
+    //    snapshots carry ctx.getContextUsage(); native pi children report a
+    //    model object).
+    try {
+      const st = await session.request<{
+        model?: unknown;
+        contextUsage?: { tokens?: number | null; contextWindow?: number | null; percent?: number | null } | null;
+      }>({ type: 'get_state' }, 8_000);
+      const cu = st.contextUsage;
+      if (
+        cu && typeof cu.percent === 'number' && typeof cu.tokens === 'number'
+        && typeof cu.contextWindow === 'number' && cu.contextWindow > 0
+      ) {
+        return { tokens: cu.tokens, contextWindow: cu.contextWindow, percent: cu.percent };
+      }
+      const model = st.model;
+      if (typeof model === 'string') modelId = model;
+      else if (model && typeof model === 'object') {
+        const m = model as { id?: string; provider?: string; modelId?: string; contextWindow?: number };
+        if (typeof m.contextWindow === 'number' && m.contextWindow > 0) contextWindow = m.contextWindow;
+        if (typeof m.id === 'string') modelId = m.id;
+        else if (typeof m.provider === 'string' && typeof m.modelId === 'string') modelId = `${m.provider}/${m.modelId}`;
+      }
+    } catch {
+      /* not running or unsupported - fall through to the file */
+    }
+    if (!contextWindow && modelId) {
+      contextWindow = KNOWN_MODEL_CONTEXT_WINDOWS[modelId]
+        ?? KNOWN_MODEL_CONTEXT_WINDOWS[modelId.split('/').pop() ?? ''] ?? 0;
+    }
+    // 2. File-based: one tail pass for the LAST assistant usage and the LAST
+    //    model_change. Works for dead sessions and old owner extensions.
+    try {
+      const stat = fs.statSync(session.file);
+      const tailStart = Math.max(0, stat.size - 4 * 1024 * 1024);
+      const fd = fs.openSync(session.file, 'r');
+      const buf = Buffer.alloc(stat.size - tailStart);
+      const n = fs.readSync(fd, buf, 0, buf.length, tailStart);
+      fs.closeSync(fd);
+      const lines = new TextDecoder('utf8').decode(buf.subarray(0, n)).split('\n');
+      let usageTokens = 0;
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const line = (lines[i] ?? '').trim();
+        if (!line) continue;
+        let entry: {
+          type?: string;
+          provider?: string;
+          modelId?: string;
+          message?: {
+            role?: string;
+            stopReason?: string;
+            usage?: { totalTokens?: number; input?: number; output?: number; cacheRead?: number; cacheWrite?: number };
+          };
+        };
+        try {
+          entry = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (!usageTokens && entry.type === 'message' && entry.message?.role === 'assistant'
+            && entry.message.stopReason !== 'aborted' && entry.message.stopReason !== 'error'
+            && entry.message.usage) {
+          const u = entry.message.usage;
+          usageTokens = u.totalTokens
+            ?? (u.input ?? 0) + (u.output ?? 0) + (u.cacheRead ?? 0) + (u.cacheWrite ?? 0);
+        }
+        if (!modelId && entry.type === 'model_change' && typeof entry.modelId === 'string') {
+          modelId = entry.provider ? `${entry.provider}/${entry.modelId}` : entry.modelId;
+        }
+        if (usageTokens && modelId) break;
+      }
+      if (!contextWindow && modelId) {
+        contextWindow = KNOWN_MODEL_CONTEXT_WINDOWS[modelId]
+          ?? KNOWN_MODEL_CONTEXT_WINDOWS[modelId.split('/').pop() ?? ''] ?? 0;
+      }
+      if (contextWindow > 0 && usageTokens > 0) {
+        return {
+          tokens: usageTokens,
+          contextWindow,
+          percent: Math.round((usageTokens / contextWindow) * 10_000) / 100,
+        };
+      }
+    } catch {
+      /* file unreadable */
+    }
+    return null;
+  };
+
   // The iOS stats decode is strict: null VALUES inside contextUsage (seeded
   // sidecars, models without a context window) threw and hid the widget bar.
   // Drop null-valued keys; omit contextUsage entirely when unusable.
@@ -321,14 +433,38 @@ export function registerRoutes(
         writeStatsSidecar(fileKey, clean);
         return { stats: clean };
       } catch (err) {
+        // Agent can't serve stats (e.g. host-owned session on an older owner
+        // extension): build the best answer from sidecar totals + a context
+        // estimate from the file itself.
         const stale = cached();
-        if (stale) return stale;
-        return reply.code(502).send({ error: (err as Error).message });
+        const base = (stale?.stats ?? statsCache.get(fileKey) ?? {
+          tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+          cost: 0,
+        }) as Record<string, unknown>;
+        const estimated = await estimateContextUsage(session);
+        const merged = estimated ? { ...base, contextUsage: estimated } : base;
+        const clean = sanitizeStats(merged);
+        statsCache.set(fileKey, clean);
+        writeStatsSidecar(fileKey, clean);
+        return { stats: clean, stale: true };
       }
     }
+    // Dead session: sidecar totals + a file-based context estimate (the
+    // estimate works without any agent - usage + model_change from the tail).
     const stale = cached();
-    if (stale) return { stats: sanitizeStats(stale.stats), stale: true };
-    return reply.code(409).send({ error: 'Session is not running' });
+    const estimated = await estimateContextUsage(session);
+    if (!stale && !estimated) {
+      return reply.code(409).send({ error: 'Session is not running' });
+    }
+    const base = (stale?.stats ?? {
+      tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      cost: 0,
+    }) as Record<string, unknown>;
+    const merged = estimated ? { ...base, contextUsage: estimated } : base;
+    const clean = sanitizeStats(merged);
+    statsCache.set(fileKey, clean);
+    writeStatsSidecar(fileKey, clean);
+    return { stats: clean, stale: true };
   });
 
   fastify.delete('/api/sessions/:id/queue/:itemId', async (req, reply) => {
