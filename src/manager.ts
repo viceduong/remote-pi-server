@@ -8,7 +8,7 @@ import { mapAgentMessage } from './history.js';
 import { manglePath } from './paths.js';
 import type { AgentMessage, AgentState, ChatMessage, LiveInstance, SessionSummary } from './types.js';
 import { probeLivePiInstances, type LivePiInstance } from './live.js';
-import { readLease, isLeaseHeld, type Lease } from './lease.js';
+import { readLease, isLeaseHeld, leasePath, type Lease } from './lease.js';
 import { queueFilePath, type QueueItem } from './queue.js';
 
 export interface SessionManagerOptions {
@@ -131,9 +131,14 @@ export class SessionManager {
 
       const mapped = new Map<string, number>();
       const used = new Set<string>();
-      // Candidate external sessions, freshest first.
+      // Candidate external sessions, freshest first. Lease-held sessions are
+      // EXACTLY mapped by buildIndex - probing must not steal them.
       const candidates = this.walkAllMetas()
-        .filter((m) => !this.sessions.has(m.id) || !this.sessions.get(m.id)!.running)
+        .filter((m) => {
+          if (this.sessions.has(m.id) && this.sessions.get(m.id)!.running) return false;
+          const lease = readLease(m.file);
+          return !(lease && isLeaseHeld(lease));
+        })
         .sort((a, b) => b.lastActivityAt - a.lastActivityAt);
 
       // Pass 1: exact cwd match (POSIX: /proc/<pid>/cwd; Windows: P/Invoke).
@@ -367,6 +372,17 @@ export class SessionManager {
         meta.livePid = pid;
       }
     }
+    // AUTHORITATIVE ownership signal: a held lease means a live host TUI has
+    // this session open. Probe-based cwd/recency mapping guesses; leases are
+    // exact. Runs after the probe overlay so it corrects wrong mappings.
+    for (const meta of entries.values()) {
+      if (meta.live) continue;
+      const lease = readLease(meta.file);
+      if (lease && isLeaseHeld(lease)) {
+        meta.live = true;
+        meta.livePid = lease.holder.pid;
+      }
+    }
     this.indexCache = { at: now, entries };
     return entries;
   }
@@ -532,8 +548,9 @@ export class SessionManager {
       messageCount: s.messageCount,
       lastMessageAt: s.lastActivityAt,
       active: s.busy,
-      live: false,
-      livePid: null,
+      // A proxied session is owned by a live host terminal.
+      live: s.isProxy,
+      livePid: s.ownerLease?.holder.pid ?? null,
       writing: s.busy,
     };
   }
@@ -867,10 +884,11 @@ export class SessionManager {
         if (meta.lastMessageAt !== null) sum.lastMessageAt = meta.lastMessageAt;
         out.push(sum);
       } else {
+        const owned = meta.live; // held lease or probe match: a live host pi owns it
         out.push({
           id: meta.id,
           name: meta.name,
-          running: false,
+          running: owned,
           busy: false,
           model: null,
           messageCount: meta.messageCount,
@@ -878,11 +896,11 @@ export class SessionManager {
           lastActivityAt: meta.lastActivityAt,
           lastMessageAt: meta.lastMessageAt,
           error: null,
-          phase: meta.live ? 'streaming' : 'idle',
-          owner: meta.live ? 'terminal' : 'none',
+          phase: owned ? 'streaming' : 'idle',
+          owner: owned ? 'terminal' : 'none',
           source: 'pi',
           workdir: meta.workdir,
-          active: meta.active,
+          active: owned || meta.active,
           live: meta.live,
           livePid: meta.livePid,
           writing: meta.writing,
