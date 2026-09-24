@@ -48,7 +48,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
  *  - busy tracking from turn/message lifecycle events
  */
 export class Session {
-  readonly id: string;
+  id: string;
   name: string;
   file: string;
   /** Working directory the agent runs in (from session metadata when resuming). */

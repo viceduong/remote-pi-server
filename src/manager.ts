@@ -556,6 +556,11 @@ export class SessionManager {
     const piId = session.piId;
     if (!piId || piId === key || this.sessions.get(key) !== session) return key;
     this.sessions.delete(key);
+    // The id FIELD must become canonical too: toSummary(), SSE payloads and
+    // the buildIndex live overlay all use it. Leaving it stale made create()
+    // hand the app the old placeholder id, whose next lookup missed and
+    // spawned a rival child on the same JSONL (the 409).
+    session.id = piId;
     this.sessions.set(piId, session);
     // The bridge-id placeholder file (named by the old key) stays empty on
     // disk and surfaces as a phantom dead session - remove it.
@@ -701,6 +706,15 @@ export class SessionManager {
     }
     const meta = this.buildIndex().get(id);
     if (!meta) return null;
+    // Another managed session already owns this file (id re-keyed after a
+    // create) — reuse it instead of spawning a rival child on the same JSONL.
+    const reqFile = path.resolve(meta.file);
+    for (const existing of this.sessions.values()) {
+      if (path.resolve(existing.file) === reqFile) {
+        if (!existing.running) await existing.start();
+        return existing;
+      }
+    }
     if (!this.ensureAgentSlot()) {
       return null; // hard cap only — never evict an attached session
     }
