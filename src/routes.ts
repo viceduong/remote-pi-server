@@ -285,8 +285,23 @@ export function registerRoutes(
   };
   const writeStatsSidecar = (file: string, stats: Record<string, unknown>): void => {
     try {
-      fs.writeFileSync(statsSidecar(file), JSON.stringify(stats));
+      fs.writeFileSync(statsSidecar(file), JSON.stringify(sanitizeStats(stats)));
     } catch { /* best effort */ }
+  };
+  // The iOS stats decode is strict: null VALUES inside contextUsage (seeded
+  // sidecars, models without a context window) threw and hid the widget bar.
+  // Drop null-valued keys; omit contextUsage entirely when unusable.
+  const sanitizeStats = (stats: Record<string, unknown>): Record<string, unknown> => {
+    const cu = stats.contextUsage;
+    if (!cu || typeof cu !== 'object') return stats;
+    const clean: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(cu as Record<string, unknown>)) {
+      if (v !== null && v !== undefined) clean[k] = v;
+    }
+    const out = { ...stats };
+    if (typeof clean.percent !== 'number') delete out.contextUsage;
+    else out.contextUsage = clean;
+    return out;
   };
   fastify.get('/api/sessions/:id/stats', async (req, reply) => {
     const id = parseId(req, reply);
@@ -301,9 +316,10 @@ export function registerRoutes(
     if (session.running) {
       try {
         const stats = await session.request<Record<string, unknown>>({ type: 'get_session_stats' }, 15_000);
-        statsCache.set(fileKey, stats);
-        writeStatsSidecar(fileKey, stats);
-        return { stats };
+        const clean = sanitizeStats(stats);
+        statsCache.set(fileKey, clean);
+        writeStatsSidecar(fileKey, clean);
+        return { stats: clean };
       } catch (err) {
         const stale = cached();
         if (stale) return stale;
@@ -311,7 +327,7 @@ export function registerRoutes(
       }
     }
     const stale = cached();
-    if (stale) return stale;
+    if (stale) return { stats: sanitizeStats(stale.stats), stale: true };
     return reply.code(409).send({ error: 'Session is not running' });
   });
 
