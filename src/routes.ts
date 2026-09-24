@@ -239,7 +239,9 @@ export function registerRoutes(
       const buf = Buffer.alloc(stat.size - tailStart);
       const n = fs.readSync(fd, buf, 0, buf.length, tailStart);
       fs.closeSync(fd);
-      for (const line of buf.subarray(0, n).toString('utf8').split('\n')) {
+      // Crash-safe decode (invalid UTF-8 crashed Node via toString).
+      const tailDecoder = new TextDecoder('utf8');
+      for (const line of tailDecoder.decode(buf.subarray(0, n)).split('\n')) {
         if (!line.trim()) continue;
         try {
           const entry = JSON.parse(line) as { type?: string; message?: { role?: string; content?: unknown } };

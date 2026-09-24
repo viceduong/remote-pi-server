@@ -108,7 +108,7 @@ export class Session {
     }
   }
   private readonly pending = new Map<string, PendingRpc>();
-  private seq = 0;
+  seq = 0;
   private rpcCounter = 0;
   private stopping = false;
   private restartTimer: NodeJS.Timeout | null = null;
@@ -307,8 +307,15 @@ export class Session {
     }
   }
 
+  // Streaming decoders: pi pipes can carry invalid UTF-8; toString() on it
+  // crashes Node (StringBytes assertion). TextDecoder replaces + carries
+  // split multibyte sequences across chunks (stream:true).
+  private rpcDecoder = new TextDecoder('utf8');
+  private ownerDecoder = new TextDecoder('utf8');
+  private watchDecoder = new TextDecoder('utf8');
+
   private onStdoutChunk(chunk: Buffer): void {
-    this.buffer += chunk.toString('utf8');
+    this.buffer += this.rpcDecoder.decode(chunk, { stream: true });
     if (Buffer.byteLength(this.buffer, 'utf8') > MAX_RPC_LINE_BYTES) {
       const newline = this.buffer.indexOf('\n');
       this.buffer = newline >= 0 ? this.buffer.slice(newline + 1) : '';
@@ -371,7 +378,7 @@ export class Session {
 
     child.stdout?.on('data', (d: Buffer) => this.onStdoutChunk(d));
     child.stderr?.on('data', (d: Buffer) => {
-      const line = d.toString().trim();
+      const line = new TextDecoder('utf8').decode(d).trim();
       this.stderrTail.push(line);
       if (this.stderrTail.length > 40) this.stderrTail.shift();
       this.log.debug({ sessionId: this.id, chunk: line }, 'pi stderr');
@@ -554,7 +561,7 @@ export class Session {
         const timer = setTimeout(() => reject(new Error('owner hello timeout')), 3000).unref();
         const onHello = (d: Buffer) => {
           try {
-            const line = d.toString('utf8').split('\n')[0] ?? '';
+            const line = new TextDecoder('utf8').decode(d).split('\n')[0] ?? '';
             const obj = JSON.parse(line) as { type?: string; success?: boolean };
             if (obj.type === 'response') {
               socket.removeListener('data', onHello);
@@ -578,7 +585,7 @@ export class Session {
   }
 
   private onOwnerChunk(chunk: Buffer): void {
-    this.ownerBuffer += chunk.toString('utf8');
+    this.ownerBuffer += this.ownerDecoder.decode(chunk, { stream: true });
     let idx: number;
     while ((idx = this.ownerBuffer.indexOf('\n')) >= 0) {
       const line = this.ownerBuffer.slice(0, idx).replace(/\r$/, '');
@@ -797,7 +804,7 @@ export class Session {
       } finally {
         fs.closeSync(fd);
       }
-      const text = this.fileRemainder + buf.toString('utf8');
+      const text = this.fileRemainder + this.watchDecoder.decode(buf, { stream: true });
       const parts = text.split('\n');
       this.fileRemainder = parts.pop() ?? '';
       this.fileOffset = stat.size - Buffer.byteLength(this.fileRemainder, 'utf8');

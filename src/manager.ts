@@ -1535,6 +1535,10 @@ export class SessionManager {
     const chunk = Buffer.alloc(1024 * 1024);
     const out: ChatMessage[] = [];
     let carry = '';
+    // Streaming decoder: invalid UTF-8 in session files crashed Node
+    // (StringBytes assertion) via toString(). TextDecoder replaces invalid
+    // sequences; stream:true carries split multibyte chars across chunks.
+    const decoder = new TextDecoder('utf8');
     const consume = (line: string) => {
       if (!line.trim()) return;
       let entry: { type?: string; id?: string; message?: AgentMessage };
@@ -1554,14 +1558,14 @@ export class SessionManager {
       do {
         n = fs.readSync(fd, chunk, 0, chunk.length, null);
         if (!n) break;
-        const text = SessionManager.sanitizeText(carry + chunk.subarray(0, n).toString('utf8'));
+        const text = SessionManager.sanitizeText(carry + decoder.decode(chunk.subarray(0, n), { stream: true }));
         const lines = text.split('\n');
         carry = lines.pop() ?? '';
         // Same OOM guard as countMessageEntries: drop monster single lines.
         if (carry.length > 8 * 1024 * 1024) carry = '';
         for (const line of lines) consume(line);
       } while (n > 0);
-      consume(carry);
+      consume(carry + decoder.decode());
     } finally {
       fs.closeSync(fd);
     }

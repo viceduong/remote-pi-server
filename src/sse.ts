@@ -167,6 +167,15 @@ export function attachSse(
   for (const record of replayPending.splice(0).sort((a, b) => a.seq - b.seq)) {
     if (record.seq > lastId) sendFrame(encodeFrame(record.type, record.seq, record.data));
   }
+  // Status snapshot: agent_status frames are not in the replay ring, so a
+  // freshly (re)connected client had no idea whether the agent was working
+  // until the NEXT transition. Send the authoritative current status now.
+  sendFrame(encodeFrame('agent_status', session.seq, {
+    type: 'agent_status',
+    working: session.busy || session.phase === 'streaming',
+    phase: session.phase,
+    error: session.error,
+  }));
 
   const keepalive = setInterval(() => {
     try {

@@ -10,8 +10,9 @@ export async function detectPiVersion(bin: string): Promise<string | null> {
       ? spawn('cmd.exe', ['/c', bin, '--version'], { windowsHide: true })
       : spawn(bin, ['--version'], { windowsHide: true });
     let out = '';
-    child.stdout.on('data', (d: Buffer) => (out += d.toString()));
-    child.stderr.on('data', (d: Buffer) => (out += d.toString()));
+    const dec = new TextDecoder('utf8');
+    child.stdout.on('data', (d: Buffer) => (out += dec.decode(d, { stream: true })));
+    child.stderr.on('data', (d: Buffer) => (out += dec.decode(d, { stream: true })));
     child.on('error', () => undefined);
     const [code] = await once(child, 'close') as [number | null];
     if (code !== 0 && out.trim() === '') return null;
