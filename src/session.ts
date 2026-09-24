@@ -380,6 +380,7 @@ export class Session {
     child.on('error', (err) => {
       this.error = err.message;
       this.log.error({ sessionId: this.id, err: err.message }, 'pi spawn failed');
+      this.pushStatus();
     });
 
     child.on('close', (code, signal) => {
@@ -424,6 +425,9 @@ export class Session {
       this.busy = false;
       this.promptReserved = false;
       this.phase = 'terminated';
+      // Authoritative not-working frame for connected skeleton clients
+      // (agent_exited alone was ignored by them, leaving stale status).
+      this.pushStatus();
       for (const p of this.pending.values()) {
         clearTimeout(p.timer);
         p.reject(new Error('Agent exited'));
@@ -529,6 +533,7 @@ export class Session {
         this.ownerSocket = null;
         this.busy = false;
         this.phase = 'terminated';
+        this.pushStatus();
         for (const p of this.pending.values()) {
           clearTimeout(p.timer);
           p.reject(new Error('Owner disconnected'));

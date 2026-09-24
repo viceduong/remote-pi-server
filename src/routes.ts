@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
+import path from 'node:path';
 import type { FastifyBaseLogger, FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { BusyError, type SessionManager } from './manager.js';
@@ -265,27 +266,50 @@ export function registerRoutes(
   });
 
   // pi 0.85 get_session_stats: tokens, cost, context-window usage.
-  // Last-known stats cache (per session file) so mirror/idle sessions still
-  // show the context/token/cost strip in the app.
+  // Last-known stats (per session FILE): in-memory cache + on-disk sidecar
+  // so idle/dead sessions and post-restart requests still show the
+  // context/token/cost strip in the app. Keyed by resolved file path so id
+  // aliases (placeholder id vs canonical pi id) hit the same entry.
+  // Sidecars are <file>.stats.json — NOT *.jsonl, so the index walk ignores
+  // them.
   const statsCache = new Map<string, Record<string, unknown>>();
+  const statsSidecar = (file: string): string => `${file}.stats.json`;
+  const readStatsSidecar = (file: string): Record<string, unknown> | null => {
+    try {
+      return JSON.parse(fs.readFileSync(statsSidecar(file), 'utf8')) as Record<string, unknown>;
+    } catch {
+      return null;
+    }
+  };
+  const writeStatsSidecar = (file: string, stats: Record<string, unknown>): void => {
+    try {
+      fs.writeFileSync(statsSidecar(file), JSON.stringify(stats));
+    } catch { /* best effort */ }
+  };
   fastify.get('/api/sessions/:id/stats', async (req, reply) => {
     const id = parseId(req, reply);
     if (!id) return;
     const session = manager.find(id);
     if (!session) return reply.code(404).send({ error: 'Session not found' });
+    const fileKey = path.resolve(session.file);
+    const cached = (): { stats: Record<string, unknown>; stale: boolean } | null => {
+      const mem = statsCache.get(fileKey) ?? readStatsSidecar(fileKey);
+      return mem ? { stats: mem, stale: true } : null;
+    };
     if (session.running) {
       try {
         const stats = await session.request<Record<string, unknown>>({ type: 'get_session_stats' }, 15_000);
-        statsCache.set(id, stats);
+        statsCache.set(fileKey, stats);
+        writeStatsSidecar(fileKey, stats);
         return { stats };
       } catch (err) {
-        const cached = statsCache.get(id);
-        if (cached) return { stats: cached, stale: true };
+        const stale = cached();
+        if (stale) return stale;
         return reply.code(502).send({ error: (err as Error).message });
       }
     }
-    const cached = statsCache.get(id);
-    if (cached) return { stats: cached, stale: true };
+    const stale = cached();
+    if (stale) return stale;
     return reply.code(409).send({ error: 'Session is not running' });
   });
 

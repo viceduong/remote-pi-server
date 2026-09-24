@@ -792,6 +792,7 @@ export class SessionManager {
     if (purge && file) {
       try { fs.unlinkSync(file); } catch { /* already gone */ }
       try { fs.unlinkSync(queueFilePath(this.options.sessionDir, file)); } catch { /* already gone */ }
+      try { fs.unlinkSync(`${file}.stats.json`); } catch { /* already gone */ }
     }
     this.invalidateIndex();
     return session !== undefined || mirror !== undefined || file !== undefined;
