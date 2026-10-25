@@ -15,6 +15,12 @@ const EVENT_RING_CAPACITY = 500;
 const EVENT_RING_MAX_BYTES = 8 * 1024 * 1024;
 const RPC_TIMEOUT_MS = 10_000;
 const FILE_WATCH_DEBOUNCE_MS = 250;
+/** Markers the ask_user_question extension uses when it must fall back to
+ *  select() (pi's RPC UI adapter has no custom components). The title carries
+ *  the questionnaire JSON; the answer comes back as the select VALUE. */
+export const RPC_QUESTION_PREFIX = 'pi-questionnaire:';
+const RPC_ANSWER_PREFIX = 'pi-answers:';
+
 const MAX_RPC_LINE_BYTES = 16 * 1024 * 1024;
 
 /** One event record in the replay ring. */
@@ -229,6 +235,39 @@ export class Session {
     else entry.reject(new Error(obj.error ?? `RPC error: ${obj.command}`));
   }
 
+  /** Unanswered questionnaire request (id + questions) for SSE replay. */
+  pendingQuestion: { requestId: string; questions: unknown } | null = null;
+
+  /**
+   * Answer a pending questionnaire: write the extension_ui_response back to
+   * pi (or forward it to the host owner over IPC) and fan out the resolved
+   * frame so every connected client dismisses its card.
+   */
+  answerQuestion(requestId: string, answers: unknown[], cancelled: boolean): boolean {
+    if (!this.pendingQuestion || this.pendingQuestion.requestId !== requestId) return false;
+    const frame: Record<string, unknown> = { type: 'extension_ui_response', id: requestId };
+    if (cancelled) frame.cancelled = true;
+    else frame.value = `${RPC_ANSWER_PREFIX}${JSON.stringify({ answers, cancelled: false })}`;
+    // Only bridge children (plain RPC children) ever use the marker
+    // transport: host TUIs render questionnaires with custom components
+    // in-process, so a proxied session never has a pendingQuestion.
+    if (!this.proc?.stdin) return false;
+    try {
+      this.proc.stdin.write(`${JSON.stringify(frame)}\n`);
+    } catch {
+      return false;
+    }
+    this.pendingQuestion = null;
+    const record = {
+      seq: ++this.seq,
+      type: 'agent_question_resolved',
+      data: { type: 'agent_question_resolved', requestId },
+    };
+    for (const sink of this.sinks) sink.send(record);
+    this.pushStatus();
+    return true;
+  }
+
   /** Push a lightweight status frame to skeleton sinks. Status is derived
    *  server-side from the authoritative busy/phase/error fields. */
   private pushStatus(): void {
@@ -245,6 +284,38 @@ export class Session {
 
   handleEvent(obj: RpcEvent): void {
     this.lastActivityAt = Date.now();
+    // Questionnaire transport: the ask_user_question extension embeds the
+    // questionnaire JSON in a select() title when running over RPC. Capture
+    // it as a first-class agent_question frame (skeleton clients only) and
+    // remember it so a reconnecting app can still render the card.
+    if (obj.type === 'extension_ui_request') {
+      const req = obj as unknown as {
+        id?: string;
+        method?: string;
+        title?: string;
+        options?: unknown[];
+      };
+      if (req.method === 'select' && typeof req.title === 'string'
+          && req.title.startsWith(RPC_QUESTION_PREFIX)) {
+        let questions: unknown = [];
+        try {
+          questions = (JSON.parse(req.title.slice(RPC_QUESTION_PREFIX.length)) as { questions?: unknown }).questions ?? [];
+        } catch {
+          questions = [];
+        }
+        const requestId = String(req.id ?? '');
+        this.pendingQuestion = { requestId, questions };
+        const record = {
+          seq: ++this.seq,
+          type: 'agent_question',
+          data: { type: 'agent_question', requestId, questions },
+        };
+        for (const sink of this.sinks) {
+          if ((sink as { skeleton?: boolean }).skeleton) sink.send(record);
+        }
+        return; // never forward the raw transport frame
+      }
+    }
     if (obj.type === 'turn_start') {
       this.busy = true;
       this.lastTurnStartAt = Date.now();

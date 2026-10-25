@@ -176,6 +176,14 @@ export function attachSse(
     phase: session.phase,
     error: session.error,
   }));
+  // A questionnaire awaiting an answer must survive reconnects / late opens.
+  if (session.pendingQuestion) {
+    sendFrame(encodeFrame('agent_question', session.seq, {
+      type: 'agent_question',
+      requestId: session.pendingQuestion.requestId,
+      questions: session.pendingQuestion.questions,
+    }));
+  }
 
   const keepalive = setInterval(() => {
     try {

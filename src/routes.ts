@@ -91,6 +91,31 @@ export function registerRoutes(
     return { session: summary };
   });
 
+  const AnswerQuestionSchema = z.object({
+    answers: z.array(z.object({
+      questionIndex: z.number().int().min(0),
+      question: z.string(),
+      kind: z.enum(['option', 'custom', 'chat', 'multi']),
+      answer: z.string().nullable(),
+      selected: z.array(z.string()).optional(),
+      notes: z.string().optional(),
+      preview: z.string().optional(),
+    })).optional(),
+    cancelled: z.boolean().optional(),
+  });
+  fastify.post('/api/sessions/:id/question/:requestId', async (req, reply) => {
+    const id = parseId(req, reply);
+    if (!id) return;
+    const body = AnswerQuestionSchema.safeParse(req.body);
+    if (!body.success) return reply.code(400).send({ error: 'Invalid body', issues: body.error.issues });
+    const session = manager.find(id);
+    if (!session) return reply.code(404).send({ error: 'Session not found' });
+    const requestId = String((req.params as { requestId?: string }).requestId ?? '');
+    const ok = session.answerQuestion(requestId, body.data.answers ?? [], body.data.cancelled === true);
+    if (!ok) return reply.code(409).send({ error: 'No pending question with that id' });
+    return { ok: true };
+  });
+
   fastify.post('/api/sessions/:id/turn', async (req, reply) => {
     const id = parseId(req, reply);
     if (!id) return;
