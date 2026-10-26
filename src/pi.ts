@@ -15,7 +15,7 @@ export async function detectPiVersion(bin: string): Promise<string | null> {
     child.stderr.on('data', (d: Buffer) => (out += dec.decode(d, { stream: true })));
     child.on('error', () => undefined);
     const [code] = await once(child, 'close') as [number | null];
-    if (code !== 0 && out.trim() === '') return null;
+    if (code !== 0) return null; // e.g. cmd.exe "not recognized" text is not a version
     return out.trim() || null;
   } catch {
     return null;

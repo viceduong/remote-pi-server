@@ -88,13 +88,29 @@ export interface ChatMessage {
   model: string | null;
   timestamp: number | null;
   errorMessage: string | null;
+  /** CONTRACT §3: set on user rows the server can map to a delivered queue item. */
+  clientMessageId?: string;
 }
 
 /** Runtime phase of a session (derived from the owner's event stream). */
 export type SessionPhase = 'idle' | 'streaming' | 'awaitingInput' | 'terminated';
 
-/** Who owns the session's agent runtime (the single writer). */
-export type SessionOwner = 'none' | 'terminal' | 'bridge';
+/** Who owns the session's agent runtime (the single writer, from leases). */
+export type SessionOwner = 'none' | 'tui' | 'bridge';
+
+/** CONTRACT §5 status phase carried by `agent_status` frames. */
+export type StatusPhase = 'idle' | 'waiting' | 'streaming' | 'error' | 'exited';
+
+export interface AgentStatusFrame {
+  type: 'agent_status';
+  phase: StatusPhase;
+  busy: boolean;
+  /** Legacy alias of `busy` for pre-v2 iOS builds. */
+  working: boolean;
+  error?: string;
+  owner: SessionOwner;
+  [key: string]: unknown;
+}
 
 export interface SessionSummary {
   id: string;
@@ -116,10 +132,11 @@ export interface SessionSummary {
   source: 'app' | 'pi';
   /** True when the file was modified recently (likely live on the host). */
   active: boolean;
-  /** True when an external (non-bridge) pi process owns this session. */
+  /** True when a host TUI holds the ownership lease (owner === 'tui'). */
   live: boolean;
+  /** Lease holder pid when owner === 'tui'. */
   livePid: number | null;
-  /** True when the session file was written in the last 30s (agent working now). */
+  /** True when the session file was written in the last 30s. */
   writing: boolean;
 }
 
@@ -131,6 +148,7 @@ export interface ServerConfig {
   features: string[];
 }
 
+/** /api/status `liveInstances[]` — now derived from held TUI leases. */
 export interface LiveInstance {
   pid: number;
   cwd: string | null;

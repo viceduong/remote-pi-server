@@ -1,64 +1,118 @@
 import zlib from 'node:zlib';
-import type { FastifyReply, FastifyRequest } from 'fastify';
-import type { FastifyBaseLogger } from 'fastify';
-import type { Session } from './session.js';
+import type { FastifyBaseLogger, FastifyReply, FastifyRequest } from 'fastify';
+import { isToolEvent, type EventSink, type RingRecord, type Session } from './session.js';
 
-let seqCounter = 0;
 const KEEPALIVE_MS = 15_000;
-/** Slow-consumer cap: if a sink queues more than this many frames, the client
- *  is too slow — drop the connection (it will reconnect + replay). */
+/** Slow-consumer cap: a sink queuing more than this is dropped (it reconnects + replays). */
 const MAX_PENDING_FRAMES = 300;
 const MAX_PENDING_BYTES = 8 * 1024 * 1024;
+const DELTA_FLUSH_MS = 60;
+const RETRY_MS = 3_000;
+
+/* ---------------- CONTRACT §1: ids + reset ---------------- */
+
+export interface ParsedEventId {
+  epoch: string;
+  seq: number;
+}
+
+/** `<epoch>-<seq>` → parts; null when unparsable (legacy numeric ids included). */
+export function parseEventId(raw: string | undefined | null): ParsedEventId | null {
+  if (!raw) return null;
+  const at = raw.lastIndexOf('-');
+  if (at <= 0) return null;
+  const epoch = raw.slice(0, at);
+  const seqText = raw.slice(at + 1);
+  if (!/^\d+$/.test(seqText)) return null;
+  const seq = Number(seqText);
+  return Number.isSafeInteger(seq) ? { epoch, seq } : null;
+}
+
+export type ReplayDecision =
+  | { kind: 'live' }
+  | { kind: 'replay'; records: RingRecord[] }
+  | { kind: 'reset'; reason: 'epoch' | 'gap' | 'ahead' };
+
+export interface ReplaySource {
+  epoch: string;
+  seq: number;
+  /** Highest seq evicted from the ring. */
+  ringFloor: number;
+  ringSnapshot(): readonly RingRecord[];
+}
 
 /**
- * Server-Sent Events connection. Writes `event:/id:/data:` frames through a
- * gzip stream with proper backpressure: when the socket is congested
- * (gzip.write returns false) frames are queued in a bounded buffer and
- * flushed on 'drain'; a client that outruns the cap is disconnected rather
- * than unboundedly buffering in memory.
+ * Decide what a (re)connecting client gets:
+ *  - no Last-Event-ID → live;
+ *  - same epoch, seq inside the ring → replay frames after it;
+ *  - different epoch / unparsable → reset(epoch); seq beyond current → reset(ahead);
+ *    seq older than the ring's retained window → reset(gap).
+ */
+export function resolveReplay(lastEventId: string | undefined, src: ReplaySource): ReplayDecision {
+  if (!lastEventId) return { kind: 'live' };
+  const parsed = parseEventId(lastEventId);
+  if (!parsed || parsed.epoch !== src.epoch) return { kind: 'reset', reason: 'epoch' };
+  if (parsed.seq > src.seq) return { kind: 'reset', reason: 'ahead' };
+  if (parsed.seq < src.ringFloor) return { kind: 'reset', reason: 'gap' };
+  return { kind: 'replay', records: src.ringSnapshot().filter((r) => r.seq > parsed.seq) };
+}
+
+export function encodeFrame(event: string, id: string, json: string): string {
+  return `event: ${event}\nid: ${id}\ndata: ${json}\n\n`;
+}
+
+export interface SseExtras {
+  /** Current pending queue (CONTRACT §2) — sent as a snapshot on connect. */
+  queueSnapshot?: () => unknown[];
+}
+
+/**
+ * Server-Sent Events connection: gzip with real backpressure (bounded
+ * buffer, drop slow consumers), per-sink delta coalescing, focus-mode tool
+ * filtering, epoch-seq ids with replay/reset, and a status snapshot.
  */
 export function attachSse(
   req: FastifyRequest,
   reply: FastifyReply,
   session: Session,
   log: FastifyBaseLogger,
+  extras: SseExtras = {},
 ): void {
   reply.hijack();
   const raw = reply.raw;
-  const gzip = zlib.createGzip({ level: zlib.constants.Z_BEST_SPEED });
-  gzip.pipe(raw);
+  // Negotiate compression: gzip only when the client advertises it
+  // (URLSession always does); plain text otherwise (curl, EventSource polyfills).
+  const acceptsGzip = /\bgzip\b/i.test(String(req.headers['accept-encoding'] ?? ''));
+  const gz = acceptsGzip ? zlib.createGzip({ level: zlib.constants.Z_BEST_SPEED }) : null;
+  if (gz) gz.pipe(raw);
+  const out: NodeJS.WritableStream = gz ?? raw;
+  const flushOut = (): void => { gz?.flush(); };
 
   raw.writeHead(200, {
     'Content-Type': 'text/event-stream; charset=utf-8',
     'Cache-Control': 'no-cache, no-transform',
     Connection: 'keep-alive',
-    'Content-Encoding': 'gzip',
+    ...(gz ? { 'Content-Encoding': 'gzip' } : {}),
+    Vary: 'Accept-Encoding',
     'X-Accel-Buffering': 'no',
   });
 
   let closed = false;
   let paused = false;
-  let pausedAt = 0;
   let pendingBytes = 0;
-  let replaying = true;
-  const replayPending: Array<{ type: string; seq: number; data: unknown }> = [];
   const pending: string[] = [];
 
   const flush = (): void => {
-    // drain means gzip can accept data again. The old implementation forgot
-    // this reset and permanently wedged every congested SSE connection.
     paused = false;
-    pausedAt = 0;
     while (!paused && pending.length > 0) {
       const frame = pending.shift()!;
-      pendingBytes -= Buffer.byteLength(frame);
-      if (!gzip.write(frame)) {
+      pendingBytes -= frame.length;
+      if (!out.write(frame)) {
         paused = true;
-        pausedAt = Date.now();
-        gzip.once('drain', flush);
+        out.once('drain', flush);
         break;
       }
-      gzip.flush();
+      flushOut();
     }
   };
 
@@ -66,154 +120,112 @@ export function attachSse(
     if (closed) return;
     if (paused) {
       pending.push(frame);
-      pendingBytes += Buffer.byteLength(frame);
+      pendingBytes += frame.length;
       if (pending.length > MAX_PENDING_FRAMES || pendingBytes > MAX_PENDING_BYTES) cleanup();
       return;
     }
-    const ok = gzip.write(frame);
-    gzip.flush();
+    const ok = out.write(frame);
+    flushOut();
     if (!ok) {
       paused = true;
-      pausedAt = Date.now();
-      gzip.once('drain', flush);
+      out.once('drain', flush);
     }
   };
 
-  const lastIdHeader = req.headers['last-event-id'];
-  const lastId = lastIdHeader ? Number.parseInt(String(lastIdHeader), 10) : -1;
-  const replay = lastId >= 0 ? session.replayAfter(lastId) : [];
-
   const skeleton = (req.query as { skeleton?: string }).skeleton === '1';
 
-  // Delta coalescing: text/thinking deltas stream at token rate; shipping
-  // each one is 5-8x more frames than needed. Buffer them per-sink and flush
-  // every 60ms as a single merged delta.
-  let deltaBuf: { kind: 'text' | 'thinking'; contentIndex: number; text: string; seq: number } | null = null;
+  // Delta coalescing: text/thinking deltas stream at token rate; merge them
+  // per sink and flush every 60 ms as one delta carrying the LAST id.
+  let deltaBuf: { kind: 'text' | 'thinking'; contentIndex: number; text: string; id: string } | null = null;
   let deltaTimer: NodeJS.Timeout | null = null;
 
   function flushDeltas(): void {
+    if (deltaTimer) clearTimeout(deltaTimer);
     deltaTimer = null;
     const buf = deltaBuf;
     if (!buf) return;
     deltaBuf = null;
-    const kind = buf.kind, contentIndex = buf.contentIndex, text = buf.text;
-    // Use the seq of the LAST buffered delta so Last-Event-ID stays correct.
-    const frame = {
+    const data = {
       type: 'message_update',
-      seq: buf.seq,
-      data: {
-        type: 'message_update',
-        assistantMessageEvent: { type: kind + '_delta', contentIndex, delta: text },
-      },
+      assistantMessageEvent: { type: `${buf.kind}_delta`, contentIndex: buf.contentIndex, delta: buf.text },
     };
-    sendFrame(encodeFrame(frame.type, frame.seq, frame.data));
+    sendFrame(encodeFrame('message_update', buf.id, JSON.stringify(data)));
   }
 
-  const sink = {
-    skeleton,
-    send(record: { type: string; seq: number; data: unknown }): void {
-      // Skeleton clients: stream ONLY user input + assistant response.
-      // Tool events (calls, outputs, execution progress) are dropped — the
-      // assistant's prose already describes what it did.
-      const d = record.data as { message?: { role?: string; toolName?: string } };
-      if (
-        record.type === 'tool_execution_start' ||
-        record.type === 'tool_execution_update' ||
-        record.type === 'tool_execution_end' ||
-        (record.type === 'message_start' && d?.message?.role === 'tool') ||
-        (record.type === 'message_end' && d?.message?.role === 'tool') ||
-        (record.type === 'message_update' && d?.message?.role === 'tool') ||
-        (record.type === 'file_update' && (d?.message?.role === 'tool' || !!d?.message?.toolName))
-      ) {
-        return; // seq NOT advanced: reconnect replays nothing for dropped frames
-      }
-      if (replaying) { replayPending.push(record); return; }
-      // Coalesce streaming deltas
-      if (record.type === 'message_update') {
-        const ev = (record.data as { assistantMessageEvent?: { type?: string; contentIndex?: number; delta?: string } }).assistantMessageEvent;
-        if (ev && (ev.type === 'text_delta' || ev.type === 'thinking_delta')) {
-          const kind = ev.type === 'text_delta' ? 'text' as const : 'thinking' as const;
-          if (deltaBuf && deltaBuf.kind === kind && deltaBuf.contentIndex === ev.contentIndex) {
-            deltaBuf.text += ev.delta ?? '';
-            deltaBuf.seq = record.seq;
-          } else {
-            flushDeltas();
-            deltaBuf = { kind, contentIndex: ev.contentIndex ?? 0, text: ev.delta ?? '', seq: record.seq };
-          }
-          if (!deltaTimer) deltaTimer = setTimeout(flushDeltas, 60);
-          return;
+  const write = (record: RingRecord): void => {
+    // Focus clients stream ONLY user input + assistant prose (+ status).
+    if (skeleton && isToolEvent(record)) return; // incl. file_update rows of role tool
+    if (record.type === 'message_update') {
+      const ev = (record.data as { assistantMessageEvent?: { type?: string; contentIndex?: number; delta?: string } }).assistantMessageEvent;
+      if (ev && (ev.type === 'text_delta' || ev.type === 'thinking_delta')) {
+        const kind = ev.type === 'text_delta' ? 'text' as const : 'thinking' as const;
+        const contentIndex = ev.contentIndex ?? 0;
+        if (deltaBuf && deltaBuf.kind === kind && deltaBuf.contentIndex === contentIndex) {
+          deltaBuf.text += ev.delta ?? '';
+          deltaBuf.id = record.id;
+        } else {
+          flushDeltas();
+          deltaBuf = { kind, contentIndex, text: ev.delta ?? '', id: record.id };
         }
-        // Non-delta event: flush pending deltas FIRST to preserve order
-        flushDeltas();
+        if (!deltaTimer) deltaTimer = setTimeout(flushDeltas, DELTA_FLUSH_MS);
+        return;
       }
-      sendFrame(encodeFrame(record.type, record.seq, record.data));
-    },
+    }
+    flushDeltas(); // preserve order: pending deltas go before any other frame
+    sendFrame(encodeFrame(record.type, record.id, record.json));
+  };
+
+  const sink: EventSink = {
+    skeleton,
+    send: write,
     close(): void {
-      if (deltaTimer) clearTimeout(deltaTimer);
       flushDeltas();
       cleanup();
     },
   };
 
+  // Subscribe and replay synchronously — no event can interleave.
   session.subscribe(sink);
-  sendFrame(': connected\n\n');
-  for (const record of replay) {
-    if (skeleton && session.isToolEvent(record)) continue; // focus: drop tool frames
-    const data = skeleton && session.isToolHeavyEvent(record)
-      ? session.skeletonizeRecordData(record.data) : record.data;
-    sendFrame(encodeFrame(record.type, record.seq, data));
+  // `retry:` tells EventSource-style clients how fast to reconnect (WHATWG).
+  sendFrame(`retry: ${RETRY_MS}\n: connected\n\n`);
+  const currentId = (): string => `${session.epoch}-${session.seq}`;
+  const lastId = req.headers['last-event-id'];
+  const decision = resolveReplay(Array.isArray(lastId) ? lastId[0] : lastId, session);
+  if (decision.kind === 'reset') {
+    sendFrame(encodeFrame('reset', currentId(), JSON.stringify({ type: 'reset', reason: decision.reason })));
+  } else if (decision.kind === 'replay') {
+    for (const record of decision.records) write(record);
+    flushDeltas();
   }
-  replaying = false;
-  for (const record of replayPending.splice(0).sort((a, b) => a.seq - b.seq)) {
-    if (record.seq > lastId) sendFrame(encodeFrame(record.type, record.seq, record.data));
-  }
-  // Status snapshot: agent_status frames are not in the replay ring, so a
-  // freshly (re)connected client had no idea whether the agent was working
-  // until the NEXT transition. Send the authoritative current status now.
-  sendFrame(encodeFrame('agent_status', session.seq, {
-    type: 'agent_status',
-    working: session.busy || session.phase === 'streaming',
-    phase: session.phase,
-    error: session.error,
-  }));
-  // A questionnaire awaiting an answer must survive reconnects / late opens.
+  // Authoritative status snapshot (agent_status frames are live-only).
+  sendFrame(encodeFrame('agent_status', currentId(), JSON.stringify(session.statusFrame())));
   if (session.pendingQuestion) {
-    sendFrame(encodeFrame('agent_question', session.seq, {
+    sendFrame(encodeFrame('agent_question', currentId(), JSON.stringify({
       type: 'agent_question',
       requestId: session.pendingQuestion.requestId,
       questions: session.pendingQuestion.questions,
-    }));
+    })));
+  }
+  if (extras.queueSnapshot) {
+    sendFrame(encodeFrame('queue_update', currentId(), JSON.stringify({ type: 'queue_update', items: extras.queueSnapshot() })));
   }
 
-  const keepalive = setInterval(() => {
-    try {
-      sendFrame(': keepalive\n\n');
-    } catch {
-      cleanup();
-    }
-  }, KEEPALIVE_MS);
+  const keepalive = setInterval(() => sendFrame(': keepalive\n\n'), KEEPALIVE_MS);
   keepalive.unref();
 
   function cleanup(): void {
     if (closed) return;
     closed = true;
     clearInterval(keepalive);
+    if (deltaTimer) clearTimeout(deltaTimer);
     session.unsubscribe(sink);
     try {
-      gzip.end();
+      out.end();
     } catch { /* already closed */ }
   }
 
-  gzip.on('error', cleanup);
+  gz?.on('error', cleanup);
   raw.on('error', cleanup);
   req.raw.on('close', cleanup);
   log.debug({ sessionId: session.id }, 'sse client connected');
-}
-
-function encodeFrame(event: string, seq: number, data: unknown): string {
-  return (
-    `event: ${event}\n` +
-    `id: ${seq}\n` +
-    `data: ${JSON.stringify(data)}\n\n`
-  );
 }

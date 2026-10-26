@@ -7,6 +7,7 @@ import { logger } from './logger.js';
 import { SessionManager } from './manager.js';
 import { detectPiVersion } from './pi.js';
 import { registerRoutes } from './routes.js';
+import { rateLimitKey } from './ratelimit.js';
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -27,44 +28,42 @@ async function main(): Promise<void> {
   const app = Fastify({
     logger: false, // request logs off; app errors go through our pino logger
     bodyLimit: 1_048_576,
+    // cloudflared / local reverse proxies connect from loopback: trust only
+    // those hops for X-Forwarded-For so req.ip is the real client.
+    trustProxy: ['127.0.0.1', '::1'],
   });
 
-  // gzip: session history payloads are multi-MB JSON — compression cuts
-  // transfer ~10x (URLSession decompresses transparently).
+  // gzip for JSON (history payloads are multi-MB). SSE does its own per-frame
+  // flushed gzip and is hijacked, so this never buffers event frames.
   await app.register(compress, { threshold: 1024 });
-  // Industry-standard hardening for an internet-exposed token service.
   await app.register(helmet, { contentSecurityPolicy: false });
   await app.register(rateLimit, {
-    max: 300,        // per IP per minute (SSE connections are long-lived)
+    max: 300, // per token+client per minute (SSE connections are long-lived)
     timeWindow: '1 minute',
-    keyGenerator: (req) => req.ip,
+    keyGenerator: rateLimitKey,
   });
 
   app.setErrorHandler((err: FastifyError, req, reply) => {
     logger.error({ err: err.message, url: req.url }, 'request error');
-    reply.code(err.statusCode ?? 500).send({ error: err.message ?? 'Internal error' });
+    void reply.code(err.statusCode ?? 500).send({ error: err.message ?? 'Internal error' });
   });
 
   registerRoutes(app, { config, manager, piVersion, log: logger as unknown as FastifyBaseLogger });
 
   await app.listen({ host: config.REMOTE_PI_HOST, port: config.REMOTE_PI_PORT });
 
-  // Memory + sink telemetry: the growth curve proves a leak or a fix. The
-  // 8GB OOM crashes (this turn's find) were the cause of the app-wide
-  // "renders unreliably" — the server died, SSE died with it.
+  // Memory + sink telemetry (growth curve proves a leak or a fix).
   const memTimer = setInterval(() => {
     const mem = process.memoryUsage();
     const sinks = manager.sinkCounts();
-    const sinkTotal = Object.values(sinks).reduce((a, b) => a + b, 0);
-    logger.info(
-      {
-        heapMB: Math.round(mem.heapUsed / 1048576),
-        rssMB: Math.round(mem.rss / 1048576),
-        sinkTotal,
-        sessions: Object.keys(sinks).length,
-      },
-      'telemetry',
-    );
+    logger.info({
+      heapMB: Math.round(mem.heapUsed / 1048576),
+      rssMB: Math.round(mem.rss / 1048576),
+      sinkTotal: Object.values(sinks).reduce((a, b) => a + b, 0),
+      sessions: Object.keys(sinks).length,
+      runningAgents: manager.runningCount,
+      historyCacheMB: Math.round(manager.files.cachedMessageBytes / 1048576),
+    }, 'telemetry');
   }, 5 * 60_000);
   memTimer.unref();
 
@@ -77,14 +76,27 @@ async function main(): Promise<void> {
     auth: config.REMOTE_PI_TOKEN ? 'Bearer token' : 'DISABLED (open LAN)',
   }, 'Remote Pi server started');
 
+  // Graceful shutdown: drain SSE, stop children (their close handlers release
+  // bridge leases), close the HTTP server, exit. NSSM stops the Windows
+  // service with Ctrl+C (SIGINT) / Ctrl+Break (SIGBREAK); systemd uses SIGTERM.
+  let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     logger.info({ signal }, 'shutting down');
-    manager.stopAll();
-    await app.close();
+    const hardExit = setTimeout(() => process.exit(1), 10_000);
+    hardExit.unref();
+    try {
+      await manager.shutdown(5_000);
+      await app.close();
+    } catch (err) {
+      logger.error({ err: (err as Error).message }, 'shutdown error');
+    }
     process.exit(0);
   };
-  process.on('SIGINT', () => void shutdown('SIGINT'));
-  process.on('SIGTERM', () => void shutdown('SIGTERM'));
+  for (const sig of ['SIGINT', 'SIGTERM', 'SIGBREAK', 'SIGHUP'] as const) {
+    process.on(sig, () => void shutdown(sig));
+  }
 }
 
 main().catch((err) => {

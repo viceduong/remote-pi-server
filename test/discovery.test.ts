@@ -17,6 +17,7 @@ function makeManager() {
     idleKillMs: 60_000,
     extraArgs: [],
     log: pino({ enabled: false }),
+    noTimers: true,
   });
 }
 
@@ -30,7 +31,7 @@ afterEach(() => {
 });
 
 describe('SessionManager discovery', () => {
-  it('discovers nested pi session files with metadata', () => {
+  it('discovers nested pi session files with metadata', async () => {
     // Simulate pi's layout: <sessiondir>/--C--Users-Admin--/<id>.jsonl
     const projDir = path.join(dir, '--C--Users-Admin--');
     fs.mkdirSync(projDir, { recursive: true });
@@ -46,7 +47,7 @@ describe('SessionManager discovery', () => {
     fs.utimesSync(file, past, past);
 
     manager = makeManager();
-    const sessions = manager.list();
+    const sessions = await manager.list();
 
     expect(sessions).toHaveLength(1);
     const s = sessions[0]!;
@@ -58,14 +59,14 @@ describe('SessionManager discovery', () => {
     expect(s.running).toBe(false);
   });
 
-  it('marks recently-modified sessions as active', () => {
+  it('marks recently-modified sessions as active', async () => {
     const projDir = path.join(dir, '--C--Users-Admin--');
     fs.mkdirSync(projDir, { recursive: true });
     const file = path.join(projDir, 'abc.jsonl');
     fs.writeFileSync(file, JSON.stringify({ type: 'session', id: 'abc' })); // fresh mtime
 
     manager = makeManager();
-    const s = manager.list()[0]!;
+    const s = (await manager.list())[0]!;
     expect(s.active).toBe(true);
     expect(s.lastActivityAt).toBeGreaterThan(0);
   });

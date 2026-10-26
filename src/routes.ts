@@ -2,27 +2,92 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import type { FastifyBaseLogger, FastifyInstance, FastifyRequest } from 'fastify';
+import type { FastifyBaseLogger, FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
-import { BusyError, type SessionManager } from './manager.js';
-import type { ChatMessage } from './types.js';
+import { BusyError, SessionLiveError, SpawnError, type SessionManager } from './manager.js';
+import { LeaseHeldError, type Session } from './session.js';
 import { attachSse } from './sse.js';
+import { readTailLines, parseEntry } from './jsonl.js';
+import { isVisibleMessage } from './visibility.js';
+import { isActive } from './queue.js';
 import type { Env } from './config.js';
 import type { ServerConfig } from './types.js';
 
+/* ---------------- request schemas (zod on every body/query) ---------------- */
+
+const IDEMPOTENCY_KEY = z.string().regex(/^[A-Za-z0-9._:-]{1,128}$/);
+const flag = z.enum(['0', '1', 'true', 'false']).optional().transform((v) => v === '1' || v === 'true');
+const intQ = (def: number, min: number, max: number) => z.coerce.number().int().min(min).max(max).optional().default(def);
+const tsQ = z.coerce.number().int().positive().optional();
+
 const CreateSessionSchema = z.object({
   name: z.string().max(80).optional(),
+  /** Idempotency key: a repeat within 10 min returns the same session. */
+  clientRequestId: IDEMPOTENCY_KEY.optional(),
 });
 
 const TurnSchema = z.object({
   message: z.string().min(1).max(50_000),
   streamingBehavior: z.enum(['steer', 'followUp']).optional(),
   // Client-generated idempotency key; legacy clients may omit it.
-  clientMessageId: z.string().regex(/^[A-Za-z0-9._:-]{1,128}$/).optional(),
+  clientMessageId: IDEMPOTENCY_KEY.optional(),
 });
+const TurnQuery = z.object({ force: flag });
+const ListQuery = z.object({ limit: intQ(50, 1, 200), before: tsQ });
+const MessagesQuery = z.object({
+  limit: intQ(100, 1, 500),
+  before: tsQ,
+  since: z.string().min(1).max(128).optional(),
+  visible: flag,
+});
+const DeleteQuery = z.object({ purge: flag, force: flag });
+const EventsQuery = z.object({ skeleton: flag });
+const AnswerQuestionSchema = z.object({
+  answers: z.array(z.object({
+    questionIndex: z.number().int().min(0),
+    question: z.string(),
+    kind: z.enum(['option', 'custom', 'chat', 'multi']),
+    answer: z.string().nullable(),
+    selected: z.array(z.string()).optional(),
+    notes: z.string().optional(),
+    preview: z.string().optional(),
+  })).optional(),
+  cancelled: z.boolean().optional(),
+});
+const RenameSchema = z.object({ name: z.string().min(1).max(80) });
+const SetModelSchema = z.object({ modelId: z.string().min(1).max(200) });
+const ForkSchema = z.object({
+  entryId: z.string().min(1).max(128).optional(),
+  name: z.string().max(80).optional(),
+  clientRequestId: IDEMPOTENCY_KEY.optional(),
+});
+const EmptyBody = z.union([z.object({}).passthrough(), z.null(), z.undefined()]);
 
 // App-created ids are 16-hex; discovered pi session ids are UUIDs or <ts>_<uuid>.
-const ID_PARAM = z.string().regex(/^[0-9a-fA-F]{16}$|^[0-9A-Za-z_.-]+$/);
+const ID_PARAM = z.string().regex(/^[0-9A-Za-z_.-]{1,128}$/);
+const PARAM_TOKEN = z.string().regex(/^[0-9A-Za-z_.:-]{1,256}$/);
+
+type Reply = FastifyReply;
+
+function parse<T extends z.ZodTypeAny>(schema: T, value: unknown, reply: Reply, what: string): z.infer<T> | null {
+  const r = schema.safeParse(value ?? undefined);
+  if (!r.success) {
+    void reply.code(400).send({ error: `Invalid ${what}`, issues: r.error.issues });
+    return null;
+  }
+  return r.data as z.infer<T>;
+}
+
+/** One mapping from domain errors to HTTP (shape: `{error, code?}`). */
+function sendError(reply: Reply, err: unknown): Reply {
+  const e = err as Error;
+  if (err instanceof BusyError) return reply.code(503).send({ error: e.message, code: 'busy' });
+  if (err instanceof SessionLiveError || err instanceof LeaseHeldError) {
+    return reply.code(409).send({ error: e.message, code: 'session_live' });
+  }
+  if (err instanceof SpawnError) return reply.code(409).send({ error: e.message, code: 'spawn_failed' });
+  return reply.code(409).send({ error: e?.message ?? String(err) });
+}
 
 export function registerRoutes(
   fastify: FastifyInstance,
@@ -42,15 +107,18 @@ export function registerRoutes(
     piVersion,
     api: '1.0',
     workdir: config.REMOTE_PI_WORKDIR,
-    features: ['chat', 'sessions', 'abort', 'history', 'sse'],
+    features: ['chat', 'sessions', 'abort', 'history', 'sse', 'contract-v2'],
   };
+
+  const idOf = (req: FastifyRequest, reply: Reply): string | null =>
+    parse(ID_PARAM, (req.params as { id?: string }).id, reply, 'session id');
 
   fastify.get('/api/health', async () => ({ ok: true, name: publicConfig.name }));
 
   fastify.get('/api/config', async () => publicConfig);
 
   fastify.get('/api/status', async () => {
-    const liveInstances = manager.getLiveInstances();
+    const liveInstances = await manager.getLiveInstances();
     const mem = process.memoryUsage();
     return {
       ...publicConfig,
@@ -60,231 +128,159 @@ export function registerRoutes(
       externalAgents: liveInstances.length,
       memory: { heapUsedMB: Math.round(mem.heapUsed / 1048576), rssMB: Math.round(mem.rss / 1048576) },
       sinks: manager.sinkCounts(),
-      sessions: manager.list(),
+      sessions: await manager.list(),
     };
   });
 
-  fastify.get('/api/sessions', async (req) => {
-    // Cursor pagination: ?limit=N (default 50, max 200) and ?before=<ts>.
-    const limit = Math.min(Math.max(parseInt(String((req.query as { limit?: string }).limit ?? '50'), 10) || 50, 1), 200);
-    const before = parseInt(String((req.query as { before?: string }).before ?? ''), 10) || undefined;
-    return manager.listPage(limit, before);
+  fastify.get('/api/sessions', async (req, reply) => {
+    const q = parse(ListQuery, req.query, reply, 'query');
+    if (!q) return;
+    return manager.listPage(q.limit, q.before);
   });
 
   fastify.post('/api/sessions', async (req, reply) => {
-    const body = CreateSessionSchema.safeParse(req.body);
-    if (!body.success) return reply.code(400).send({ error: 'Invalid body', issues: body.error.issues });
+    const body = parse(CreateSessionSchema, req.body ?? {}, reply, 'body');
+    if (!body) return;
     try {
-      const session = await manager.create(body.data.name ?? '');
-      return reply.code(201).send({ session: session.toSummary() });
+      const session = await manager.create(body.name ?? '', body.clientRequestId);
+      return reply.code(201).send({ session: await manager.summaryOf(session) });
     } catch (err) {
-      if (err instanceof BusyError) return reply.code(503).send({ error: err.message });
-      return reply.code(409).send({ error: (err as Error).message });
+      return sendError(reply, err);
     }
   });
 
   fastify.get('/api/sessions/:id', async (req, reply) => {
-    const id = parseId(req, reply);
+    const id = idOf(req, reply);
     if (!id) return;
-    const summary = manager.summary(id);
+    const summary = await manager.summary(id);
     if (!summary) return reply.code(404).send({ error: 'Session not found' });
     return { session: summary };
   });
 
-  const AnswerQuestionSchema = z.object({
-    answers: z.array(z.object({
-      questionIndex: z.number().int().min(0),
-      question: z.string(),
-      kind: z.enum(['option', 'custom', 'chat', 'multi']),
-      answer: z.string().nullable(),
-      selected: z.array(z.string()).optional(),
-      notes: z.string().optional(),
-      preview: z.string().optional(),
-    })).optional(),
-    cancelled: z.boolean().optional(),
-  });
   fastify.post('/api/sessions/:id/question/:requestId', async (req, reply) => {
-    const id = parseId(req, reply);
+    const id = idOf(req, reply);
     if (!id) return;
-    const body = AnswerQuestionSchema.safeParse(req.body);
-    if (!body.success) return reply.code(400).send({ error: 'Invalid body', issues: body.error.issues });
-    const session = manager.find(id);
+    const requestId = parse(PARAM_TOKEN, (req.params as { requestId?: string }).requestId, reply, 'requestId');
+    if (!requestId) return;
+    const body = parse(AnswerQuestionSchema, req.body ?? {}, reply, 'body');
+    if (!body) return;
+    const session = await manager.find(id);
     if (!session) return reply.code(404).send({ error: 'Session not found' });
-    const requestId = String((req.params as { requestId?: string }).requestId ?? '');
-    const ok = session.answerQuestion(requestId, body.data.answers ?? [], body.data.cancelled === true);
+    const ok = session.answerQuestion(requestId, body.answers ?? [], body.cancelled === true);
     if (!ok) return reply.code(409).send({ error: 'No pending question with that id' });
     return { ok: true };
   });
 
+  /*
+   * Turn write-guard (leases are the only ownership signal):
+   *  - host TUI holds the lease  → proxied to it (202); ?force=1 = graceful
+   *    hello+abort+release handshake, then a bridge child;
+   *  - lease unreadable          → 409 session_live (retry);
+   *  - no lease but the file was written < 30 s ago by a non-lease holder
+   *    → 409 session_live unless ?force=1;
+   *  - otherwise                 → bridge child (spawned on demand).
+   */
   fastify.post('/api/sessions/:id/turn', async (req, reply) => {
-    const id = parseId(req, reply);
+    const id = idOf(req, reply);
     if (!id) return;
-    const body = TurnSchema.safeParse(req.body);
-    if (!body.success) return reply.code(400).send({ error: 'Invalid body', issues: body.error.issues });
+    const q = parse(TurnQuery, req.query, reply, 'query');
+    if (!q) return;
+    const body = parse(TurnSchema, req.body, reply, 'body');
+    if (!body) return;
 
-    // PATCH owner-proxy write-guard:
-    //  - valid lease ⇒ the host TUI is the single writer and we proxy to it;
-    //    no 409 needed (dual-write is structurally impossible now).
-    //  - externally live WITHOUT a lease (legacy host) ⇒ legacy 409 unless
-    //    force=1, which performs a graceful handshake-release then spawns.
-    const force = (req.query as { force?: string }).force === '1' || (req.query as { force?: string }).force === 'true';
-    const liveLease = manager.getLiveLeaseInfo(id);
-    if (liveLease && force) {
+    const own = await manager.ownership(id);
+    if (!own.session) return reply.code(404).send({ error: 'Session not found' });
+    if (own.owner === 'tui' && q.force) {
       const released = await manager.handshakeRelease(id);
       if (!released) {
         return reply.code(409).send({ error: 'Host Pi did not release the session in time', code: 'session_live' });
       }
-    } else if (!liveLease && manager.isExternallyLive(id) && !force) {
+    } else if (own.owner === 'unknown') {
+      return reply.code(409).send({ error: 'Session ownership is temporarily unreadable — retry', code: 'session_live' });
+    } else if (own.owner === 'none' && !q.force && await manager.hasUnownedRecentWriter(id)) {
       return reply.code(409).send({
-        error: manager.isHostWriting(id)
-          ? 'The host terminal is actively working on this session right now. Let it finish, then retry.'
-          : 'Session is live on the host. Stop the host Pi process before sending from RemotePi.',
+        error: 'Another pi process (without the ownership lease) is writing this session right now. Let it finish, or retry with force.',
         code: 'session_live',
       });
     }
 
-    let session;
+    let session: Session | null;
     try {
-      // Use the RETURNED session: ensureRunning can re-key the map to pi's
-      // canonical id, which would make a follow-up get(id) miss (404).
+      // Use the RETURNED session: ensureRunning can re-key to pi's canonical id.
       session = await manager.ensureRunning(id);
     } catch (err) {
-      return reply.code((err as { code?: number }).code ?? 409).send({ error: (err as Error).message });
+      return sendError(reply, err);
     }
-    session ??= manager.get(id);
     if (!session) return reply.code(404).send({ error: 'Session not found' });
 
-    let queued = false;
-    let behavior = body.data.streamingBehavior;
-    // Phase is the AUTHORITATIVE busy signal: it persists through tool
-    // execution gaps where get_state.isStreaming flickers false. Sending a
-    // raw prompt while truly mid-turn makes pi ABORT the running turn.
-    const busyNow = session.busy || session.phase === 'streaming';
-    if (busyNow && !behavior) {
-      if (session.phase === 'streaming') {
-        session.busy = true; // trust the phase — never raw-prompt mid-turn
-      } else {
-        // busy flag stale but phase says idle — verify once; on failure do NOT
-        // queue (an unverifiable agent must not swallow a followUp).
-        let verifiedBusy = session.busy;
-        try {
-          const st = await session.request<{ isStreaming?: boolean }>({ type: 'get_state' });
-          verifiedBusy = st.isStreaming === true;
-        } catch {
-          verifiedBusy = false;
-        }
-        session.busy = verifiedBusy;
-        if (verifiedBusy) session.phase = 'streaming';
-      }
-      if (session.busy) {
-        // Explicit steer/followUp is delegated to Pi; otherwise use the
-        // durable server queue. Never raw-send a prompt during a turn.
-        if (!behavior) {
-          behavior = 'followUp';
-          queued = true;
-        }
-      }
-    }
-    let queueItemId: string | null = null;
     try {
-      // Idempotent clients use the durable queue even when the agent is idle.
-      // A lost HTTP response is therefore safe to retry.
-      if (body.data.clientMessageId && !body.data.streamingBehavior) {
-        const item = manager.enqueuePrompt(session, body.data.message, body.data.clientMessageId);
-        queueItemId = item.id;
-        if (item.status === 'failed') {
-          return reply.code(409).send({ error: item.error ?? 'Previously failed idempotent turn', code: 'turn_failed' });
-        }
-        manager.dispatchQueuedNow(session);
-        return reply.code(202).send({
-          accepted: true,
-          queued: item.status === 'queued' || item.status === 'running',
-          // True when the prompt went to the agent immediately (idle session)
-          // — the client must NOT render a queued chip in that case (it caused
-          // a double bubble: optimistic + queued for every new message).
-          dispatched: item.status === 'running',
-          queueItemId,
-          queueDepth: session.queue.filter((i) => i.status === 'queued' || i.status === 'running').length,
-        });
+      if (body.streamingBehavior) {
+        // Explicit steer/followUp is delegated to pi (or the TUI owner, as
+        // steer/enqueue ops — works with v3 owners too).
+        await session.request({ type: 'prompt', message: body.message, streamingBehavior: body.streamingBehavior }, 8_000);
+        return reply.code(202).send({ accepted: true, queued: false, dispatched: true, queueItemId: null });
       }
-      if (queued) {
-        // Server-owned queue: held, dispatched on turn_end, never lost.
-        const item = manager.enqueuePrompt(session, body.data.message);
-        queueItemId = item.id;
-        return reply.code(202).send({
-          accepted: true, queued: true, queueItemId,
-          queueDepth: session.queue.filter((i) => i.status === 'queued' || i.status === 'running').length,
-        });
+      // Everything else goes through the durable queue: dispatched at once
+      // when the agent is idle, held (never lost, never doubled) when busy.
+      const item = manager.enqueuePrompt(session, body.message, body.clientMessageId);
+      if (item.status === 'failed') {
+        return reply.code(409).send({ error: item.error ?? 'Previously failed idempotent turn', code: 'turn_failed' });
       }
-      // Reserve idle sessions before the RPC write so concurrent HTTP requests
-      // cannot both observe idle and send two prompts.
-      const reserved = busyNow && behavior ? true : session.reservePrompt();
-      if (!reserved) {
-        const item = manager.enqueuePrompt(session, body.data.message);
-        return reply.code(202).send({
-          accepted: true, queued: true, queueItemId: item.id,
-          queueDepth: session.queue.filter((i) => i.status === 'queued' || i.status === 'running').length,
-        });
-      }
-      const cmd: Record<string, unknown> = { type: 'prompt', message: body.data.message };
-      if (behavior) cmd.streamingBehavior = behavior;
-      try {
-        await session.request(cmd, 8000);
-      } catch (err) {
-        session.releasePrompt();
-        throw err;
-      }
-      return reply.code(202).send({ accepted: true, queued: false, queueItemId });
+      manager.dispatchQueuedNow(session);
+      const dispatched = item.status === 'running' || item.status === 'done';
+      return reply.code(202).send({
+        accepted: true,
+        // Legacy clients (no clientMessageId) read `queued` as "held behind a busy agent".
+        queued: body.clientMessageId ? isActive(item) : !dispatched,
+        dispatched,
+        queueItemId: item.id,
+        queueDepth: session.queue.filter(isActive).length,
+      });
     } catch (err) {
-      return reply.code(409).send({ error: (err as Error).message });
+      return sendError(reply, err);
     }
   });
 
   fastify.get('/api/sessions/:id/queue', async (req, reply) => {
-    const id = parseId(req, reply);
+    const id = idOf(req, reply);
     if (!id) return;
-    const items = manager.getQueueItems(id);
+    const items = await manager.getQueueItems(id);
     if (!items) return reply.code(404).send({ error: 'Session not found' });
     return { items };
   });
 
-  // Full tool result for a toolCallId (skeleton mode fetch-on-expand).
-  // Reads the session JSONL tail — the authoritative persisted copy.
-  fastify.get('/api/sessions/:id/toolresult/:toolCallId', async (req, reply) => {
-    const id = parseId(req, reply);
+  fastify.delete('/api/sessions/:id/queue/:itemId', async (req, reply) => {
+    const id = idOf(req, reply);
     if (!id) return;
-    const toolCallId = String((req.params as { toolCallId?: string }).toolCallId ?? '');
-    if (!toolCallId) return reply.code(400).send({ error: 'Missing toolCallId' });
-    const session = manager.find(id);
+    const itemId = parse(PARAM_TOKEN, (req.params as { itemId?: string }).itemId, reply, 'itemId');
+    if (!itemId) return;
+    const ok = await manager.cancelQueueItem(id, itemId);
+    if (!ok) return reply.code(404).send({ error: 'Queued item not found' });
+    return { ok: true };
+  });
+
+  // Full tool result for a toolCallId (skeleton mode fetch-on-expand).
+  fastify.get('/api/sessions/:id/toolresult/:toolCallId', async (req, reply) => {
+    const id = idOf(req, reply);
+    if (!id) return;
+    const toolCallId = parse(PARAM_TOKEN, (req.params as { toolCallId?: string }).toolCallId, reply, 'toolCallId');
+    if (!toolCallId) return;
+    const session = await manager.find(id);
     if (!session) return reply.code(404).send({ error: 'Session not found' });
     try {
-      const stat = fs.statSync(session.file);
-      const tailStart = Math.max(0, stat.size - 4 * 1024 * 1024);
-      const fd = fs.openSync(session.file, 'r');
-      const buf = Buffer.alloc(stat.size - tailStart);
-      const n = fs.readSync(fd, buf, 0, buf.length, tailStart);
-      fs.closeSync(fd);
-      // Crash-safe decode (invalid UTF-8 crashed Node via toString).
-      const tailDecoder = new TextDecoder('utf8');
-      for (const line of tailDecoder.decode(buf.subarray(0, n)).split('\n')) {
-        if (!line.trim()) continue;
-        try {
-          const entry = JSON.parse(line) as { type?: string; message?: { role?: string; content?: unknown } };
-          if (entry.type !== 'message' || !entry.message) continue;
-          const msg = entry.message as { role?: string; toolName?: string; content?: unknown };
-          if (msg.role !== 'toolResult' && msg.role !== 'tool') continue;
-          // Match by position in the toolCalls of the preceding assistant? Simpler:
-          // the toolResult line itself carries the call context via its content blocks.
-          // pi JSONL: toolResult messages follow the assistant toolCall. We match by
-          // scanning for the toolCallId in the raw line.
-          if (!line.includes(toolCallId)) continue;
-          const text = typeof msg.content === 'string'
-            ? msg.content
-            : Array.isArray(msg.content)
-              ? (msg.content as { type?: string; text?: string }[]).filter((b) => b.type === 'text').map((b) => b.text ?? '').join('')
-              : '';
-          return { toolCallId, text, isError: Boolean((entry.message as { isError?: boolean }).isError) };
-        } catch { /* skip */ }
+      const lines = await readTailLines(session.file, 8 * 1024 * 1024);
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const line = lines[i]!;
+        if (!line.includes(toolCallId)) continue;
+        const entry = parseEntry(line);
+        const msg = entry?.message as { role?: string; content?: unknown; isError?: boolean; toolCallId?: string } | undefined;
+        if (entry?.type !== 'message' || !msg || (msg.role !== 'toolResult' && msg.role !== 'tool')) continue;
+        const text = typeof msg.content === 'string'
+          ? msg.content
+          : Array.isArray(msg.content)
+            ? (msg.content as { type?: string; text?: string }[]).filter((b) => b.type === 'text').map((b) => b.text ?? '').join('')
+            : '';
+        return { toolCallId, text, isError: Boolean(msg.isError) };
       }
       return reply.code(404).send({ error: 'Tool result not found' });
     } catch (err) {
@@ -292,142 +288,98 @@ export function registerRoutes(
     }
   });
 
-  // pi 0.85 get_session_stats: tokens, cost, context-window usage.
-  // Last-known stats (per session FILE): in-memory cache + on-disk sidecar
-  // so idle/dead sessions and post-restart requests still show the
-  // context/token/cost strip in the app. Keyed by resolved file path so id
-  // aliases (placeholder id vs canonical pi id) hit the same entry.
-  // Sidecars are <file>.stats.json — NOT *.jsonl, so the index walk ignores
-  // them.
-  const statsCache = new Map<string, Record<string, unknown>>();
+  /* ---------------- stats (pi get_session_stats + cached sidecar) ---------------- */
+
+  // Last-known stats per session FILE: in-memory cache + <file>.stats.json
+  // sidecar (ignored by the dir watcher). The sidecar is written only when the
+  // stats actually changed — never on every GET.
+  const statsCache = new Map<string, { stats: Record<string, unknown>; json: string }>();
   const statsSidecar = (file: string): string => `${file}.stats.json`;
-  const readStatsSidecar = (file: string): Record<string, unknown> | null => {
+  const loadStats = async (file: string): Promise<Record<string, unknown> | null> => {
+    const mem = statsCache.get(file);
+    if (mem) return mem.stats;
     try {
-      return JSON.parse(fs.readFileSync(statsSidecar(file), 'utf8')) as Record<string, unknown>;
+      const json = await fs.promises.readFile(statsSidecar(file), 'utf8');
+      const stats = JSON.parse(json) as Record<string, unknown>;
+      statsCache.set(file, { stats, json });
+      return stats;
     } catch {
       return null;
     }
   };
-  const writeStatsSidecar = (file: string, stats: Record<string, unknown>): void => {
+  const storeStats = async (file: string, stats: Record<string, unknown>): Promise<void> => {
+    const json = JSON.stringify(stats);
+    if (statsCache.get(file)?.json === json) return;
+    statsCache.set(file, { stats, json });
     try {
-      fs.writeFileSync(statsSidecar(file), JSON.stringify(sanitizeStats(stats)));
+      await fs.promises.writeFile(statsSidecar(file), json);
     } catch { /* best effort */ }
   };
-  // Estimate context usage for sessions whose agent RPC cannot serve stats
-  // (host-owned sessions proxied to owner extensions predating
-  // get_session_stats): context tokens come from the LAST assistant usage in
-  // the session file (pi's calculateContextTokens: totalTokens ||
-  // input+output+cacheRead+cacheWrite), the window from get_state's model.
-  // Verified context windows for models the owner proxy may report by id
-  // only (model_change entries carry provider+modelId, not the window).
+  // Verified context windows for models reported by id only.
   const KNOWN_MODEL_CONTEXT_WINDOWS: Record<string, number> = {
     'merge-gateway/zai/glm-5.3-flash': 1_000_000,
     'zai/glm-5.3-flash': 1_000_000,
     'glm-5.3-flash': 1_000_000,
   };
-  const estimateContextUsage = async (
-    session: import('./session.js').Session,
-  ): Promise<Record<string, unknown> | null> => {
-    // Verified context windows for models reported by id only (model_change
-    // entries carry provider+modelId, not the window).
-    const KNOWN_MODEL_CONTEXT_WINDOWS: Record<string, number> = {
-      'merge-gateway/zai/glm-5.3-flash': 1_000_000,
-      'zai/glm-5.3-flash': 1_000_000,
-      'glm-5.3-flash': 1_000_000,
-    };
+  const windowFor = (modelId: string | null): number => (modelId
+    ? KNOWN_MODEL_CONTEXT_WINDOWS[modelId] ?? KNOWN_MODEL_CONTEXT_WINDOWS[modelId.split('/').pop() ?? ''] ?? 0
+    : 0);
+  /** Context usage from get_state, else from the LAST assistant usage in the file tail. */
+  const estimateContextUsage = async (session: Session): Promise<Record<string, unknown> | null> => {
     let contextWindow = 0;
     let modelId: string | null = null;
-    // 1. Exact value when the agent can answer get_state (owner proxy
-    //    snapshots carry ctx.getContextUsage(); native pi children report a
-    //    model object).
-    try {
-      const st = await session.request<{
-        model?: unknown;
-        contextUsage?: { tokens?: number | null; contextWindow?: number | null; percent?: number | null } | null;
-      }>({ type: 'get_state' }, 8_000);
-      const cu = st.contextUsage;
-      if (
-        cu && typeof cu.percent === 'number' && typeof cu.tokens === 'number'
-        && typeof cu.contextWindow === 'number' && cu.contextWindow > 0
-      ) {
-        return { tokens: cu.tokens, contextWindow: cu.contextWindow, percent: cu.percent };
-      }
-      const model = st.model;
-      if (typeof model === 'string') modelId = model;
-      else if (model && typeof model === 'object') {
-        const m = model as { id?: string; provider?: string; modelId?: string; contextWindow?: number };
-        if (typeof m.contextWindow === 'number' && m.contextWindow > 0) contextWindow = m.contextWindow;
-        if (typeof m.id === 'string') modelId = m.id;
-        else if (typeof m.provider === 'string' && typeof m.modelId === 'string') modelId = `${m.provider}/${m.modelId}`;
-      }
-    } catch {
-      /* not running or unsupported - fall through to the file */
+    if (session.running) {
+      try {
+        const st = await session.request<{
+          model?: unknown;
+          contextUsage?: { tokens?: number | null; contextWindow?: number | null; percent?: number | null } | null;
+        }>({ type: 'get_state' }, 8_000);
+        const cu = st.contextUsage;
+        if (cu && typeof cu.percent === 'number' && typeof cu.tokens === 'number'
+            && typeof cu.contextWindow === 'number' && cu.contextWindow > 0) {
+          return { tokens: cu.tokens, contextWindow: cu.contextWindow, percent: cu.percent };
+        }
+        const model = st.model;
+        if (typeof model === 'string') modelId = model;
+        else if (model && typeof model === 'object') {
+          const m = model as { id?: string; provider?: string; modelId?: string; contextWindow?: number };
+          if (typeof m.contextWindow === 'number' && m.contextWindow > 0) contextWindow = m.contextWindow;
+          if (typeof m.id === 'string') modelId = m.id;
+          else if (typeof m.provider === 'string' && typeof m.modelId === 'string') modelId = `${m.provider}/${m.modelId}`;
+        }
+      } catch { /* fall through to the file */ }
     }
-    if (!contextWindow && modelId) {
-      contextWindow = KNOWN_MODEL_CONTEXT_WINDOWS[modelId]
-        ?? KNOWN_MODEL_CONTEXT_WINDOWS[modelId.split('/').pop() ?? ''] ?? 0;
-    }
-    // 2. File-based: one tail pass for the LAST assistant usage and the LAST
-    //    model_change. Works for dead sessions and old owner extensions.
+    if (!contextWindow) contextWindow = windowFor(modelId);
     try {
-      const stat = fs.statSync(session.file);
-      const tailStart = Math.max(0, stat.size - 4 * 1024 * 1024);
-      const fd = fs.openSync(session.file, 'r');
-      const buf = Buffer.alloc(stat.size - tailStart);
-      const n = fs.readSync(fd, buf, 0, buf.length, tailStart);
-      fs.closeSync(fd);
-      const lines = new TextDecoder('utf8').decode(buf.subarray(0, n)).split('\n');
+      const lines = await readTailLines(session.file, 4 * 1024 * 1024);
       let usageTokens = 0;
       for (let i = lines.length - 1; i >= 0; i--) {
-        const line = (lines[i] ?? '').trim();
-        if (!line) continue;
-        let entry: {
+        const entry = parseEntry(lines[i]!) as {
           type?: string;
           provider?: string;
           modelId?: string;
-          message?: {
-            role?: string;
-            stopReason?: string;
-            usage?: { totalTokens?: number; input?: number; output?: number; cacheRead?: number; cacheWrite?: number };
-          };
-        };
-        try {
-          entry = JSON.parse(line);
-        } catch {
-          continue;
-        }
+          message?: { role?: string; stopReason?: string; usage?: { totalTokens?: number; input?: number; output?: number; cacheRead?: number; cacheWrite?: number } };
+        } | null;
+        if (!entry) continue;
         if (!usageTokens && entry.type === 'message' && entry.message?.role === 'assistant'
-            && entry.message.stopReason !== 'aborted' && entry.message.stopReason !== 'error'
-            && entry.message.usage) {
+            && entry.message.stopReason !== 'aborted' && entry.message.stopReason !== 'error' && entry.message.usage) {
           const u = entry.message.usage;
-          usageTokens = u.totalTokens
-            ?? (u.input ?? 0) + (u.output ?? 0) + (u.cacheRead ?? 0) + (u.cacheWrite ?? 0);
+          usageTokens = u.totalTokens ?? (u.input ?? 0) + (u.output ?? 0) + (u.cacheRead ?? 0) + (u.cacheWrite ?? 0);
         }
         if (!modelId && entry.type === 'model_change' && typeof entry.modelId === 'string') {
           modelId = entry.provider ? `${entry.provider}/${entry.modelId}` : entry.modelId;
         }
         if (usageTokens && modelId) break;
       }
-      if (!contextWindow && modelId) {
-        contextWindow = KNOWN_MODEL_CONTEXT_WINDOWS[modelId]
-          ?? KNOWN_MODEL_CONTEXT_WINDOWS[modelId.split('/').pop() ?? ''] ?? 0;
-      }
+      if (!contextWindow) contextWindow = windowFor(modelId);
       if (contextWindow > 0 && usageTokens > 0) {
-        return {
-          tokens: usageTokens,
-          contextWindow,
-          percent: Math.round((usageTokens / contextWindow) * 10_000) / 100,
-        };
+        return { tokens: usageTokens, contextWindow, percent: Math.round((usageTokens / contextWindow) * 10_000) / 100 };
       }
-    } catch {
-      /* file unreadable */
-    }
+    } catch { /* file unreadable */ }
     return null;
   };
-
-  // The iOS stats decode is strict: null VALUES inside contextUsage (seeded
-  // sidecars, models without a context window) threw and hid the widget bar.
-  // Drop null-valued keys; omit contextUsage entirely when unusable.
+  // The iOS stats decode is strict: drop null-valued contextUsage keys; omit
+  // contextUsage entirely when unusable.
   const sanitizeStats = (stats: Record<string, unknown>): Record<string, unknown> => {
     const cu = stats.contextUsage;
     if (!cu || typeof cu !== 'object') return stats;
@@ -440,133 +392,75 @@ export function registerRoutes(
     else out.contextUsage = clean;
     return out;
   };
+  const EMPTY_STATS = { tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 };
   fastify.get('/api/sessions/:id/stats', async (req, reply) => {
-    const id = parseId(req, reply);
+    const id = idOf(req, reply);
     if (!id) return;
-    const session = manager.find(id);
+    const session = await manager.find(id);
     if (!session) return reply.code(404).send({ error: 'Session not found' });
     const fileKey = path.resolve(session.file);
-    const cached = (): { stats: Record<string, unknown>; stale: boolean } | null => {
-      const mem = statsCache.get(fileKey) ?? readStatsSidecar(fileKey);
-      return mem ? { stats: mem, stale: true } : null;
-    };
     if (session.running) {
       try {
-        const stats = await session.request<Record<string, unknown>>({ type: 'get_session_stats' }, 15_000);
-        const clean = sanitizeStats(stats);
-        statsCache.set(fileKey, clean);
-        writeStatsSidecar(fileKey, clean);
+        const clean = sanitizeStats(await session.request<Record<string, unknown>>({ type: 'get_session_stats' }, 15_000));
+        await storeStats(fileKey, clean);
         return { stats: clean };
-      } catch (err) {
-        // Agent can't serve stats (e.g. host-owned session on an older owner
-        // extension): build the best answer from sidecar totals + a context
-        // estimate from the file itself.
-        const stale = cached();
-        const base = (stale?.stats ?? statsCache.get(fileKey) ?? {
-          tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-          cost: 0,
-        }) as Record<string, unknown>;
-        const estimated = await estimateContextUsage(session);
-        const merged = estimated ? { ...base, contextUsage: estimated } : base;
-        const clean = sanitizeStats(merged);
-        statsCache.set(fileKey, clean);
-        writeStatsSidecar(fileKey, clean);
-        return { stats: clean, stale: true };
-      }
+      } catch { /* older owner extension etc. — estimate below */ }
     }
-    // Dead session: sidecar totals + a file-based context estimate (the
-    // estimate works without any agent - usage + model_change from the tail).
-    const stale = cached();
+    const base = (await loadStats(fileKey)) ?? null;
     const estimated = await estimateContextUsage(session);
-    if (!stale && !estimated) {
-      return reply.code(409).send({ error: 'Session is not running' });
-    }
-    const base = (stale?.stats ?? {
-      tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-      cost: 0,
-    }) as Record<string, unknown>;
-    const merged = estimated ? { ...base, contextUsage: estimated } : base;
-    const clean = sanitizeStats(merged);
-    statsCache.set(fileKey, clean);
-    writeStatsSidecar(fileKey, clean);
+    if (!base && !estimated) return reply.code(409).send({ error: 'Session is not running' });
+    const clean = sanitizeStats(estimated ? { ...(base ?? EMPTY_STATS), contextUsage: estimated } : (base ?? EMPTY_STATS));
+    await storeStats(fileKey, clean);
     return { stats: clean, stale: true };
   });
 
-  fastify.delete('/api/sessions/:id/queue/:itemId', async (req, reply) => {
-    const id = parseId(req, reply);
-    if (!id) return;
-    const itemId = String((req.params as { itemId?: string }).itemId ?? '');
-    const ok = manager.cancelQueueItem(id, itemId);
-    if (!ok) return reply.code(404).send({ error: 'Queued item not found' });
-    return { ok: true };
-  });
+  /* ---------------- messages ---------------- */
 
   fastify.get('/api/sessions/:id/messages', async (req, reply) => {
-    const id = parseId(req, reply);
+    const id = idOf(req, reply);
     if (!id) return;
-    const session = manager.find(id);
+    const q = parse(MessagesQuery, req.query, reply, 'query');
+    if (!q) return;
+    const session = await manager.find(id);
     if (!session) return reply.code(404).send({ error: 'Session not found' });
-    // Pagination: ?limit=N (default 100, max 500), ?before=<ts> (load older),
-    // and ?since=<entryId> (cursor reconnect — only entries AFTER that id).
-    const limit = Math.min(Math.max(parseInt(String((req.query as { limit?: string }).limit ?? '100'), 10) || 100, 1), 500);
-    const before = parseInt(String((req.query as { before?: string }).before ?? ''), 10) || undefined;
-    const since = String((req.query as { since?: string }).since ?? '') || undefined;
+    const pendingRows = () => manager.pendingItems(session).map((item) => ({
+      id: item.id,
+      clientMessageId: item.clientMessageId ?? null,
+      text: item.message,
+      message: item.message,
+      status: item.status,
+      queuedAt: item.queuedAt,
+    }));
     try {
       const all = await manager.history(session);
-      if (since) {
-        // Durable cursor: return only rows strictly after the entry id the
-        // client last saw. Cheap reconnect for large sessions (no full refetch).
-        const at = all.findIndex((m) => m.id === since);
+      const pool = q.visible ? all.filter(isVisibleMessage) : all;
+      if (q.since) {
+        // Durable cursor: only rows strictly after the entry id the client saw.
+        const at = all.findIndex((m) => m.id === q.since);
         if (at >= 0) {
           const tail = all.slice(at + 1);
           return {
-            messages: tail.slice(-limit),
-            pending: session.queue.map((item) => ({
-              id: item.id,
-              clientMessageId: item.clientMessageId ?? null,
-              text: item.message,
-              queuedAt: item.queuedAt,
-            })),
-            working: await manager.working(session),
+            messages: (q.visible ? tail.filter(isVisibleMessage) : tail).slice(-q.limit),
+            pending: pendingRows(),
+            working: await manager.working(session, all),
             hasMore: false,
             cursorMode: true,
           };
         }
-        // Unknown cursor (compaction/branch switch) — fall through to full fetch.
+        // Unknown cursor (compaction/branch switch) — full fetch below.
       }
-      // Focus-mode visibility filter (mirror of the iOS computeVisible):
-      // ?visible=1 returns only rows the app would render, so sessions whose
-      // tail is a huge tool loop still open with real content in one call.
-      const isVisible = (m: ChatMessage): boolean => {
-        if (m.role === 'tool' || m.toolName || m.system) return false;
-        const t = (m.text ?? '').trim();
-        const th = (m.thinking ?? '').trim();
-        if (m.role === 'assistant' && !t && !th) return false;
-        return true;
-      };
-      const wantVisible = (req.query as { visible?: string }).visible === '1';
-      const pool = wantVisible && !before ? all.filter(isVisible) : all;
-      const page = before
-        ? all.filter((m) => (m.timestamp ?? 0) < before).slice(-limit)
-        : pool.slice(-limit);
+      const before = q.before;
+      const older = before ? pool.filter((m) => (m.timestamp ?? 0) < before) : pool;
+      const page = older.slice(-q.limit);
       return {
         messages: page,
-        // Queued-but-not-yet-written prompts (server-owned queue): the client
-        // renders them as pending so they never vanish on reload.
-        pending: before ? undefined : session.queue.map((item) => ({
-          id: item.id,
-          clientMessageId: item.clientMessageId ?? null,
-          text: item.message,
-          queuedAt: item.queuedAt,
-        })),
-        // Working indicator: derived server-side so mirrors (TUI-owned
-        // sessions) also show it — RPC events don't exist for them.
-        working: before ? undefined : await manager.working(session),
-        hasMore: before
-          ? all.some((m) => (m.timestamp ?? 0) < (page[0]?.timestamp ?? 0))
-          : all.length > limit,
+        // CONTRACT §2: queued/running items only, with status + clientMessageId.
+        pending: before ? undefined : pendingRows(),
+        working: before ? undefined : await manager.working(session, all),
+        hasMore: older.length > page.length,
         cursorMode: false,
         total: all.length,
+        ...(q.visible ? { visibleTotal: pool.length } : {}),
       };
     } catch (err) {
       return reply.code(500).send({ error: (err as Error).message });
@@ -574,163 +468,152 @@ export function registerRoutes(
   });
 
   fastify.get('/api/sessions/:id/state', async (req, reply) => {
-    const id = parseId(req, reply);
+    const id = idOf(req, reply);
     if (!id) return;
-    const session = manager.find(id);
+    const session = await manager.find(id);
     if (!session) return reply.code(404).send({ error: 'Session not found' });
-    if (!session.running) return { session: session.toSummary(), state: { running: false } };
+    const summary = await manager.summaryOf(session);
+    if (!session.running) return { session: summary, state: { running: false }, status: session.statusFrame() };
     try {
       const state = await session.request({ type: 'get_state' });
-      return { session: session.toSummary(), state };
+      return { session: summary, state, status: session.statusFrame() };
     } catch (err) {
-      return { session: session.toSummary(), state: { error: (err as Error).message } };
+      return { session: summary, state: { error: (err as Error).message }, status: session.statusFrame() };
     }
   });
 
-  const RenameSchema = z.object({ name: z.string().min(1).max(80) });
+  /** Mutations a host TUI cannot serve over IPC: refuse while it owns the session. */
+  const rejectHostOwned = async (id: string, reply: Reply): Promise<boolean> => {
+    if (!(await manager.isHostOwned(id))) return false;
+    await reply.code(409).send({ error: 'Session is owned by a host pi TUI — do this in the terminal', code: 'session_live' });
+    return true;
+  };
+
   fastify.post('/api/sessions/:id/name', async (req, reply) => {
-    const id = parseId(req, reply);
+    const id = idOf(req, reply);
     if (!id) return;
-    if (rejectExternalMutation(manager, id, reply)) return;
-    const body = RenameSchema.safeParse(req.body);
-    if (!body.success) return reply.code(400).send({ error: 'Invalid body' });
+    const body = parse(RenameSchema, req.body, reply, 'body');
+    if (!body) return;
+    if (await rejectHostOwned(id, reply)) return;
     try {
-      const session = await manager.rename(id, body.data.name);
+      const session = await manager.rename(id, body.name);
       if (!session) return reply.code(404).send({ error: 'Session not found' });
       return { session };
     } catch (err) {
-      return reply.code(409).send({ error: (err as Error).message });
+      return sendError(reply, err);
     }
   });
 
   fastify.get('/api/sessions/:id/models', async (req, reply) => {
-    const id = parseId(req, reply);
+    const id = idOf(req, reply);
     if (!id) return;
-    if (rejectExternalMutation(manager, id, reply)) return;
+    if (await rejectHostOwned(id, reply)) return;
     try {
-      const data = await manager.listModels(id);
-      return { models: data };
+      return { models: await manager.listModels(id) };
     } catch (err) {
+      if (err instanceof BusyError || err instanceof SessionLiveError || err instanceof LeaseHeldError) return sendError(reply, err);
       return reply.code(404).send({ error: (err as Error).message });
     }
   });
 
-  const SetModelSchema = z.object({ modelId: z.string().min(1) });
   fastify.post('/api/sessions/:id/models', async (req, reply) => {
-    const id = parseId(req, reply);
+    const id = idOf(req, reply);
     if (!id) return;
-    if (rejectExternalMutation(manager, id, reply)) return;
-    const body = SetModelSchema.safeParse(req.body);
-    if (!body.success) return reply.code(400).send({ error: 'Invalid body' });
+    const body = parse(SetModelSchema, req.body, reply, 'body');
+    if (!body) return;
+    if (await rejectHostOwned(id, reply)) return;
     try {
-      await manager.setModel(id, body.data.modelId);
+      await manager.setModel(id, body.modelId);
       return { ok: true };
     } catch (err) {
+      if (err instanceof BusyError || err instanceof SessionLiveError || err instanceof LeaseHeldError) return sendError(reply, err);
       return reply.code(404).send({ error: (err as Error).message });
     }
   });
 
   fastify.post('/api/sessions/:id/models/cycle', async (req, reply) => {
-    const id = parseId(req, reply);
+    const id = idOf(req, reply);
     if (!id) return;
-    if (rejectExternalMutation(manager, id, reply)) return;
+    if (!EmptyBody.safeParse(req.body).success) return reply.code(400).send({ error: 'Invalid body' });
+    if (await rejectHostOwned(id, reply)) return;
     try {
-      const modelId = await manager.cycleModel(id);
-      return { modelId };
+      return { modelId: await manager.cycleModel(id) };
     } catch (err) {
+      if (err instanceof BusyError || err instanceof SessionLiveError || err instanceof LeaseHeldError) return sendError(reply, err);
       return reply.code(404).send({ error: (err as Error).message });
     }
   });
 
+  // Abort reaches whichever transport owns the session (child → `abort`,
+  // TUI owner → `op:"abort"`) and reports the REAL result.
   fastify.post('/api/sessions/:id/abort', async (req, reply) => {
-    const id = parseId(req, reply);
+    const id = idOf(req, reply);
     if (!id) return;
-    // PATCH owner-proxy: leased sessions forward abort to the live owner.
-    if (manager.getLiveLeaseInfo(id)) {
-      try {
-        const s = await manager.ensureRunning(id);
-        if (s?.isProxy) return { ok: s.send({ type: 'abort' }) };
-      } catch { /* fall through to legacy handling */ }
-    }
-    if (manager.isExternallyLive(id)) return reply.code(409).send({ error: 'Session is owned by host Pi', code: 'session_live' });
-    const session = manager.find(id);
+    const session = await manager.find(id);
     if (!session) return reply.code(404).send({ error: 'Session not found' });
-    const ok = session.send({ type: 'abort' });
-    return { ok };
-  });
-
-  const ForkSchema = z.object({
-    entryId: z.string().min(1).optional(),
-    name: z.string().max(80).optional(),
+    let target: Session | null = session;
+    if (!session.running && await manager.getLiveLeaseInfo(id)) {
+      try {
+        target = await manager.ensureRunning(id); // attach to the TUI owner
+      } catch (err) {
+        return sendError(reply, err);
+      }
+    }
+    if (!target?.running) return { ok: false, error: 'Agent not running' };
+    const ok = await target.abort();
+    return ok ? { ok: true } : { ok: false, error: 'Abort was not acknowledged by the agent' };
   });
 
   fastify.post('/api/sessions/:id/fork', async (req, reply) => {
-    const id = parseId(req, reply);
+    const id = idOf(req, reply);
     if (!id) return;
-    if (rejectExternalMutation(manager, id, reply)) return;
-    const body = ForkSchema.safeParse(req.body ?? {});
-    if (!body.success) return reply.code(400).send({ error: 'Invalid body', issues: body.error.issues });
-
-    // Fork stops the source process (pi forks in place) — NEVER mid-turn.
-    const forkSession = manager.find(id);
-    if (forkSession?.phase === 'streaming') {
-      return reply.code(409).send({ error: 'Agent is busy — fork when it finishes' });
-    }
-
-    // Default to the last user message entry in the session file.
-    let entryId = body.data.entryId;
-    if (!entryId) {
-      const messages = manager.historyFromFileSafe(id);
-      const lastUser = [...messages].reverse().find((m) => m.role === 'user' && m.id);
-      if (lastUser?.id) entryId = lastUser.id;
-    }
+    const body = parse(ForkSchema, req.body ?? {}, reply, 'body');
+    if (!body) return;
+    // Fork runs in a dedicated child that only READS the source file, so it
+    // is safe for TUI-owned sessions too; never mid-turn.
+    const src = await manager.find(id);
+    if (!src) return reply.code(404).send({ error: 'Session not found' });
+    if (src.isBusy) return reply.code(409).send({ error: 'Agent is busy — fork when it finishes' });
+    const entryId = body.entryId ?? await manager.lastUserEntryId(id);
     if (!entryId) return reply.code(400).send({ error: 'No forkable user message found' });
-
     try {
-      const result = await manager.fork(id, entryId, body.data.name);
+      const result = await manager.fork(id, entryId, body.name, body.clientRequestId);
       if (!result) return reply.code(404).send({ error: 'Session not found' });
       return reply.code(201).send({ session: result.session, forkedFrom: result.text });
     } catch (err) {
-      return reply.code(409).send({ error: (err as Error).message });
+      return sendError(reply, err);
     }
   });
 
   fastify.delete('/api/sessions/:id', async (req, reply) => {
-    const id = parseId(req, reply);
+    const id = idOf(req, reply);
     if (!id) return;
-    const { purge, force } = (req.query as { purge?: string, force?: string });
-    const isForce = force === '1' || force === 'true';
-    if (!isForce && rejectExternalMutation(manager, id, reply)) return;
-    const removed = manager.delete(id, purge === '1');
+    const q = parse(DeleteQuery, req.query, reply, 'query');
+    if (!q) return;
+    if (q.purge) {
+      // Never delete a file another writer owns — not even with force.
+      if (await manager.isHostOwned(id)) {
+        return reply.code(409).send({ error: 'Session is owned by a host pi TUI — close it there before deleting', code: 'session_live' });
+      }
+      if (!q.force && await manager.hasUnownedRecentWriter(id)) {
+        return reply.code(409).send({ error: 'Session file is being written by another pi process', code: 'session_live' });
+      }
+    }
+    const removed = await manager.delete(id, q.purge);
     if (!removed) return reply.code(404).send({ error: 'Session not found' });
     return { ok: true };
   });
 
   fastify.get('/api/sessions/:id/events', async (req, reply) => {
-    const id = parseId(req, reply);
+    const id = idOf(req, reply);
     if (!id) return;
-    // Host-owned sessions attach as a read-only mirror (no second agent).
+    if (!parse(EventsQuery, req.query, reply, 'query')) return;
+    // Never spawns a child just to watch: TUI-owned → owner proxy; otherwise
+    // the session's own transport, or a read-only file tailer.
     const session = await manager.sessionForSSE(id);
     if (!session) return reply.code(404).send({ error: 'Session not found' });
-    attachSse(req, reply, session, log);
+    attachSse(req, reply, session, log, { queueSnapshot: () => manager.pendingItems(session) });
   });
-}
-
-function parseId(req: FastifyRequest, reply: {
-  code: (code: number) => { send: (body: unknown) => unknown };
-}): string | null {
-  const id = ID_PARAM.safeParse((req.params as { id?: string }).id);
-  if (!id.success) {
-    reply.code(400).send({ error: 'Invalid session id' });
-    return null;
-  }
-  return id.data;
-}
-
-function rejectExternalMutation(manager: SessionManager, id: string, reply: { code: (code: number) => { send: (body: unknown) => unknown } }): boolean {
-  if (!manager.isExternallyLive(id)) return false;
-  reply.code(409).send({ error: 'Session is owned by host Pi', code: 'session_live' });
-  return true;
 }
 
 function authorized(req: FastifyRequest, token: string): boolean {

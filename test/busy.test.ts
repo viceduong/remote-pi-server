@@ -37,11 +37,11 @@ describe('session busy tracking (mid-turn safety)', () => {
     expect(s.busy).toBe(false);
   });
 
-  it('turn_start sets busy true and records lastTurnStartAt', () => {
+  it('turn_start sets busy true and streaming status', () => {
     const s = makeSession();
     s.handleEvent({ type: 'turn_start' } as never);
     expect(s.busy).toBe(true);
-    expect(s.lastTurnStartAt).toBeGreaterThan(0);
+    expect(s.statusFrame()).toMatchObject({ type: 'agent_status', phase: 'streaming', busy: true });
   });
 });
 

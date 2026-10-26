@@ -1,15 +1,37 @@
 import fs from 'node:fs';
-import net from 'node:net';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import type { Logger } from 'pino';
-import { Session, type EventSink } from './session.js';
+import { LeaseHeldError, Session, type EventSink } from './session.js';
 import { mapAgentMessage } from './history.js';
 import { manglePath } from './paths.js';
-import type { AgentMessage, AgentState, ChatMessage, LiveInstance, SessionSummary } from './types.js';
-import { probeLivePiInstances, type LivePiInstance } from './live.js';
-import { readLease, isLeaseHeld, leasePath, type Lease } from './lease.js';
-import { queueFilePath, type QueueItem } from './queue.js';
+import {
+  gcLeases,
+  inspectLease,
+  inspectLeaseAsync,
+  leaseKind,
+  leasePath,
+  readLeaseRawAsync,
+  writeAtomic,
+  type Lease,
+  type LeaseInspection,
+} from './lease.js';
+import { SessionFileCache, type FileSummary } from './filecache.js';
+import { stripLoneSurrogates } from './jsonl.js';
+import {
+  QUEUE_MAX_ACTIVE,
+  QUEUE_MAX_ATTEMPTS,
+  backoffMs,
+  isActive,
+  newQueueId,
+  pendingView,
+  pruneQueue,
+  queueFilePath,
+  restoreItems,
+  type PendingItemView,
+  type QueueItem,
+} from './queue.js';
+import type { AgentMessage, AgentState, ChatMessage, LiveInstance, SessionOwner, SessionSummary } from './types.js';
 
 export interface SessionManagerOptions {
   sessionDir: string;
@@ -19,13 +41,17 @@ export interface SessionManagerOptions {
   idleKillMs: number;
   extraArgs: string[];
   log: Logger;
+  /** Test hook: disable timers (sweep, lease GC, dir watcher). */
+  noTimers?: boolean;
 }
 
-/** Busy-capacity reached (503). */
+/** Agent-slot capacity reached (503). */
 export class BusyError extends Error {
   readonly code = 503;
-  constructor() {
-    super('All agents busy');
+  constructor(max?: number) {
+    super(max
+      ? `All ${max} agent slots are busy — stop an idle session or retry shortly`
+      : 'All agents busy');
   }
 }
 
@@ -37,239 +63,798 @@ export class SpawnError extends Error {
   }
 }
 
-/** Metadata extracted from a pi session file. */
+/** Another writer owns the session (409 `session_live`). */
+export class SessionLiveError extends Error {
+  readonly code = 409;
+  readonly apiCode = 'session_live';
+  constructor(message: string) {
+    super(message);
+  }
+}
+
+/** Lease-derived ownership of a session file. `unknown` = treat as owned. */
+export type LeaseOwner = SessionOwner | 'unknown';
+
+/** Metadata of one pi session file (from the incremental file cache). */
 interface SessionFileMeta {
   id: string;
   file: string;
   name: string;
   workdir: string | null;
   createdAt: number;
+  /** File mtime (rounded — iOS decodes Int strictly). */
   lastActivityAt: number;
   messageCount: number;
-  /** Timestamp of the actual last message entry (not file mtime). */
   lastMessageAt: number | null;
-  /** True when the file was modified recently (live pi process on the host). */
-  active: boolean;
-  /** True when an external (non-bridge) pi process owns this session. */
-  live: boolean;
-  livePid: number | null;
-  /** True when the session file was written in the last 30s (agent working now). */
-  writing: boolean;
+  /** A `<file>.lease` sidecar was present at the last directory walk. */
+  hasLease: boolean;
 }
 
-const META_READ_LIMIT = 4096;
-
-// Crash-safe decode: malformed UTF-8 / lone surrogates in session files
-// crashed Node (StringBytes assertion) via Buffer.toString(). TextDecoder
-// (encoding_rs) replaces invalid sequences instead of tripping the assert.
-const utf8Decoder = new TextDecoder('utf-8');
-const decodeUtf8 = (buf: Buffer): string => utf8Decoder.decode(buf);
 const ACTIVE_WINDOW_MS = 5 * 60_000;
-/** A session file touched within this window means the agent is working NOW. */
 const WRITING_WINDOW_MS = 30_000;
-const INDEX_TTL_MS = 3_000;
-const PROBE_TTL_MS = 5_000;
+const INDEX_TTL_MS = 5_000;
+/** Serve a stale walk while refreshing in the background, up to this age. */
+const INDEX_MAX_STALE_MS = 60_000;
+const WALK_CONCURRENCY = 16;
 const MAX_LISTED = 250;
-const MAX_FILE_CACHE = 2_000;
+const MIN_PREFIX = 12;
+const UNLOAD_AFTER_MS = 15 * 60_000;
+const CREATE_IDEMPOTENCY_MS = 10 * 60_000;
+const LEASE_GC_INTERVAL_MS = 10 * 60_000;
+/** A file written this recently by nobody holding a lease = unowned live writer. */
+const UNOWNED_WRITE_WINDOW_MS = 30_000;
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+function shorten(text: string): string {
+  return text.length > 48 ? `${text.slice(0, 48)}…` : text;
+}
 
 /**
- * Owns the session lifecycle and — importantly — discovers **all** pi sessions
- * on the host (not just ones created through this bridge). The session dir
- * defaults to pi's real storage (`~/.pi/agent/sessions`), so sessions created
- * in the CLI/TUI and sessions created from the app are one and the same pool.
+ * Owns the session lifecycle and discovers ALL pi sessions on the host (the
+ * session dir defaults to pi's own storage). Ownership comes from leases only:
+ *  - TUI lease held → proxy to the host TUI over its IPC endpoint;
+ *  - no lease       → spawn a `pi --mode rpc` child under a bridge lease;
+ *  - SSE viewers of unowned sessions get a read-only file tailer.
  */
 export class SessionManager {
   private readonly sessions = new Map<string, Session>();
   private readonly options: SessionManagerOptions;
-  private indexCache: { at: number; entries: Map<string, SessionFileMeta> } | null = null;
-  /** Read-only mirrors for host-owned sessions — kept OUT of `sessions` so
-   *  they never pollute the session list/index metadata. */
-  private readonly mirrors = new Map<string, Session>();
+  /** Last directory walk (disk metas only; loaded sessions are overlaid per read). */
+  private walkCache: { at: number; generation: number; entries: Map<string, SessionFileMeta> } | null = null;
+  private indexGeneration = 0;
+  private walkInflight: Promise<Map<string, SessionFileMeta>> | null = null;
   private readonly startLocks = new Map<string, Promise<Session | null>>();
-  private readonly fileCache = new Map<string, { mtimeMs: number; size: number; meta: SessionFileMeta }>();
-  private liveCache: { at: number; instances: LiveInstance[]; mapped: Map<string, number> } = {
-    at: 0,
-    instances: [],
-    mapped: new Map(),
-  };
+  /** Idempotency keys for mutating POSTs (create/fork): key → first result for 10 min. */
+  private readonly idempotency = new Map<string, { at: number; promise: Promise<unknown> }>();
+  /** Last time a bridge transport for a file ended (unowned-writer heuristic). */
+  private readonly lastBridgeExit = new Map<string, number>();
+  readonly files: SessionFileCache;
 
   constructor(options: SessionManagerOptions) {
     this.options = options;
     fs.mkdirSync(options.sessionDir, { recursive: true });
-    setInterval(() => this.sweepIdle(), 60_000).unref();
-    // Live pi-instance probe (external agents on the host).
-    void this.refreshLive();
-    setInterval(() => void this.refreshLive(), PROBE_TTL_MS).unref();
-    // Watch the session dir for changes (new sessions / active updates).
-    this.watchSessionDir();
+    this.files = new SessionFileCache({ onAsyncUpdate: () => this.invalidateIndex() });
+    if (!options.noTimers) {
+      setInterval(() => this.sweep(), 60_000).unref();
+      setTimeout(() => void this.collectLeaseGarbage(), 5_000).unref();
+      setInterval(() => void this.collectLeaseGarbage(), LEASE_GC_INTERVAL_MS).unref();
+      this.watchSessionDir();
+    }
   }
 
-  /** Recursive fs.watch where supported (Windows/macOS); the 3s index TTL
-   *  covers platforms without recursive watch. */
+  /** Recursive fs.watch; only session JSONL changes invalidate the index —
+   *  lease/tmp/queue/stats sidecar writes are ignored (no invalidation storms). */
   private watchSessionDir(): void {
     try {
-      const watcher = fs.watch(this.options.sessionDir, { recursive: true }, () => {
-        this.invalidateIndex();
+      const watcher = fs.watch(this.options.sessionDir, { recursive: true }, (_ev, name) => {
+        const n = name ? name.toString() : '';
+        if (!n || n.endsWith('.jsonl')) this.invalidateIndex();
       });
       watcher.on('error', () => this.invalidateIndex());
-      this.options.log.debug('session dir watcher active');
     } catch {
       this.options.log.debug('recursive fs.watch unavailable — using TTL only');
     }
   }
 
-  /** Probe host processes; map external pi agents to sessions by cwd, then by
-   *  recency. Never maps bridge-managed children (excluded by pid). */
-  private async refreshLive(): Promise<void> {
+  async collectLeaseGarbage(): Promise<void> {
     try {
-      const instances = await probeLivePiInstances();
-      const children = new Set<number>();
-      for (const s of this.sessions.values()) {
-        if (s.pid !== null) children.add(s.pid);
-      }
-      const external = instances.filter((i) => !children.has(i.pid));
-
-      const mapped = new Map<string, number>();
-      const used = new Set<string>();
-      // Candidate external sessions, freshest first. Lease-held sessions are
-      // EXACTLY mapped by buildIndex - probing must not steal them.
-      const candidates = this.walkAllMetas()
-        .filter((m) => {
-          if (this.sessions.has(m.id) && this.sessions.get(m.id)!.running) return false;
-          const lease = readLease(m.file);
-          return !(lease && isLeaseHeld(lease));
-        })
-        .sort((a, b) => b.lastActivityAt - a.lastActivityAt);
-
-      // Pass 1: exact cwd match (POSIX: /proc/<pid>/cwd; Windows: P/Invoke).
-      for (const inst of external) {
-        if (!inst.cwd) continue;
-        const hit = candidates.find((c) => c.workdir === inst.cwd && !used.has(c.id));
-        if (hit) {
-          mapped.set(hit.id, inst.pid);
-          used.add(hit.id);
-        }
-      }
-      // Pass 2: unmatched agents -> freshest session touched in the last 2 min.
-      for (const inst of external) {
-        if ([...mapped.values()].includes(inst.pid)) continue;
-        const hit = candidates.find(
-          (c) => !used.has(c.id) && Date.now() - c.lastActivityAt < 120_000,
-        );
-        if (hit) {
-          mapped.set(hit.id, inst.pid);
-          used.add(hit.id);
-        }
-      }
-      this.liveCache = {
-        at: Date.now(),
-        instances: external.map((i) => ({
-          pid: i.pid,
-          cwd: i.cwd,
-          startedAt: i.startedAt,
-          args: i.args,
-          sessionId: [...mapped.entries()].find(([, p]) => p === i.pid)?.[0] ?? null,
-        })),
-        mapped,
-      };
+      const r = await gcLeases(this.options.sessionDir);
+      if (r.staleLeases || r.tmpFiles) this.options.log.info(r, 'lease GC removed stale sidecars');
     } catch (err) {
-      this.options.log.warn({ err: (err as Error).message }, 'live probe failed');
+      this.options.log.warn({ err: (err as Error).message }, 'lease GC failed');
     }
   }
 
+  /* ---------------- ids & paths ---------------- */
+
+  private nextId(): string {
+    return crypto.randomUUID().replace(/-/g, '').slice(0, 16);
+  }
+
+  /** App-created sessions live inside the mangled workdir dir — where pi itself stores them. */
+  sessionFile(id: string): string {
+    return path.join(this.options.sessionDir, manglePath(this.options.workdir), `${id}.jsonl`);
+  }
+
+  /* ---------------- discovery ---------------- */
+
+  invalidateIndex(): void {
+    this.indexGeneration++;
+  }
+
+  /** Last walk + overlay (possibly stale) — for background maintenance only. */
+  private peekIndex(): Map<string, SessionFileMeta> {
+    return this.overlay(this.walkCache?.entries ?? new Map());
+  }
+
   /**
-   * Session for SSE attachment: host-owned sessions get a READ-ONLY mirror
-   * (file watcher only — NO second pi process, so the agent context never
-   * diverges). Bridge-owned sessions spawn normally. A turn later converts
-   * the mirror into a real agent (explicit takeover).
+   * Session index with stale-while-revalidate semantics. The directory walk is
+   * async (fs.promises + incremental file summaries) and shared by concurrent
+   * callers. A dirty (watcher-invalidated) or expired walk is refreshed in the
+   * background while callers get the previous one — unless it is very old or
+   * `fresh` is requested (e.g. an id lookup that missed).
    */
-  async sessionForSSE(id: string): Promise<Session | null> {
-    const existing = this.sessions.get(id);
-    if (existing) {
-      if (!existing.running && !existing.readOnly) return this.ensureRunning(id);
-      return existing;
+  private async getIndex(fresh = false): Promise<Map<string, SessionFileMeta>> {
+    const cache = this.walkCache;
+    const age = cache ? Date.now() - cache.at : Infinity;
+    const clean = cache !== null && cache.generation === this.indexGeneration && age < INDEX_TTL_MS;
+    if (cache && clean && !fresh) return this.overlay(cache.entries);
+    const walk = this.refreshWalk();
+    if (cache && !fresh && age < INDEX_MAX_STALE_MS) {
+      walk.catch(() => undefined);
+      return this.overlay(cache.entries);
     }
-    const oldMirror = this.mirrors.get(id);
-    if (oldMirror) return oldMirror;
-    const meta = this.buildIndex().get(id);
-    if (!meta) return null;
-    if (this.liveCache.mapped.has(id)) {
-      // PATCH owner-proxy: when the host TUI holds the lease, attach as proxy
-      // so SSE subscribers get real agent events instead of file-tail deltas.
-      const lease = readLease(meta.file);
-      if (lease && isLeaseHeld(lease)) return this.ensureRunning(id);
-      const mirror = new Session(
-        id,
-        meta.name,
-        meta.file,
-        this.options.bin,
-        meta.workdir ?? this.options.workdir,
-        this.options.sessionDir,
-        this.options.extraArgs,
-        this.options.log.child({ mirror: true }),
-        'pi',
-        true, // readOnly
-      );
-      this.mirrors.set(id, mirror);
-      await mirror.start();
-      return mirror;
-    }
-    return this.ensureRunning(id);
+    return this.overlay(await walk);
   }
 
-  /** Valid lease held by a live host process for this session, if any. */
-  getLiveLeaseInfo(id: string): Lease | null {
-    const meta = this.buildIndex().get(id);
-    if (!meta) return null;
-    const lease = readLease(meta.file);
-    return lease && isLeaseHeld(lease) ? lease : null;
+  private refreshWalk(): Promise<Map<string, SessionFileMeta>> {
+    if (this.walkInflight) return this.walkInflight;
+    const generation = this.indexGeneration;
+    const p = (async () => {
+      const entries = new Map<string, SessionFileMeta>();
+      await this.walkSessionDir(this.options.sessionDir, entries, 0);
+      this.walkCache = { at: Date.now(), generation, entries };
+      return entries;
+    })().finally(() => {
+      if (this.walkInflight === p) this.walkInflight = null;
+    });
+    this.walkInflight = p;
+    return p;
   }
 
   /**
-   * Graceful takeover handshake: ask the live owner to abort + release its
-   * lease, then wait for the lease file to disappear. Never force-kills.
+   * Loaded sessions win: re-key any meta pointing at the same FILE under the
+   * session's canonical id (pre-rekey placeholder ids never list twice) and
+   * add running sessions whose JSONL pi has not written yet.
+   */
+  private overlay(walk: Map<string, SessionFileMeta>): Map<string, SessionFileMeta> {
+    if (this.sessions.size === 0) return walk;
+    const entries = new Map(walk);
+    const byFile = new Map<string, string>();
+    for (const [k, m] of entries) byFile.set(path.resolve(m.file), k);
+    for (const s of this.sessions.values()) {
+      const key = byFile.get(path.resolve(s.file));
+      const meta = key ? entries.get(key) : undefined;
+      if (meta && key) {
+        if (key !== s.id) {
+          entries.delete(key);
+          entries.set(s.id, { ...meta, id: s.id });
+        }
+      } else if (s.running) {
+        entries.set(s.id, {
+          id: s.id,
+          file: s.file,
+          name: s.name,
+          workdir: s.workdir,
+          createdAt: s.createdAt,
+          lastActivityAt: Math.round(s.lastActivityAt),
+          messageCount: s.messageCount,
+          lastMessageAt: null,
+          hasLease: true,
+        });
+      }
+    }
+    return entries;
+  }
+
+  private async walkSessionDir(dir: string, out: Map<string, SessionFileMeta>, depth: number): Promise<void> {
+    if (depth > 3) return;
+    let children: fs.Dirent[];
+    try {
+      children = await fs.promises.readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    const names = new Set(children.map((c) => c.name));
+    const files = children.filter((c) => c.isFile() && c.name.endsWith('.jsonl'));
+    // Bounded parallelism: enough to keep the libuv pool busy, never a flood.
+    for (let i = 0; i < files.length; i += WALK_CONCURRENCY) {
+      await Promise.all(files.slice(i, i + WALK_CONCURRENCY).map(async (child) => {
+        const full = path.join(dir, child.name);
+        let stat: fs.Stats;
+        try {
+          stat = await fs.promises.stat(full);
+        } catch {
+          return;
+        }
+        const sum = await this.files.summaryFast(full, stat);
+        const meta = this.metaFor(full, stat, sum, names.has(`${child.name}.lease`));
+        const prev = out.get(meta.id);
+        if (!prev || prev.lastActivityAt < meta.lastActivityAt) out.set(meta.id, meta);
+      }));
+    }
+    for (const child of children) {
+      if (child.isDirectory() && !child.name.startsWith('.')) {
+        await this.walkSessionDir(path.join(dir, child.name), out, depth + 1);
+      }
+    }
+  }
+
+  private metaFor(file: string, stat: fs.Stats, sum: FileSummary, hasLease: boolean): SessionFileMeta {
+    const base = path.basename(file, '.jsonl');
+    let name = sum.sessionName ?? (sum.firstUserText ? shorten(sum.firstUserText) : null);
+    if (!name && sum.cwd) {
+      const dirName = sum.cwd.split(/[\\/]/).filter(Boolean).pop();
+      const date = stat.mtime.toISOString().slice(0, 10);
+      name = dirName ? `${dirName} · ${date}` : date;
+    }
+    return {
+      id: sum.headerId ?? base,
+      file,
+      name: name ?? `pi session · ${base.slice(0, 8)}`,
+      workdir: sum.cwd,
+      createdAt: sum.createdAt ?? Math.round(stat.birthtimeMs || stat.mtimeMs),
+      lastActivityAt: Math.round(stat.mtimeMs),
+      messageCount: sum.messageCount,
+      lastMessageAt: sum.lastMessageAt,
+      hasLease,
+    };
+  }
+
+  /** Exact id, else a unique prefix of ≥ 12 chars (UUIDv7 share time prefixes). */
+  private async resolveMeta(id: string): Promise<SessionFileMeta | null> {
+    const lookup = (index: Map<string, SessionFileMeta>): SessionFileMeta | null | undefined => {
+      const exact = index.get(id);
+      if (exact) return exact;
+      if (id.length < MIN_PREFIX) return undefined;
+      let hit: SessionFileMeta | undefined;
+      for (const meta of index.values()) {
+        if (!meta.id.startsWith(id)) continue;
+        if (hit) return null; // ambiguous — never guess
+        hit = meta;
+      }
+      return hit;
+    };
+    const first = lookup(await this.getIndex());
+    if (first !== undefined) return first;
+    // Miss on a possibly stale index (a session created seconds ago): re-walk once.
+    return lookup(await this.getIndex(true)) ?? null;
+  }
+
+  private sessionByFile(file: string): Session | undefined {
+    const key = path.resolve(file);
+    for (const s of this.sessions.values()) if (path.resolve(s.file) === key) return s;
+    return undefined;
+  }
+
+  /** Get-or-create the registered Session for a meta (queue restored once). */
+  private sessionFor(meta: SessionFileMeta): Session {
+    const existing = this.sessions.get(meta.id) ?? this.sessionByFile(meta.file);
+    if (existing) return existing;
+    const session = new Session(
+      meta.id,
+      meta.name,
+      meta.file,
+      this.options.bin,
+      meta.workdir ?? this.options.workdir,
+      this.options.sessionDir,
+      this.options.extraArgs,
+      this.options.log,
+      'pi',
+    );
+    session.messageCount = meta.messageCount;
+    session.createdAt = meta.createdAt;
+    session.lastActivityAt = meta.lastActivityAt;
+    this.register(session);
+    return session;
+  }
+
+  private register(session: Session): void {
+    this.sessions.set(session.id, session);
+    this.wireQueue(session);
+    session.onFenced = () => this.handleFenced(session);
+  }
+
+  get(id: string): Session | null {
+    return this.sessions.get(id) ?? null;
+  }
+
+  /** Registered Session for an id (exact or unique ≥12-char prefix); loads its queue. */
+  async find(id: string): Promise<Session | null> {
+    const loaded = this.sessions.get(id);
+    if (loaded) return loaded;
+    const meta = await this.resolveMeta(id);
+    return meta ? this.sessionFor(meta) : null;
+  }
+
+  /* ---------------- ownership ---------------- */
+
+  /** Fresh (uncached) lease-derived ownership of a session. */
+  async ownership(id: string): Promise<{ owner: LeaseOwner; lease: Lease | null; session: Session | null }> {
+    const session = await this.find(id);
+    if (!session) return { owner: 'none', lease: null, session: null };
+    if (session.hasChild) return { owner: 'bridge', lease: null, session };
+    const insp = await inspectLeaseAsync(session.file);
+    if (insp.state === 'unknown') return { owner: 'unknown', lease: null, session };
+    if (insp.state === 'held' && insp.lease) return { owner: leaseKind(insp.lease), lease: insp.lease, session };
+    return { owner: 'none', lease: null, session };
+  }
+
+  /** Lease held by a host TUI (proxy target), if any. */
+  async getLiveLeaseInfo(id: string): Promise<Lease | null> {
+    const o = await this.ownership(id);
+    return o.owner === 'tui' ? o.lease : null;
+  }
+
+  /** True when a host TUI (or an undeterminable owner) holds the session. */
+  async isHostOwned(id: string): Promise<boolean> {
+    const o = (await this.ownership(id)).owner;
+    return o === 'tui' || o === 'unknown';
+  }
+
+  /**
+   * No lease, no bridge transport, yet the file was written in the last 30 s
+   * by someone other than our own (now stopped) child: an unowned writer (an
+   * old TUI that lost the lease race, a print-mode pi…). Spawning a child now
+   * would make two writers.
+   */
+  async hasUnownedRecentWriter(id: string): Promise<boolean> {
+    const o = await this.ownership(id);
+    if (o.owner !== 'none') return false;
+    const s = o.session;
+    if (!s || s.running) return false;
+    try {
+      const mtime = (await fs.promises.stat(s.file)).mtimeMs;
+      if (Date.now() - mtime >= UNOWNED_WRITE_WINDOW_MS) return false;
+      // Writes up to our own transport's end, or a holder's clean release
+      // (tombstone), were made by the single writer of the time.
+      const ours = this.lastBridgeExit.get(path.resolve(s.file)) ?? 0;
+      const tomb = await readLeaseRawAsync(s.file);
+      const released = tomb.state === 'ok' ? (tomb.lease.releasedAt ?? 0) : 0;
+      return mtime > Math.max(ours, released) + 2_000;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Graceful takeover handshake (turn ?force=1): hello first (line-buffered),
+   * then abort + release; wait for the lease to go away. Never force-kills.
    */
   async handshakeRelease(id: string, timeoutMs = 8000): Promise<boolean> {
-    const meta = this.buildIndex().get(id);
-    if (!meta) return false;
-    const lease = readLease(meta.file);
-    if (!lease || !isLeaseHeld(lease) || !lease.ipc) return false;
-    await new Promise<void>((resolve) => {
-      const socket = net.connect(lease.ipc);
-      const send = (op: string) => socket.write(`${JSON.stringify({ id: `t${op}`, op })}\n`);
-      socket.once('connect', () => {
-        send('abort');
-        send('release');
-      });
-      socket.once('error', () => resolve());
-      setTimeout(() => {
-        try { socket.destroy(); } catch { /* ignore */ }
-        resolve();
-      }, 2000).unref();
-    });
+    const s = await this.find(id);
+    if (!s) return false;
+    const lease = await this.getLiveLeaseInfo(id);
+    if (!lease) return true;
+    if (s.isProxy) s.stop('takeover');
+    const helper = new Session(`${s.id}~release`, s.name, s.file, this.options.bin, s.workdir,
+      this.options.sessionDir, [], this.options.log.child({ release: true }));
+    try {
+      await helper.attachOwner(lease);
+      await helper.abort();
+      await helper.request({ type: 'release' }, 3_000).catch(() => undefined);
+    } catch (err) {
+      this.options.log.warn({ sessionId: id, err: (err as Error).message }, 'release handshake failed');
+    } finally {
+      helper.stop('release done');
+    }
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      const cur = readLease(meta.file);
-      if (!cur || !isLeaseHeld(cur)) return true;
-      await new Promise((r) => setTimeout(r, 250));
+      const insp = await inspectLeaseAsync(s.file);
+      if (insp.state === 'absent' || insp.state === 'stale') return true;
+      await sleep(250);
     }
     return false;
   }
 
-  /* ---------------- rename ---------------- */
+  /* ---------------- lifecycle ---------------- */
 
-  /** Rename a session: pi persists it via set_session_name (session_renamed
-   *  entry) so the file — and every surface reading it — syncs. */
+  /** Re-key a started session under pi's canonical id (JSONL header id). */
+  private canonicalRekey(session: Session): void {
+    const piId = session.piId;
+    const key = session.id;
+    if (!piId || piId === key || this.sessions.get(key) !== session) return;
+    this.sessions.delete(key);
+    session.id = piId;
+    this.sessions.set(piId, session);
+    session.newEpoch();
+    try {
+      const placeholder = this.sessionFile(key);
+      if (path.resolve(placeholder) !== path.resolve(session.file) && fs.existsSync(placeholder)
+          && fs.statSync(placeholder).size === 0) {
+        fs.unlinkSync(placeholder);
+      }
+    } catch { /* best effort */ }
+    this.invalidateIndex();
+    this.options.log.info({ from: key, to: piId }, 'session re-keyed to canonical pi id');
+  }
+
+  /** Bridge children only — owner proxies never consume a slot. */
+  get runningCount(): number {
+    let n = 0;
+    for (const s of this.sessions.values()) if (s.hasChild) n++;
+    return n;
+  }
+
+  /** Free a slot by stopping the stalest idle child (no viewers first). */
+  private ensureAgentSlot(): boolean {
+    if (this.runningCount < this.options.maxAgents) return true;
+    const now = Date.now();
+    const evictable = [...this.sessions.values()]
+      .filter((x) => x.hasChild && !x.isBusy && !x.error && !x.queue.some(isActive)
+        && now - x.lastActivityAt > 60_000)
+      .sort((a, b) => (a.sinkCount() - b.sinkCount()) || (a.lastActivityAt - b.lastActivityAt));
+    for (const victim of evictable) {
+      if (this.runningCount < this.options.maxAgents) break;
+      this.options.log.info({ sessionId: victim.id }, 'evicting idle agent to free a slot');
+      victim.stop('evicted for capacity');
+    }
+    return this.runningCount < this.options.maxAgents;
+  }
+
+  /** Run `fn` once per idempotency key (10 min window); failures are not cached. */
+  idempotent<T>(key: string | undefined, fn: () => Promise<T>): Promise<T> {
+    if (!key) return fn();
+    const prior = this.idempotency.get(key);
+    if (prior && Date.now() - prior.at < CREATE_IDEMPOTENCY_MS) return prior.promise as Promise<T>;
+    const promise = fn();
+    this.idempotency.set(key, { at: Date.now(), promise });
+    promise.catch(() => {
+      if (this.idempotency.get(key)?.promise === promise) this.idempotency.delete(key);
+    });
+    return promise;
+  }
+
+  /**
+   * Create a session. `clientRequestId` makes it idempotent: a repeat within
+   * 10 min returns the same session (lost HTTP response retries).
+   */
+  create(name: string, clientRequestId?: string): Promise<Session> {
+    return this.idempotent(clientRequestId ? `create:${clientRequestId}` : undefined, () => this.createUnlocked(name));
+  }
+
+  private async createUnlocked(name: string): Promise<Session> {
+    if (!this.ensureAgentSlot()) throw new BusyError(this.options.maxAgents);
+    const id = this.nextId();
+    const session = new Session(
+      id,
+      name,
+      this.sessionFile(id),
+      this.options.bin,
+      this.options.workdir,
+      this.options.sessionDir,
+      this.options.extraArgs,
+      this.options.log,
+    );
+    session.passNameOnce = name.trim().length > 0;
+    this.register(session);
+    this.invalidateIndex();
+    try {
+      await session.start();
+      this.throwIfDead(session);
+    } catch (err) {
+      session.stop('create failed');
+      this.sessions.delete(session.id);
+      throw err;
+    }
+    this.canonicalRekey(session);
+    return session;
+  }
+
+  private throwIfDead(session: Session): void {
+    if (session.closed || !session.running) {
+      throw new SpawnError(session.error ? `pi failed to start: ${session.error}` : 'pi exited before the session was ready');
+    }
+  }
+
+  /** Bring a session's transport up (proxy to the TUI owner, or spawn a child). */
+  async ensureRunning(id: string): Promise<Session | null> {
+    const existing = this.startLocks.get(id);
+    if (existing) return existing;
+    const pending = this.ensureRunningUnlocked(id);
+    this.startLocks.set(id, pending);
+    try {
+      return await pending;
+    } finally {
+      if (this.startLocks.get(id) === pending) this.startLocks.delete(id);
+    }
+  }
+
+  private async ensureRunningUnlocked(id: string): Promise<Session | null> {
+    const session = await this.find(id);
+    if (!session) return null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const insp = inspectLease(session.file);
+      if (insp.state === 'unknown') throw new LeaseHeldError('unknown', null);
+      const lease = insp.state === 'held' ? insp.lease : null;
+      const oursForThisFile = lease !== null && leaseKind(lease) === 'bridge' && lease.bridgePid === process.pid;
+      if (oursForThisFile && !session.hasChild && !this.anyChildFor(session.file)) {
+        // Orphaned sidecar from one of OUR children that is gone — reclaimable.
+        try { fs.unlinkSync(leasePath(session.file)); } catch { /* raced */ }
+        continue;
+      }
+      if (lease && !oursForThisFile) {
+        if (leaseKind(lease) === 'bridge') {
+          session.externalOwner = 'bridge';
+          throw new SessionLiveError('Session is driven by another Remote Pi bridge process');
+        }
+        // Host TUI is the single writer → proxy to it.
+        session.externalOwner = 'tui';
+        if (session.hasChild) await session.standDownChild();
+        if (session.isProxy && session.ownerLease?.epoch === lease.epoch
+            && session.ownerLease.holder.nonce === lease.holder.nonce) {
+          return session;
+        }
+        await this.attachOwner(session, lease);
+        return session;
+      }
+      session.externalOwner = 'none';
+      if (session.isProxy) session.stop('owner released the lease');
+      if (session.hasChild) return session;
+      if (!this.ensureAgentSlot()) throw new BusyError(this.options.maxAgents);
+      try {
+        await session.start();
+      } catch (err) {
+        if (err instanceof LeaseHeldError && attempt === 0) continue; // a TUI claimed it meanwhile
+        throw err;
+      }
+      this.throwIfDead(session);
+      this.canonicalRekey(session);
+      return session;
+    }
+    return session;
+  }
+
+  private anyChildFor(file: string): boolean {
+    const key = path.resolve(file);
+    for (const s of this.sessions.values()) if (s.hasChild && path.resolve(s.file) === key) return true;
+    return false;
+  }
+
+  /** Attach as owner proxy; waits briefly for a just-written lease to publish its ipc. */
+  private async attachOwner(session: Session, lease: Lease): Promise<void> {
+    let current = lease;
+    const deadline = Date.now() + 3_000;
+    while (!current.ipc && Date.now() < deadline) {
+      await sleep(250);
+      const insp = inspectLease(session.file);
+      if (insp.state !== 'held' || !insp.lease) break;
+      current = insp.lease;
+    }
+    if (!current.ipc) {
+      throw new SessionLiveError('The host TUI owns this session but its control channel is unavailable — restart that pi TUI to load the updated remote-pi-owner extension');
+    }
+    try {
+      await session.attachOwner(current);
+    } catch (err) {
+      throw new SessionLiveError(`Host TUI owns this session but did not answer (${(err as Error).message})`);
+    }
+  }
+
+  /** Our bridge lease was pre-empted by a host TUI: stand the child down and proxy instead. */
+  private handleFenced(session: Session): void {
+    void (async () => {
+      await session.standDownChild();
+      for (let i = 0; i < 10; i++) {
+        const insp = inspectLease(session.file);
+        if (insp.state === 'held' && insp.lease && leaseKind(insp.lease) === 'tui') {
+          session.externalOwner = 'tui';
+          if (insp.lease.ipc) {
+            try {
+              await session.attachOwner(insp.lease);
+              this.options.log.info({ sessionId: session.id }, 'fenced child replaced by owner proxy');
+              this.dispatchQueued(session);
+              return;
+            } catch (err) {
+              this.options.log.debug({ sessionId: session.id, err: (err as Error).message }, 'proxy attach after fence failed');
+            }
+          }
+        } else if (insp.state !== 'held' && insp.state !== 'unknown') {
+          return; // owner already gone; next turn spawns/attaches lazily
+        }
+        await sleep(1_000);
+      }
+    })();
+  }
+
+  /** Session for an SSE attach: never spawns a child just to watch. */
+  async sessionForSSE(id: string): Promise<Session | null> {
+    const session = await this.find(id);
+    if (!session) return null;
+    if (session.running) return session;
+    const insp = await inspectLeaseAsync(session.file);
+    if (insp.state === 'held' && insp.lease && leaseKind(insp.lease) === 'tui') {
+      session.externalOwner = 'tui';
+      try {
+        await this.ensureRunning(session.id); // cheap: proxy attach, no slot
+      } catch (err) {
+        this.options.log.debug({ sessionId: id, err: (err as Error).message }, 'proxy attach for SSE failed — tailing file');
+      }
+    } else {
+      session.externalOwner = insp.state === 'held' && insp.lease ? leaseKind(insp.lease) : insp.state === 'unknown' ? 'tui' : 'none';
+    }
+    return session;
+  }
+
+  async delete(id: string, purge: boolean): Promise<boolean> {
+    const session = await this.find(id);
+    if (!session) return false;
+    const file = session.file;
+    const closed = session.waitClosed(5_000);
+    session.stop('deleted');
+    session.closeSinks();
+    if (session.queueTimer) clearTimeout(session.queueTimer);
+    this.sessions.delete(session.id);
+    if (purge) {
+      await closed; // never unlink under a still-writing child
+      for (const f of [file, queueFilePath(this.options.sessionDir, file), `${file}.stats.json`]) {
+        await fs.promises.unlink(f).catch(() => undefined);
+      }
+      const insp = await inspectLeaseAsync(file);
+      if (insp.state === 'stale' || (insp.lease && leaseKind(insp.lease) === 'bridge' && insp.lease.bridgePid === process.pid)) {
+        await fs.promises.unlink(leasePath(file)).catch(() => undefined);
+      }
+      this.files.delete(file);
+    }
+    this.invalidateIndex();
+    return true;
+  }
+
+  /* ---------------- summaries (ONE builder) ---------------- */
+
+  /** Lease ownership for a summary (only files that have a sidecar are read). */
+  private async leaseFor(meta: SessionFileMeta | null, s: Session | undefined): Promise<LeaseInspection | null> {
+    const file = meta?.file ?? s?.file;
+    if (!file || (!meta?.hasLease && !s)) return null;
+    return inspectLeaseAsync(file);
+  }
+
+  private summarize(meta: SessionFileMeta | null, s: Session | undefined, lease: LeaseInspection | null): SessionSummary {
+    const now = Date.now();
+    let leaseOwner: SessionOwner = 'none';
+    let leasePid: number | null = null;
+    if (lease?.state === 'unknown') leaseOwner = 'tui';
+    else if (lease?.state === 'held' && lease.lease) {
+      leaseOwner = leaseKind(lease.lease);
+      leasePid = lease.lease.holder.pid;
+    }
+    const owner: SessionOwner = s?.running ? s.owner : leaseOwner;
+    if (s && !s.running) s.externalOwner = leaseOwner;
+    const mtime = meta?.lastActivityAt ?? 0;
+    const lastActivityAt = Math.round(Math.max(mtime, s?.lastActivityAt ?? 0));
+    const busy = s ? s.isBusy : false;
+    return {
+      id: s?.id ?? meta!.id,
+      name: (s?.running ? s.name : meta?.name) ?? s?.name ?? 'pi session',
+      running: owner !== 'none',
+      busy,
+      model: s?.model ?? null,
+      messageCount: meta?.messageCount ?? s?.messageCount ?? 0,
+      createdAt: meta?.createdAt ?? s?.createdAt ?? now,
+      lastActivityAt,
+      lastMessageAt: meta?.lastMessageAt ?? null,
+      error: s?.error ?? null,
+      phase: s?.phase ?? 'idle',
+      owner,
+      source: s?.source ?? 'pi',
+      workdir: meta?.workdir ?? s?.workdir ?? null,
+      active: busy || now - lastActivityAt < ACTIVE_WINDOW_MS,
+      live: owner === 'tui',
+      livePid: owner === 'tui' ? (s?.ownerLease?.holder.pid ?? leasePid) : null,
+      writing: mtime > 0 && now - mtime < WRITING_WINDOW_MS,
+    };
+  }
+
+  private sortKey(meta: SessionFileMeta, s: Session | undefined): number {
+    return meta.lastMessageAt ?? Math.max(meta.lastActivityAt, s?.lastActivityAt ?? 0);
+  }
+
+  /** Cursor-paginated session list: newest first, `before` = older than ts. */
+  async listPage(limit: number, before?: number): Promise<{ sessions: SessionSummary[]; hasMore: boolean; total: number }> {
+    const rows: { meta: SessionFileMeta; s: Session | undefined; key: number }[] = [];
+    const seen = new Set<string>();
+    for (const meta of (await this.getIndex()).values()) {
+      const s = this.sessions.get(meta.id) ?? this.sessionByFile(meta.file);
+      const id = s?.id ?? meta.id;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      rows.push({ meta, s, key: this.sortKey(meta, s) });
+    }
+    rows.sort((a, b) => b.key - a.key);
+    const filtered = before ? rows.filter((r) => r.key < before) : rows;
+    const page = filtered.slice(0, limit);
+    const sessions = await Promise.all(page.map(async (r) => this.summarize(r.meta, r.s, await this.leaseFor(r.meta, r.s))));
+    return { sessions, hasMore: filtered.length > limit, total: rows.length };
+  }
+
+  async list(): Promise<SessionSummary[]> {
+    return (await this.listPage(MAX_LISTED)).sessions;
+  }
+
+  async summary(id: string): Promise<SessionSummary | null> {
+    const loaded = this.sessions.get(id);
+    const meta = loaded ? ((await this.getIndex()).get(loaded.id) ?? null) : await this.resolveMeta(id);
+    const s = loaded ?? (meta ? this.sessionByFile(meta.file) : undefined);
+    if (!s && !meta) return null;
+    return this.summarize(meta, s, await this.leaseFor(meta, s));
+  }
+
+  async summaryOf(session: Session): Promise<SessionSummary> {
+    const meta = (await this.getIndex()).get(session.id) ?? null;
+    return this.summarize(meta, session, await this.leaseFor(meta, session));
+  }
+
+  /** /api/status `liveInstances`: host TUIs holding leases. */
+  async getLiveInstances(): Promise<LiveInstance[]> {
+    const metas = [...(await this.getIndex()).values()].filter((m) => m.hasLease);
+    const out: LiveInstance[] = [];
+    await Promise.all(metas.map(async (meta) => {
+      const insp = await inspectLeaseAsync(meta.file);
+      if (insp.state !== 'held' || !insp.lease || leaseKind(insp.lease) !== 'tui') return;
+      out.push({
+        pid: insp.lease.holder.pid,
+        cwd: meta.workdir,
+        startedAt: insp.lease.holder.startedAtMs || null,
+        args: insp.lease.ipc,
+        sessionId: meta.id,
+      });
+    }));
+    return out;
+  }
+
+  stopAll(): void {
+    for (const s of this.sessions.values()) {
+      if (s.queueTimer) clearTimeout(s.queueTimer);
+      s.stop('shutdown');
+    }
+  }
+
+  /**
+   * Graceful shutdown: end every SSE stream (so the HTTP server can close),
+   * stop children and wait for them to exit — their close handlers release
+   * the bridge leases — and drop owner-proxy pipes (never the TUIs).
+   */
+  async shutdown(timeoutMs = 5_000): Promise<void> {
+    this.shuttingDown = true;
+    const sessions = [...this.sessions.values()];
+    for (const s of sessions) {
+      if (s.queueTimer) clearTimeout(s.queueTimer);
+      s.closeSinks();
+    }
+    const waits = sessions.map((s) => s.waitClosed(timeoutMs));
+    for (const s of sessions) s.stop('shutdown');
+    await Promise.all(waits);
+  }
+
+  private shuttingDown = false;
+
+  sinkCounts(): Record<string, number> {
+    const out: Record<string, number> = {};
+    for (const [id, s] of this.sessions) if (s.sinkCount()) out[id] = s.sinkCount();
+    return out;
+  }
+
+  /* ---------------- rename / models ---------------- */
+
   async rename(id: string, name: string): Promise<SessionSummary | null> {
     const session = await this.ensureRunning(id);
     if (!session) return null;
     session.name = name;
     await session.request({ type: 'set_session_name', name });
     this.invalidateIndex();
-    return session.toSummary();
+    return this.summaryOf(session);
   }
-
-  /* ---------------- models ---------------- */
 
   async listModels(id: string): Promise<unknown> {
     const session = await this.ensureRunning(id);
@@ -290,706 +875,22 @@ export class SessionManager {
     return data.modelId ?? null;
   }
 
-  /** Raw external pi instances (for /api/status). */
-  getLiveInstances(): LiveInstance[] {
-    return this.liveCache.instances;
-  }
-
-  /** True when an external (non-bridge) pi process currently owns this session. */
-  isExternallyLive(id: string): boolean {
-    return this.liveCache.mapped.has(id);
-  }
-
-  /** True when the host agent is actively writing to the session file (<10s). */
-  isHostWriting(id: string): boolean {
-    const meta = this.liveCache.mapped.has(id) ? this.buildIndex().get(id) : undefined;
-    if (!meta) return false;
-    try {
-      return Date.now() - fs.statSync(meta.file).mtimeMs < 10_000;
-    } catch {
-      return false;
-    }
-  }
-
-  private walkAllMetas(): SessionFileMeta[] {
-    const entries = new Map<string, SessionFileMeta>();
-    this.walkSessionDir(this.options.sessionDir, entries);
-    for (const s of this.sessions.values()) entries.set(s.id, this.metaFromLive(s));
-    return [...entries.values()];
-  }
-
-  /* ---------------- ids & paths ---------------- */
-
-  private nextId(): string {
-    return crypto.randomUUID().replace(/-/g, '').slice(0, 16);
-  }
-
-  /** App-created sessions live inside the mangled workdir dir — exactly where
-   *  pi itself stores them, so the CLI sees them too. */
-  sessionFile(id: string): string {
-    return path.join(
-      this.options.sessionDir,
-      manglePath(this.options.workdir),
-      `${id}.jsonl`,
-    );
-  }
-
-  /* ---------------- discovery ---------------- */
-
-  /** Recursively scan the session dir for pi session files (cached 10s). */
-  private buildIndex(): Map<string, SessionFileMeta> {
-    const now = Date.now();
-    if (this.indexCache && now - this.indexCache.at < INDEX_TTL_MS) {
-      return this.indexCache.entries;
-    }
-    const entries = new Map<string, SessionFileMeta>();
-    this.walkSessionDir(this.options.sessionDir, entries);
-    // Live (managed) sessions win over their disk metadata — EXCEPT
-    // lastMessageAt, which must reflect the real last message, not the
-    // open/spawn time (activity timestamps move on every SSE event).
-    for (const s of this.sessions.values()) {
-      const live = this.metaFromLive(s);
-      const disk = entries.get(s.id);
-      if (disk && disk.lastMessageAt !== null) {
-        live.lastMessageAt = disk.lastMessageAt;
-      }
-      // Any other index entry pointing at the SAME file is a stale identity
-      // of this live session (pre-rekey basename key) - drop it or the list
-      // shows the session twice.
-      const liveFile = path.resolve(s.file);
-      for (const k of [...entries.keys()]) {
-        if (k !== s.id && path.resolve(entries.get(k)!.file) === liveFile) {
-          entries.delete(k);
-        }
-      }
-      entries.set(s.id, live);
-    }
-    // External pi agents currently owning a session (from the last probe).
-    for (const [id, pid] of this.liveCache.mapped) {
-      const meta = entries.get(id);
-      if (meta) {
-        meta.live = true;
-        meta.livePid = pid;
-      }
-    }
-    // AUTHORITATIVE ownership signal: a held lease means a live host TUI has
-    // this session open. Probe-based cwd/recency mapping guesses; leases are
-    // exact. Runs after the probe overlay so it corrects wrong mappings.
-    for (const meta of entries.values()) {
-      if (meta.live) continue;
-      const lease = readLease(meta.file);
-      if (lease && isLeaseHeld(lease)) {
-        meta.live = true;
-        meta.livePid = lease.holder.pid;
-      }
-    }
-    this.indexCache = { at: now, entries };
-    return entries;
-  }
-
-  private walkSessionDir(dir: string, out: Map<string, SessionFileMeta>): void {
-    let children: fs.Dirent[];
-    try {
-      children = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const child of children) {
-      const full = path.join(dir, child.name);
-      if (child.isDirectory()) {
-        this.walkSessionDir(full, out);
-      } else if (child.isFile() && child.name.endsWith('.jsonl')) {
-        // Reuse parsed meta for unchanged files (stat is ~free vs reading 2MB).
-        let stat: fs.Stats | null = null;
-        try {
-          stat = fs.statSync(full);
-        } catch {
-          continue;
-        }
-        const cached = this.fileCache.get(full);
-        if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
-          this.fileCache.delete(full);
-          this.fileCache.set(full, cached);
-          out.set(cached.meta.id, cached.meta);
-          continue;
-        }
-        const meta = this.readMeta(full, stat);
-        if (meta) {
-          this.fileCache.delete(full);
-          this.fileCache.set(full, { mtimeMs: stat.mtimeMs, size: stat.size, meta });
-          while (this.fileCache.size > MAX_FILE_CACHE) {
-            const oldest = this.fileCache.keys().next().value as string;
-            this.fileCache.delete(oldest);
-          }
-          out.set(meta.id, meta);
-        }
-      }
-    }
-  }
-
-  private readMeta(file: string, statArg?: fs.Stats): SessionFileMeta | null {
-    const base = path.basename(file, '.jsonl');
-    let head: Buffer;
-    let stat: fs.Stats;
-    try {
-      const fd = fs.openSync(file, 'r');
-      head = Buffer.alloc(META_READ_LIMIT);
-      const n = fs.readSync(fd, head, 0, META_READ_LIMIT, 0);
-      fs.closeSync(fd);
-      head = head.subarray(0, n);
-      stat = statArg ?? fs.statSync(file);
-    } catch {
-      return null;
-    }
-
-    let id = base;
-    let cwd: string | null = null;
-    let sessionName: string | null = null;
-    let createdAt = Math.round(stat.mtimeMs);
-    let messageCount = 0;
-    let lastMessageAt: number | null = null;
-
-    const text = decodeUtf8(head);
-    for (const line of text.split('\n')) {
-      if (!line.trim()) continue;
-      try {
-        const obj = JSON.parse(line) as Record<string, unknown>;
-        if (obj.type === 'session') {
-          if (typeof obj.id === 'string') id = obj.id;
-          if (typeof obj.cwd === 'string') cwd = obj.cwd;
-          if (typeof obj.timestamp === 'string') {
-            const ts = Date.parse(obj.timestamp);
-            if (!Number.isNaN(ts)) createdAt = ts;
-          }
-        } else if (obj.type === 'session_renamed' && typeof obj.name === 'string') {
-          sessionName = obj.name;
-        } else if (obj.type === 'session_info' && typeof obj.name === 'string') {
-          sessionName = obj.name;
-        }
-      } catch { /* skip unparseable line */ }
-    }
-    // Count parsed JSONL entries in bounded chunks. Substring counting was
-    // wrong for whitespace/content and Buffer.alloc(stat.size) could OOM.
-    messageCount = this.countMessageEntries(file);
-    // Last message timestamp: parse the tail line-by-line (a regex can match
-    // `"type":"message"` inside message CONTENT and report a stale time).
-    {
-      const fd = fs.openSync(file, 'r');
-      const tailStart = Math.max(0, stat.size - 512 * 1024);
-      const tail = Buffer.alloc(stat.size - tailStart);
-      const n = fs.readSync(fd, tail, 0, tail.length, tailStart);
-      fs.closeSync(fd);
-      const tailText = decodeUtf8(tail.subarray(0, n));
-      for (const line of tailText.split('\n')) {
-        if (!line.trim()) continue;
-        try {
-          const entry = JSON.parse(line) as { type?: string; timestamp?: number | string };
-          if (entry.type === 'message' && entry.timestamp) {
-            const ts = typeof entry.timestamp === 'number'
-              ? entry.timestamp
-              : Date.parse(entry.timestamp as string);
-            if (!Number.isNaN(ts)) lastMessageAt = ts;
-          }
-        } catch { /* skip */ }
-      }
-    }
-
-    const name = sessionName
-      ?? this.fallbackName(text, cwd, stat)
-      ?? `pi session · ${base.slice(0, 8)}`;
-
-    return {
-      id,
-      file,
-      name,
-      workdir: cwd ?? null,
-      createdAt,
-      // fs.Stats.mtimeMs is fractional — the iOS app decodes Int strictly,
-      // so round to integer epoch ms before serializing.
-      lastActivityAt: Math.round(stat.mtimeMs),
-      messageCount,
-      lastMessageAt,
-      active: Date.now() - stat.mtimeMs < ACTIVE_WINDOW_MS,
-      live: false,
-      livePid: null,
-      writing: Date.now() - stat.mtimeMs < WRITING_WINDOW_MS,
-    };
-  }
-
-  /** Name from the first user message, else "cwd — date". */
-  private fallbackName(head: string, cwd: string | null, stat: fs.Stats): string | null {
-    // pi 0.79: user content is a block array: content:[{"type":"text","text":"..."}]
-    const blocks = /"role":"user","content":\[\{"type":"text","text":"([^"]{1,60})/.exec(head);
-    if (blocks) return this.shorten(blocks[1]!);
-    // Older flat shape: content:"..."
-    const flat = /"role":"user","content":"([^"]{1,60})/.exec(head);
-    if (flat) return this.shorten(flat[1]!);
-    if (cwd) {
-      const base = cwd.split(/[\\/]/).filter(Boolean).pop();
-      const date = stat.mtime.toISOString().slice(0, 10);
-      return base ? `${base} · ${date}` : date;
-    }
-    return null;
-  }
-
-  private shorten(text: string): string {
-    const clean = text.replace(/\\n/g, ' ');
-    return clean.length > 48 ? `${clean.slice(0, 48)}…` : clean;
-  }
-
-  private metaFromLive(s: Session): SessionFileMeta {
-    return {
-      id: s.id,
-      file: s.file,
-      name: s.name,
-      workdir: s.workdir,
-      createdAt: s.createdAt,
-      lastActivityAt: s.lastActivityAt,
-      messageCount: s.messageCount,
-      lastMessageAt: s.lastActivityAt,
-      active: s.busy,
-      // A proxied session is owned by a live host terminal.
-      live: s.isProxy,
-      livePid: s.ownerLease?.holder.pid ?? null,
-      writing: s.busy,
-    };
-  }
-
-  private invalidateIndex(): void {
-    this.indexCache = null;
-  }
-
-  /* ---------------- lifecycle ---------------- */
+  /* ---------------- durable prompt queue ---------------- */
 
   /**
-   * Re-key a started session under pi's canonical id (session.piId - the
-   * JSONL header id). Keying by the file basename split one session into
-   * two identities: the map held the basename while buildIndex keyed the
-   * same file by its header id, so the app saw the session TWICE (duplicate
-   * entry) and sending to the twin spawned a rival child on a locked file
-   * (409). Returns the canonical map key.
-   */
-  private canonicalRekey(session: Session, key: string): string {
-    const piId = session.piId;
-    if (!piId || piId === key || this.sessions.get(key) !== session) return key;
-    this.sessions.delete(key);
-    // The id FIELD must become canonical too: toSummary(), SSE payloads and
-    // the buildIndex live overlay all use it. Leaving it stale made create()
-    // hand the app the old placeholder id, whose next lookup missed and
-    // spawned a rival child on the same JSONL (the 409).
-    session.id = piId;
-    this.sessions.set(piId, session);
-    // The bridge-id placeholder file (named by the old key) stays empty on
-    // disk and surfaces as a phantom dead session - remove it.
-    try {
-      const placeholder = this.sessionFile(key);
-      if (path.resolve(placeholder) !== path.resolve(session.file) && fs.existsSync(placeholder)) {
-        if (fs.statSync(placeholder).size === 0) fs.unlinkSync(placeholder);
-      }
-    } catch { /* best effort */ }
-    this.invalidateIndex();
-    this.options.log.info({ from: key, to: piId }, 'session re-keyed to canonical pi id');
-    return piId;
-  }
-
-  /**
-   * Free agent slots by stopping the stalest idle managed session (never
-   * busy/streaming/proxied/errored, queue empty, untouched for >60s).
-   * Sessions stay listed on disk - only the child process is released.
-   * Returns true if at least one slot is available afterwards.
-   */
-  private ensureAgentSlot(): boolean {
-    if (this.runningCount < this.options.maxAgents) return true;
-    const now = Date.now();
-    const evictable = [...this.sessions.values()]
-      .filter((x) => x.running
-        && !x.busy
-        && !x.isProxy
-        && x.phase !== 'streaming'
-        && !x.error
-        && x.queue.length === 0
-        && now - x.lastActivityAt > 60_000)
-      .sort((a, b) => a.lastActivityAt - b.lastActivityAt);
-    for (const victim of evictable) {
-      if (this.runningCount < this.options.maxAgents) break;
-      this.options.log.info({ sessionId: victim.id }, 'evicting idle agent to free a slot');
-      victim.stop();
-    }
-    return this.runningCount < this.options.maxAgents;
-  }
-
-  async create(name: string): Promise<Session> {
-    if (!this.ensureAgentSlot()) {
-      // No eviction of attached/mid-turn sessions: hard cap only.
-      throw new BusyError();
-    }
-    const id = this.nextId();
-    const session = new Session(
-      id,
-      name,
-      this.sessionFile(id),
-      this.options.bin,
-      this.options.workdir,
-      this.options.sessionDir,
-      this.options.extraArgs,
-      this.options.log,
-    );
-    this.sessions.set(id, session);
-    this.invalidateIndex();
-    this.wireQueue(session);
-    await session.start();
-    this.throwIfDead(session);
-    // Re-key under pi's canonical session id (JSONL header id from
-    // get_state) - NOT the file basename. buildIndex keys disk metas by the
-    // header id; a basename key made the same file appear under two ids.
-    this.canonicalRekey(session, id);
-    return session;
-  }
-
-  /** Surface a failed pi boot (stderr text) like piface/pi-threads do. */
-  private throwIfDead(session: Session): void {
-    if (session.closed || session.error || !session.running) {
-      throw new SpawnError(
-        session.error ? `pi failed to start: ${session.error}` : 'pi exited before the session was ready',
-      );
-    }
-  }
-
-  /** Resume any session (managed or discovered) by id. */
-  async ensureRunning(id: string): Promise<Session | null> {
-    const existing = this.startLocks.get(id);
-    if (existing) return existing;
-    const pending = this.ensureRunningUnlocked(id);
-    this.startLocks.set(id, pending);
-    try {
-      return await pending;
-    } finally {
-      if (this.startLocks.get(id) === pending) this.startLocks.delete(id);
-    }
-  }
-
-  private async ensureRunningUnlocked(id: string): Promise<Session | null> {
-    // PATCH owner-proxy: a live host TUI holding the session lease is the
-    // single writer — proxy turns to it over IPC instead of ever spawning a
-    // rival child on the same JSONL. Falls through to legacy paths when no
-    // valid lease exists (unowned / stale-unclaimed files).
-    const leasedMeta = this.buildIndex().get(id);
-    if (leasedMeta) {
-      const lease = readLease(leasedMeta.file);
-      if (lease && isLeaseHeld(lease)) {
-        let s = this.sessions.get(id) ?? this.mirrors.get(id) ?? null;
-        if (s && s.isProxy && s.ownerLease && s.ownerLease.epoch === lease.epoch && s.running) return s;
-        if (!s) {
-          s = this.sessionFromMeta(leasedMeta, 'pi');
-        } else {
-          this.mirrors.delete(id);
-          s.readOnly = false;
-        }
-        this.sessions.set(id, s);
-        this.wireQueue(s);
-        await s.attachOwner(lease);
-        return s;
-      }
-    }
-    const live = this.sessions.get(id);
-    if (live) {
-      if (live.readOnly && this.runningCount >= this.options.maxAgents) throw new BusyError();
-      // Read-only mirror -> explicit takeover: convert in place so the SSE
-      // subscribers (app) keep receiving agent events on the same Session.
-      if (live.readOnly) {
-        live.readOnly = false;
-        this.options.log.info({ sessionId: id }, 'takeover: mirror -> real agent');
-      }
-      if (!live.running) await live.start();
-      // Takeover must wire the queue: without onIdle the converted session
-      // never dispatches queued prompts (they sat queued forever).
-      this.wireQueue(live);
-      return live;
-    }
-    const mirror = this.mirrors.get(id);
-    if (mirror) {
-      if (this.runningCount >= this.options.maxAgents) throw new BusyError();
-      // Takeover of a host-owned mirror (kept out of `sessions`): convert it
-      // in place and move it into the managed map — SSE continuity preserved.
-      mirror.readOnly = false;
-      this.mirrors.delete(id);
-      this.sessions.set(id, mirror);
-      this.options.log.info({ sessionId: id }, 'takeover: mirror -> real agent');
-      if (!mirror.running) await mirror.start();
-      // Takeover must wire the queue: without onIdle the converted session
-      // never dispatches queued prompts (they sat queued forever).
-      this.wireQueue(mirror);
-      return mirror;
-    }
-    const meta = this.buildIndex().get(id);
-    if (!meta) return null;
-    // Another managed session already owns this file (id re-keyed after a
-    // create) — reuse it instead of spawning a rival child on the same JSONL.
-    const reqFile = path.resolve(meta.file);
-    for (const existing of this.sessions.values()) {
-      if (path.resolve(existing.file) === reqFile) {
-        if (!existing.running) await existing.start();
-        return existing;
-      }
-    }
-    if (!this.ensureAgentSlot()) {
-      return null; // hard cap only — never evict an attached session
-    }
-    const session = this.sessionFromMeta(meta, 'pi');
-    this.sessions.set(id, session);
-    this.wireQueue(session);
-    try {
-      await session.start();
-      this.throwIfDead(session);
-    } catch (err) {
-      this.sessions.delete(id);
-      throw err;
-    }
-    // The disk meta id and pi's canonical id can differ (renamed/branch
-    // file) - normalize so later lookups by either id hit the same Session.
-    const canonical = this.canonicalRekey(session, id);
-    return this.sessions.get(canonical) ?? session;
-  }
-
-  get(id: string): Session | null {
-    return this.sessions.get(id) ?? null;
-  }
-
-  find(id: string): Session | null {
-    if (this.sessions.has(id)) return this.sessions.get(id)!;
-    const index = this.buildIndex();
-    const meta = index.get(id);
-    if (meta) return this.sessionFromMeta(meta, 'pi');
-    // Fork/compaction fallback: pi can change a session's id (branch file).
-    // The app may still hold the OLD id. Match by id PREFIX against the
-    // index (both the key and the header id inside each file) and serve the
-    // newest match — turns blank 404s into the relocated session.
-    const prefix = id.slice(0, 8);
-    let best: SessionFileMeta | null = null;
-    for (const meta of index.values()) {
-      if (meta.id.startsWith(prefix)) {
-        if (!best || (meta.lastMessageAt ?? 0) > (best.lastMessageAt ?? 0)) best = meta;
-      }
-    }
-    if (best) return this.sessionFromMeta(best, 'pi');
-    return null;
-  }
-
-  private sessionFromMeta(meta: SessionFileMeta, source: 'app' | 'pi'): Session {
-    const session = new Session(
-      meta.id,
-      meta.name,
-      meta.file,
-      this.options.bin,
-      meta.workdir ?? this.options.workdir,
-      this.options.sessionDir,
-      this.options.extraArgs,
-      this.options.log,
-      source,
-    );
-    session.messageCount = meta.messageCount;
-    session.createdAt = meta.createdAt;
-    session.lastActivityAt = meta.lastActivityAt;
-    return session;
-  }
-
-  delete(id: string, purge: boolean): boolean {
-    const session = this.sessions.get(id);
-    const mirror = this.mirrors.get(id);
-    let file = session?.file ?? mirror?.file;
-    if (session) {
-      session.stop();
-      this.sessions.delete(id);
-    }
-    if (mirror) {
-      mirror.stop();
-      this.mirrors.delete(id);
-    }
-    if (!file) file = this.buildIndex().get(id)?.file;
-    if (purge && file) {
-      try { fs.unlinkSync(file); } catch { /* already gone */ }
-      try { fs.unlinkSync(queueFilePath(this.options.sessionDir, file)); } catch { /* already gone */ }
-      try { fs.unlinkSync(`${file}.stats.json`); } catch { /* already gone */ }
-    }
-    this.invalidateIndex();
-    return session !== undefined || mirror !== undefined || file !== undefined;
-  }
-
-  list(): SessionSummary[] {
-    const index = this.buildIndex();
-    const out: SessionSummary[] = [];
-    // Live sessions are keyed by their bridge id at create time but the
-    // index is keyed by pi's session id once the JSONL header lands — match
-    // by canonical file so a freshly created session never appears twice.
-    const liveByFile = new Map<string, Session>();
-    for (const s of this.sessions.values()) liveByFile.set(path.resolve(s.file), s);
-    for (const meta of index.values()) {
-      const live = this.sessions.get(meta.id) ?? liveByFile.get(path.resolve(meta.file));
-      if (live) {
-        const sum = live.toSummary();
-        if (meta.lastMessageAt !== null) sum.lastMessageAt = meta.lastMessageAt;
-        out.push(sum);
-      } else {
-        out.push({
-          id: meta.id,
-          name: meta.name,
-          running: false,
-          busy: false,
-          model: null,
-          messageCount: meta.messageCount,
-          createdAt: meta.createdAt,
-          lastActivityAt: meta.lastActivityAt,
-          lastMessageAt: meta.lastMessageAt,
-          error: null,
-          phase: meta.live ? 'streaming' : 'idle',
-          owner: meta.live ? 'terminal' : 'none',
-          source: 'pi',
-          workdir: meta.workdir,
-          active: meta.active,
-          live: meta.live,
-          livePid: meta.livePid,
-          writing: meta.writing,
-        });
-      }
-    }
-    // Two index metas can resolve to the same live session (bridge-id
-    // placeholder + pi's file): dedupe by id so the list never shows a
-    // session twice.
-    const seen = new Set<string>();
-    const deduped = out.filter((x) => !seen.has(x.id) && seen.add(x.id));
-    return this.allSorted(deduped).slice(0, MAX_LISTED);
-  }
-
-  /** Cursor-paginated session list: newest first, `before` = older than ts. */
-  listPage(limit: number, before?: number): { sessions: SessionSummary[]; hasMore: boolean; total: number } {
-    const index = this.buildIndex();
-    const out: SessionSummary[] = [];
-    const liveByFile = new Map<string, Session>();
-    for (const s of this.sessions.values()) liveByFile.set(path.resolve(s.file), s);
-    const emittedLive = new Set<Session>();
-    const emittedFiles = new Set<string>();
-    for (const meta of index.values()) {
-      const fileKey = path.resolve(meta.file);
-      const live = this.sessions.get(meta.id) ?? liveByFile.get(fileKey);
-      // One session must never occupy two list rows: skip metas resolving
-      // to an already-emitted live session or an already-emitted file.
-      if (live) {
-        if (emittedLive.has(live)) continue;
-        emittedLive.add(live);
-      }
-      if (emittedFiles.has(fileKey)) continue;
-      emittedFiles.add(fileKey);
-      if (live) {
-        const sum = live.toSummary();
-        if (meta.lastMessageAt !== null) sum.lastMessageAt = meta.lastMessageAt;
-        out.push(sum);
-      } else {
-        const owned = meta.live; // held lease or probe match: a live host pi owns it
-        out.push({
-          id: meta.id,
-          name: meta.name,
-          running: owned,
-          busy: false,
-          model: null,
-          messageCount: meta.messageCount,
-          createdAt: meta.createdAt,
-          lastActivityAt: meta.lastActivityAt,
-          lastMessageAt: meta.lastMessageAt,
-          error: null,
-          phase: owned ? 'streaming' : 'idle',
-          owner: owned ? 'terminal' : 'none',
-          source: 'pi',
-          workdir: meta.workdir,
-          active: owned || meta.active,
-          live: meta.live,
-          livePid: meta.livePid,
-          writing: meta.writing,
-        });
-      }
-    }
-    // Dedupe by id: two index metas can resolve to the same live session
-    // (bridge-id placeholder file + pi's own file after compaction/adopt).
-    const seen = new Set<string>();
-    const deduped = out.filter((x) => !seen.has(x.id) && seen.add(x.id));
-    const sorted = this.allSorted(deduped);
-    const filtered = before ? sorted.filter((s) => (s.lastMessageAt ?? s.lastActivityAt) < before) : sorted;
-    const page = filtered.slice(0, limit);
-    return { sessions: page, hasMore: filtered.length > limit, total: sorted.length };
-  }
-
-  private allSorted(list: SessionSummary[]): SessionSummary[] {
-    return list.sort((a, b) => (b.lastMessageAt ?? b.lastActivityAt) - (a.lastMessageAt ?? a.lastActivityAt));
-  }
-
-  /** Summary for one session — live flag from the probe for external ones. */
-  summary(id: string): SessionSummary | null {
-    const live = this.sessions.get(id);
-    if (live) {
-      const out = live.toSummary();
-      // Honor the real last-message time even for managed sessions
-      // (toSummary uses activity time, which moves on open/spawn).
-      const meta = this.buildIndex().get(id);
-      if (meta && meta.lastMessageAt !== null) out.lastMessageAt = meta.lastMessageAt;
-      return out;
-    }
-    const meta = this.buildIndex().get(id);
-    if (!meta) return null;
-    return {
-      id: meta.id,
-      name: meta.name,
-      running: false,
-      busy: false,
-      model: null,
-      messageCount: meta.messageCount,
-      createdAt: meta.createdAt,
-      lastActivityAt: meta.lastActivityAt,
-      lastMessageAt: meta.lastMessageAt,
-      error: null,
-      phase: meta.live ? 'streaming' : 'idle',
-      owner: meta.live ? 'terminal' : 'none',
-      source: 'pi',
-      workdir: meta.workdir,
-      active: meta.active,
-      live: meta.live,
-      livePid: meta.livePid,
-      writing: meta.writing,
-    };
-  }
-
-  get runningCount(): number {
-    let n = 0;
-    for (const s of this.sessions.values()) if (s.running) n++;
-    return n;
-  }
-
-  stopAll(): void {
-    for (const s of this.sessions.values()) s.stop();
-    for (const m of this.mirrors.values()) m.stop();
-    this.mirrors.clear();
-  }
-
-  /**
-   * Server-owned prompt queue. Queued messages are held here (never only
-   * optimistic on the client), dispatched as a direct prompt the moment the
-   * current turn ends, and surfaced as `pending` in /messages — so they can
-   * never vanish on reload and never double-send.
+   * Enqueue a prompt (idempotent by clientMessageId). Lone UTF-16 surrogates
+   * are stripped (Node's encoder crashed on them); valid pairs — emoji —
+   * are preserved.
    */
   enqueuePrompt(session: Session, rawMessage: string, clientMessageId?: string): QueueItem {
-    // Strip lone UTF-16 surrogates: iOS paste/emoji can produce them, and
-    // Node crashes hard (StringBytes::Encode assertion) when such strings
-    // hit Buffer/write paths - taking the whole service down.
-    const message = rawMessage.replace(/[\uD800-\uDFFF]/g, (ch) => {
-      const code = ch.codePointAt(0) ?? 0;
-      return code >= 0xd800 && code <= 0xdbff ? ch : '';
-    });
+    const message = stripLoneSurrogates(rawMessage);
     if (clientMessageId) {
       const existing = session.queue.find((item) => item.clientMessageId === clientMessageId);
       if (existing) return existing;
     }
-    const activeCount = session.queue.filter((i) => i.status === 'queued' || i.status === 'running').length;
-    if (activeCount >= 50) throw new Error('Prompt queue is full');
+    if (session.queue.filter(isActive).length >= QUEUE_MAX_ACTIVE) throw new Error('Prompt queue is full');
     const item: QueueItem = {
-      id: crypto.randomUUID().replace(/-/g, '').slice(0, 16),
+      id: newQueueId(),
       ...(clientMessageId ? { clientMessageId } : {}),
       message,
       status: 'queued',
@@ -997,145 +898,184 @@ export class SessionManager {
       startedAt: null,
       completedAt: null,
       error: null,
+      attempts: 0,
     };
     session.queue.push(item);
-    if (session.queue.filter((i) => i.status === 'queued' || i.status === 'running').length > 50) {
-      // Bound the durable file: drop finished items older than a day.
-      const cutoff = Date.now() - 86_400_000;
-      session.queue = session.queue.filter(
-        (i) => i.status === 'queued' || i.status === 'running' || (i.completedAt ?? 0) > cutoff,
-      );
-    }
     this.persistQueue(session);
-    session.broadcast('queue_update', { items: session.queue });
+    this.broadcastQueue(session);
     return item;
   }
 
-  /** Trigger queue delivery after an idempotent submission. */
+  pendingItems(session: Session): PendingItemView[] {
+    return pendingView(session.queue);
+  }
+
+  private broadcastQueue(session: Session): void {
+    session.broadcast('queue_update', { items: pendingView(session.queue) });
+  }
+
+  /** Trigger queue delivery (after an enqueue). */
   dispatchQueuedNow(session: Session): void {
     this.dispatchQueued(session);
   }
 
-  /** Dispatch the next queued prompt when the agent is ready. */
-  private dispatchQueued(session: Session): void {
-    if (session.busy || session.phase === 'streaming') return;
-    const item = session.queue.find((candidate) => candidate.status === 'queued');
-    if (!item || !session.reservePrompt()) return;
-    // Delivery-time dedupe: if this exact prompt text already exists as a
-    // user message in the session JSONL tail, the item was already delivered
-    // (crash-restart rollback, double-enqueue from offline flush + manual
-    // send). Mark done instead of re-sending — the #1 remaining source of
-    // duplicate user inputs.
-    if (this.sessionTailHasUserText(session, item.message)) {
-      item.status = 'done';
-      item.completedAt = Date.now();
-      this.persistQueue(session);
-      session.broadcast('queue_update', { items: session.queue });
-      this.options.log.info({ sessionId: session.id, itemId: item.id }, 'queued item already delivered, marked done');
-      session.releasePrompt();
+  private scheduleDispatch(session: Session, delayMs: number): void {
+    if (session.queueTimer) clearTimeout(session.queueTimer);
+    session.queueTimer = setTimeout(() => {
+      session.queueTimer = null;
       this.dispatchQueued(session);
+    }, Math.max(50, delayMs));
+    session.queueTimer.unref?.();
+  }
+
+  /** Dispatch the next ready queued prompt when the agent can take it. */
+  private dispatchQueued(session: Session): void {
+    if (session.dispatching || this.shuttingDown) return;
+    if (session.queue.some((i) => i.status === 'running')) return; // one at a time
+    const queued = session.queue.filter((i) => i.status === 'queued');
+    if (!queued.length) return;
+    const now = Date.now();
+    const ready = queued.find((i) => (i.nextAttemptAt ?? 0) <= now);
+    if (!ready) {
+      this.scheduleDispatch(session, Math.min(...queued.map((i) => i.nextAttemptAt ?? now)) - now);
       return;
     }
-    item.status = 'running';
-    item.startedAt = Date.now();
-    this.persistQueue(session);
-    session.broadcast('queue_update', { items: session.queue });
-    this.options.log.info({ sessionId: session.id }, 'dispatching queued prompt');
-    void session.request({ type: 'prompt', message: item.message }).catch((err) => {
-      this.options.log.warn({ sessionId: session.id, err: (err as Error).message }, 'queue dispatch failed, retrying');
-      session.releasePrompt();
-      item.status = 'queued';
-      item.startedAt = null;
-      this.persistQueue(session);
-      session.broadcast('queue_update', { items: session.queue });
-      // "Agent not running" means the idle sweep stopped the process (or a
-      // mirror never spawned one). Retrying blind loops forever — restart
-      // the agent first, then dispatch.
-      if (!session.running) {
-        this.ensureRunning(session.id).then(() => {
-          this.dispatchQueued(session);
-        }).catch((restartErr) => {
-          this.options.log.warn({ sessionId: session.id, err: (restartErr as Error).message }, 'queue restart failed');
-          setTimeout(() => this.dispatchQueued(session), 5000);
-        });
-        return;
-      }
-      setTimeout(() => this.dispatchQueued(session), 2000);
+    if (session.isBusy) return; // onIdle re-triggers
+    if (session.running) {
+      // Transport is up: mark running SYNCHRONOUSLY so the turn response can
+      // report `dispatched: true` (no queued chip for an immediate send).
+      if (!session.reservePrompt()) return;
+      this.markRunning(session, ready);
+      session.dispatching = true;
+      void this.send(session, ready).finally(() => {
+        session.dispatching = false;
+      });
+      return;
+    }
+    session.dispatching = true;
+    void this.startAndDeliver(session, ready).finally(() => {
+      session.dispatching = false;
     });
   }
 
-  /**
-   * Stuck-running watchdog: an item stuck in `running` for over 10 minutes
-   * (dispatch RPC write lost, process wedged without onExit) blocks the
-   * whole queue. Roll it back to `queued` so dispatch can proceed.
-   */
-  private static readonly STUCK_RUNNING_MS = 10 * 60_000;
-  recoverStuckRunning(session: Session): void {
-    const cutoff = Date.now() - SessionManager.STUCK_RUNNING_MS;
-    let changed = false;
-    for (const item of session.queue) {
-      if (item.status !== 'running') continue;
-      // Owner-proxy turns: the TUI's event stream may not surface agent_end
-      // reliably. When the session is verifiably idle AND newer activity
-      // exists than the dispatch, the turn finished — mark done.
-      // 3-minute threshold: turns routinely run >30s; a too-eager check
-      // killed live turns, rolled them back to queued, and re-dispatched
-      // them (duplicate prompts reaching pi).
-      const idleWithActivity = !session.busy && session.phase !== 'streaming'
-        && session.lastActivityAt > (item.startedAt ?? 0)
-        && Date.now() - (item.startedAt ?? 0) > 180_000;
-      if ((item.startedAt ?? 0) < cutoff || idleWithActivity) {
-        item.status = idleWithActivity ? 'done' : 'queued';
-        if (idleWithActivity) item.completedAt = Date.now();
-        else item.startedAt = null;
-        changed = true;
-        this.options.log.warn({ sessionId: session.id, itemId: item.id, done: idleWithActivity }, 'stuck running item resolved');
+  /** No transport yet: bring one up (proxy or child), then deliver. */
+  private async startAndDeliver(session: Session, item: QueueItem): Promise<void> {
+    let live: Session | null;
+    try {
+      live = await this.ensureRunning(session.id);
+      if (!live) throw new Error('Session not found');
+    } catch (err) {
+      if (err instanceof BusyError) {
+        this.scheduleDispatch(session, 5_000); // capacity is transient — no attempt consumed
+        return;
       }
+      item.attempts = (item.attempts ?? 0) + 1;
+      this.failAttempt(session, item, err as Error);
+      return;
     }
-    if (changed) {
-      // The stuck dispatch held the prompt reservation (agent_end never came
-      // — that's WHY it was stuck). Release it or every future dispatch is
-      // blocked at reservePrompt() forever.
-      session.releasePrompt();
+    if (item.status !== 'queued') return; // cancelled meanwhile
+    if (!live.reservePrompt()) return; // became busy — onIdle retries
+    this.markRunning(live, item);
+    await this.send(live, item);
+  }
+
+  private markRunning(session: Session, item: QueueItem): void {
+    item.status = 'running';
+    item.startedAt = Date.now();
+    item.attempts = (item.attempts ?? 0) + 1;
+    item.error = null;
+    delete item.nextAttemptAt;
+    this.persistQueue(session);
+    this.broadcastQueue(session);
+    session.resetCrashBudget();
+    session.expectEcho(item.message, item.clientMessageId, (ts) => {
+      if (ts !== null) {
+        item.messageTimestamp = ts;
+        this.persistQueue(session);
+      }
+    });
+  }
+
+  private async send(session: Session, item: QueueItem): Promise<void> {
+    this.options.log.info({ sessionId: session.id, itemId: item.id, attempt: item.attempts }, 'dispatching queued prompt');
+    try {
+      await session.request({ type: 'prompt', message: item.message }, 30_000);
+      item.deliveredAt = Date.now();
+      if (session.error?.startsWith('Queued message')) session.setError(null);
+      // The run may already have ended before the acceptance reply arrived
+      // (owner extensions emit events synchronously): settle it now.
+      if (item.status === 'running' && !session.isBusy && session.lastIdleAt >= (item.startedAt ?? 0)) {
+        item.status = 'done';
+        item.completedAt = Date.now();
+        this.persistQueue(session);
+        this.broadcastQueue(session);
+        setImmediate(() => this.dispatchQueued(session));
+        return;
+      }
       this.persistQueue(session);
-      session.broadcast('queue_update', { items: session.queue });
-      this.dispatchQueued(session);
+    } catch (err) {
+      session.releasePrompt();
+      session.cancelEcho(item.message);
+      this.failAttempt(session, item, err as Error);
     }
   }
 
-  /** Wire a session's queue to its turn_end events + restore persisted state. */
-  private wireQueue(session: Session): void {
-    if (session.queueWired) return;
-    session.queueWired = true;
-    this.restoreQueue(session);
-    session.onIdle = () => {
-      this.completeRunning(session);
-      this.recoverStuckRunning(session);
-      this.dispatchQueued(session);
-    };
-    session.onExit = () => {
-      // A running queued item was not delivered to a completed turn. Return
-      // it to queued state so restart/crash cannot lose the prompt.
-      let changed = false;
-      for (const item of session.queue) {
-        if (item.status === 'running') {
-          item.status = 'queued';
-          item.startedAt = null;
+  /** Backoff (1 s … 30 s); after QUEUE_MAX_ATTEMPTS the item fails visibly. */
+  private failAttempt(session: Session, item: QueueItem, err: Error): void {
+    const attempts = item.attempts ?? 1;
+    const msg = err.message || String(err);
+    if (attempts >= QUEUE_MAX_ATTEMPTS) {
+      item.status = 'failed';
+      item.error = msg;
+      item.completedAt = Date.now();
+      this.options.log.error({ sessionId: session.id, itemId: item.id, err: msg }, 'queued prompt failed permanently');
+      session.setError(`Queued message failed after ${attempts} attempts: ${msg}`);
+    } else {
+      item.status = 'queued';
+      item.startedAt = null;
+      item.error = msg;
+      const delay = backoffMs(attempts);
+      item.nextAttemptAt = Date.now() + delay;
+      this.options.log.warn({ sessionId: session.id, itemId: item.id, attempts, delay, err: msg }, 'queue dispatch failed, backing off');
+      this.scheduleDispatch(session, delay);
+    }
+    this.persistQueue(session);
+    this.broadcastQueue(session);
+  }
+
+  private static readonly STUCK_RUNNING_MS = 10 * 60_000;
+
+  /** Watchdog for `running` items whose completion signal never arrived. */
+  recoverStuckRunning(session: Session): void {
+    const now = Date.now();
+    let changed = false;
+    for (const item of session.queue) {
+      if (item.status !== 'running') continue;
+      const age = now - (item.startedAt ?? now);
+      if (item.deliveredAt) {
+        if (!session.isBusy && (now - item.deliveredAt > 180_000 || age > SessionManager.STUCK_RUNNING_MS)) {
+          item.status = 'done';
+          item.completedAt = now;
           changed = true;
         }
+      } else if (age > 120_000 && !session.dispatching) {
+        item.status = 'queued'; // the prompt RPC died without settling
+        item.startedAt = null;
+        changed = true;
       }
-      if (changed) {
-        this.persistQueue(session);
-        session.broadcast('queue_update', { items: session.queue });
-      }
-    };
-    if (session.queue.some((item) => item.status === 'queued')) this.dispatchQueued(session);
+    }
+    if (changed) {
+      if (!session.isBusy) session.releasePrompt();
+      this.persistQueue(session);
+      this.broadcastQueue(session);
+      this.dispatchQueued(session);
+    }
   }
 
   private completeRunning(session: Session): void {
     let changed = false;
     for (const item of session.queue) {
-      if (item.status === 'running') {
+      if (item.status === 'running' && item.deliveredAt) {
         item.status = 'done';
         item.completedAt = Date.now();
         changed = true;
@@ -1143,502 +1083,252 @@ export class SessionManager {
     }
     if (changed) {
       this.persistQueue(session);
-      session.broadcast('queue_update', { items: session.queue });
+      this.broadcastQueue(session);
     }
+  }
+
+  /** Wire queue hooks and restore the persisted queue (exactly once per Session). */
+  private wireQueue(session: Session): void {
+    if (session.queueWired) return;
+    session.queueWired = true;
+    this.restoreQueue(session);
+    session.onIdle = () => {
+      this.completeRunning(session);
+      this.dispatchQueued(session);
+    };
+    session.onExit = () => {
+      this.lastBridgeExit.set(path.resolve(session.file), Date.now());
+      let changed = false;
+      for (const item of session.queue) {
+        if (item.status !== 'running') continue;
+        if (item.deliveredAt) {
+          item.status = 'done'; // accepted by the agent — never re-send
+          item.completedAt = Date.now();
+        } else {
+          item.status = 'queued';
+          item.startedAt = null;
+        }
+        changed = true;
+      }
+      if (changed) {
+        this.persistQueue(session);
+        this.broadcastQueue(session);
+      }
+      if (session.queue.some((i) => i.status === 'queued')) this.scheduleDispatch(session, 2_000);
+    };
+    if (session.queue.some((i) => i.status === 'queued')) this.scheduleDispatch(session, 500);
   }
 
   private persistQueue(session: Session): void {
+    session.queue = pruneQueue(session.queue);
+    const file = queueFilePath(this.options.sessionDir, session.file);
     try {
-      const file = queueFilePath(this.options.sessionDir, session.file);
-      this.writeQueueFile(file, session.queue);
+      if (session.queue.length === 0) {
+        try { fs.unlinkSync(file); } catch { /* none */ }
+        return;
+      }
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      writeAtomic(file, JSON.stringify(session.queue));
     } catch (err) {
       this.options.log.warn({ err: (err as Error).message }, 'queue persist failed');
     }
-  }
-
-  private writeQueueFile(file: string, items: QueueItem[]): void {
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    const temp = `${file}.${process.pid}.tmp`;
-    fs.writeFileSync(temp, JSON.stringify(items));
-    fs.renameSync(temp, file);
   }
 
   private restoreQueue(session: Session): void {
-    try {
-      const file = queueFilePath(this.options.sessionDir, session.file);
-      if (!fs.existsSync(file)) return;
-      const parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as QueueItem[];
-      if (Array.isArray(parsed)) {
-        // A `running` item rolled back after a crash may have ALREADY been
-        // delivered (the turn completed before the restart) — re-dispatching
-        // it duplicates the user's input in the session. Drop items whose
-        // text already exists in the session JSONL tail.
-        const delivered = new Set<string>();
-        try {
-          const stat = fs.statSync(session.file);
-          const tailStart = Math.max(0, stat.size - 512 * 1024);
-          const fd = fs.openSync(session.file, 'r');
-          const buf = Buffer.alloc(stat.size - tailStart);
-          const n = fs.readSync(fd, buf, 0, buf.length, tailStart);
-          fs.closeSync(fd);
-          for (const line of decodeUtf8(buf.subarray(0, n)).split('\n')) {
-            if (!line.trim()) continue;
-            try {
-              const entry = JSON.parse(line) as { type?: string; message?: { role?: string; content?: unknown } };
-              if (entry.type !== 'message' || entry.message?.role !== 'user') continue;
-              const c = entry.message.content;
-              const text = typeof c === 'string' ? c
-                : Array.isArray(c)
-                  ? (c as { type?: string; text?: string }[]).filter((b) => b.type === 'text').map((b) => b.text ?? '').join('')
-                  : '';
-              if (text) delivered.add(text.trim());
-            } catch { /* skip */ }
-          }
-        } catch { /* file unreadable */ }
-        session.queue = parsed
-          .filter((i) => i && typeof i.id === 'string' && typeof i.message === 'string')
-          .filter((i) => !(i.status === 'running' && delivered.has(i.message.trim())))
-          .map((i) => i.status === 'running' ? { ...i, status: 'queued', startedAt: null } : i);
-      }
-    } catch { /* corrupt -> ignore */ }
-  }
-
-  /** True when the session JSONL tail already contains this user text. */
-  private sessionTailHasUserText(session: Session, message: string): boolean {
-    try {
-      const stat = fs.statSync(session.file);
-      const tailStart = Math.max(0, stat.size - 512 * 1024);
-      const fd = fs.openSync(session.file, 'r');
-      const buf = Buffer.alloc(stat.size - tailStart);
-      const n = fs.readSync(fd, buf, 0, buf.length, tailStart);
-      fs.closeSync(fd);
-      const want = message.trim();
-      for (const line of decodeUtf8(buf.subarray(0, n)).split('\n')) {
-        if (!line.trim()) continue;
-        try {
-          const entry = JSON.parse(line) as { type?: string; message?: { role?: string; content?: unknown } };
-          if (entry.type !== 'message' || entry.message?.role !== 'user') continue;
-          const c = entry.message.content;
-          const text = typeof c === 'string' ? c
-            : Array.isArray(c)
-              ? (c as { type?: string; text?: string }[]).filter((b) => b.type === 'text').map((b) => b.text ?? '').join('')
-              : '';
-          if (text.trim() === want) return true;
-        } catch { /* skip */ }
-      }
-    } catch { /* file unreadable */ }
-    return false;
-  }
-
-  /** Queue contents for a session (API). File-first: works even before the
-   *  session is loaded into memory (e.g. right after a server restart). */
-  getQueueItems(id: string): QueueItem[] | null {
-    const session = this.find(id);
-    if (!session) return null;
     const file = queueFilePath(this.options.sessionDir, session.file);
-    if (!fs.existsSync(file)) return session.queue;
+    let raw: unknown;
     try {
-      return JSON.parse(fs.readFileSync(file, 'utf8')) as QueueItem[];
+      raw = JSON.parse(fs.readFileSync(file, 'utf8'));
     } catch {
-      return [];
+      return; // absent or corrupt
     }
+    const before = Array.isArray(raw) ? raw.length : 0;
+    session.queue = restoreItems(raw);
+    if (session.queue.length !== before
+        || (raw as QueueItem[]).some((i) => i?.status === 'running')) {
+      this.persistQueue(session);
+    }
+  }
+
+  /** CONTRACT §2: pending (queued/running) items only. Null = unknown session. */
+  async getQueueItems(id: string): Promise<PendingItemView[] | null> {
+    const session = await this.find(id);
+    return session ? pendingView(session.queue) : null;
   }
 
   /** Cancel a queued item. Returns false if unknown/not queued. */
-  cancelQueueItem(id: string, itemId: string): boolean {
-    const items = this.getQueueItems(id);
-    if (!items) return false;
-    const idx = items.findIndex((i) => i.id === itemId && i.status === 'queued');
+  async cancelQueueItem(id: string, itemId: string): Promise<boolean> {
+    const session = await this.find(id);
+    if (!session) return false;
+    const idx = session.queue.findIndex((i) => i.id === itemId && i.status === 'queued');
     if (idx < 0) return false;
-    items.splice(idx, 1);
-    // Persist to disk, then sync the in-memory session queue if loaded.
-    try {
-      const session = this.find(id);
-      const file = session ? queueFilePath(this.options.sessionDir, session.file) : null;
-      if (file) {
-        this.writeQueueFile(file, items);
-      }
-    } catch (err) {
-      this.options.log.warn({ err: (err as Error).message }, 'queue persist failed');
-    }
-    const session = this.sessions.get(id);
-    if (session) {
-      const i2 = session.queue.findIndex((i) => i.id === itemId);
-      if (i2 >= 0) session.queue.splice(i2, 1);
-      session.broadcast('queue_update', { items: session.queue });
-    }
+    session.queue.splice(idx, 1);
+    this.persistQueue(session);
+    this.broadcastQueue(session);
     return true;
   }
 
   /* ---------------- history ---------------- */
 
   /**
-   * Fork a session at a user message. pi's `fork` branches the *current*
-   * session in place, so we clone first (new session + file), fork the clone,
-   * then restore the source session on its original file. Source stays intact.
+   * Full history parsed from the session JSONL via the incremental cache
+   * (only appended bytes are parsed after the first read). No temp pi
+   * processes: an empty/unwritten file of a running child falls back to
+   * get_messages on THAT child, otherwise it is simply empty.
    */
-  async fork(id: string, entryId: string, name?: string): Promise<{ session: SessionSummary; text: string | null } | null> {
-    const src = await this.ensureRunning(id);
-    if (!src) return null;
-    if (src.busy || src.phase === 'streaming') {
-      throw new SpawnError('Agent is busy — fork when the current turn finishes');
-    }
-    const srcFile = src.file;
-    const srcName = src.name;
-    let clone: Session | null = null;
-
+  async history(session: Session): Promise<ChatMessage[]> {
+    let messages: ChatMessage[] = [];
     try {
-    // 1) pi `clone`: duplicate the current branch into a new session/file.
-    await src.request({ type: 'clone' });
-    const st = await src.request<AgentState>({ type: 'get_state' });
-    const cloneFile = st.sessionFile && st.sessionFile !== srcFile
-      ? st.sessionFile
-      : srcFile;
-
-    // 2) stop the process (it now serves the clone) and detach the source.
-    src.stop();
-    this.sessions.delete(src.id);
-
-    // 3) boot the clone on its own file.
-    const cloneId = this.nextId();
-    clone = new Session(
-      cloneId,
-      name || `${srcName} (fork)`,
-      cloneFile,
-      this.options.bin,
-      src.workdir,
-      this.options.sessionDir,
-      this.options.extraArgs,
-      this.options.log.child({ fork: true }),
-    );
-    this.sessions.set(cloneId, clone);
-    this.wireQueue(clone);
-    await clone.start();
-    this.throwIfDead(clone);
-
-    // 4) truncate the clone at the fork point.
-    const data = await clone.request<{ text?: string; cancelled?: boolean }>({ type: 'fork', entryId });
-    if (data.cancelled) throw new SpawnError('Fork cancelled by an extension');
-
-    // 5) restore the source on its original file.
-    const restored = new Session(
-      src.id,
-      srcName,
-      srcFile,
-      this.options.bin,
-      src.workdir,
-      this.options.sessionDir,
-      this.options.extraArgs,
-      this.options.log,
-    );
-    this.sessions.set(src.id, restored);
-    this.wireQueue(restored);
-    await restored.start();
-    this.throwIfDead(restored);
-
-    this.invalidateIndex();
-    return { session: clone.toSummary(), text: data.text ?? null };
-    } catch (err) {
-      if (clone) {
-        clone.stop();
-        this.sessions.delete(clone.id);
-      }
-      // Restore source ownership if clone/fork failed after detachment.
-      if (!this.sessions.has(src.id)) {
-        const restored = new Session(
-          src.id,
-          srcName,
-          srcFile,
-          this.options.bin,
-          src.workdir,
-          this.options.sessionDir,
-          this.options.extraArgs,
-          this.options.log,
-        );
-        this.sessions.set(src.id, restored);
-        this.wireQueue(restored);
-        try {
-          await restored.start();
-          this.throwIfDead(restored);
-        } catch (restoreErr) {
-          this.options.log.error({ sessionId: src.id, err: (restoreErr as Error).message }, 'source restore failed after fork error');
-        }
-      }
-      this.invalidateIndex();
-      throw err;
+      messages = await this.files.messages(session.file);
+    } catch { /* not written yet */ }
+    if (messages.length === 0 && session.hasChild) {
+      try {
+        const data = await session.request<{ messages?: AgentMessage[] }>({ type: 'get_messages' }, 15_000);
+        messages = (data.messages ?? []).map(mapAgentMessage).filter((m): m is ChatMessage => m !== null);
+      } catch { /* agent busy/booting — empty */ }
     }
+    return this.decorateEchoes(session, messages);
   }
 
+  /** CONTRACT §3: attach clientMessageId to user rows mapped to delivered queue items. */
+  private decorateEchoes(session: Session, messages: ChatMessage[]): ChatMessage[] {
+    const byTs = new Map<number, string>();
+    for (const item of session.queue) {
+      if (item.clientMessageId && typeof item.messageTimestamp === 'number') byTs.set(item.messageTimestamp, item.clientMessageId);
+    }
+    if (!byTs.size) return messages;
+    return messages.map((m) => {
+      const cmid = m.role === 'user' && m.timestamp !== null ? byTs.get(m.timestamp) : undefined;
+      return cmid ? { ...m, clientMessageId: cmid } : m;
+    });
+  }
 
   /**
-   * Full history for a session. Fast path: parse the session JSONL directly
-   * (ms-scale — pi's get_messages takes ~8s on large sessions because it
-   * re-serializes every message). Falls back to RPC/temp-pi if the file is
-   * unreadable.
+   * Working flag for /messages: lease/transport state when attached; for
+   * unowned files a display heuristic (fresh file whose last row is a user
+   * prompt).
    */
-  /**
-   * Server-derived working flag: our own process is mid-turn, or the file's
-   * last entry is a user prompt awaiting a reply and the file changed within
-   * the working window. Works for mirrors (TUI-owned sessions) where RPC
-   * events never reach clients.
-   */
-  async working(s: Session): Promise<boolean> {
-    if (s.busy || s.phase === 'streaming') return true;
+  async working(s: Session, messages?: ChatMessage[]): Promise<boolean> {
+    if (s.running) return s.isBusy;
     try {
       const stat = await fs.promises.stat(s.file);
       if (Date.now() - stat.mtimeMs > 120_000) return false;
-      const messages = await this.history(s);
-      const last = messages[messages.length - 1];
+      const rows = messages ?? await this.history(s);
+      const last = rows[rows.length - 1];
       return !!last && last.role === 'user';
     } catch {
       return false;
     }
   }
 
-  /** Per-session SSE sink counts (zombie-connection forensics). */
-  sinkCounts(): Record<string, number> {
-    const out: Record<string, number> = {};
-    for (const [id, s] of this.sessions) out[id] = s.sinkCount();
-    for (const [id, s] of this.mirrors) out[id] = s.sinkCount();
-    return out;
+  /** Entry id of the last user message (default fork point). */
+  async lastUserEntryId(id: string): Promise<string | null> {
+    const s = await this.find(id);
+    if (!s) return null;
+    const rows = await this.history(s);
+    for (let i = rows.length - 1; i >= 0; i--) {
+      const m = rows[i]!;
+      if (m.role === 'user' && !m.system && m.id) return m.id;
+    }
+    return null;
   }
 
-  async history(session: Session): Promise<ChatMessage[]> {
-    try {
-      const messages = this.historyFromFile(session.file);
-      if (messages.length > 0) return messages;
-    } catch {
-      /* fall through to RPC */
-    }
-    if (session.running) {
-      const data = await session.request<{ messages?: AgentMessage[] }>({ type: 'get_messages' });
-      return (data.messages ?? []).map(mapAgentMessage).filter((m): m is ChatMessage => m !== null);
-    }
-    const tmp = new Session(
-      `${session.id}h`,
-      session.name,
-      session.file,
+  /* ---------------- fork ---------------- */
+
+  /**
+   * Fork at a user entry. pi 0.85 RPC `fork` switches the PROCESS to a brand
+   * new session file. So: spawn a dedicated child on the source file (it only
+   * reads it and never takes the source lease), fork there, read get_state
+   * for the new sessionFile/sessionId, and keep that child as the NEW session
+   * keyed by its real pi id. The source session (and its owner/child/viewers)
+   * is never touched.
+   */
+  fork(id: string, entryId: string, name?: string, clientRequestId?: string): Promise<{ session: SessionSummary; text: string | null } | null> {
+    return this.idempotent(clientRequestId ? `fork:${clientRequestId}` : undefined, () => this.forkUnlocked(id, entryId, name));
+  }
+
+  private async forkUnlocked(id: string, entryId: string, name?: string): Promise<{ session: SessionSummary; text: string | null } | null> {
+    const src = await this.find(id);
+    if (!src) return null;
+    if (src.isBusy) throw new SpawnError('Agent is busy — fork when the current turn finishes');
+    if (!this.ensureAgentSlot()) throw new BusyError(this.options.maxAgents);
+    const child = new Session(
+      `${this.nextId()}`,
+      name || `${src.name} (fork)`,
+      src.file,
       this.options.bin,
-      session.workdir,
+      src.workdir,
       this.options.sessionDir,
       this.options.extraArgs,
-      this.options.log.child({ temp: true }),
+      this.options.log.child({ fork: true }),
+      'app',
     );
     try {
-      await tmp.start();
-      await new Promise((r) => setTimeout(r, 800));
-      if (!tmp.running) return [];
-      const data = await tmp.request<{ messages?: AgentMessage[] }>({ type: 'get_messages' });
-      return (data.messages ?? []).map(mapAgentMessage).filter((m): m is ChatMessage => m !== null);
-    } finally {
-      tmp.stop();
-    }
-  }
-
-  /** Public wrapper for route-level id lookups (fork default entry). */
-  historyFromFileSafe(id: string): ChatMessage[] {
-    const meta = this.buildIndex().get(id);
-    if (!meta) return [];
-    try {
-      return this.historyFromFile(meta.file);
-    } catch {
-      return [];
-    }
-  }
-
-  private historyCache = new Map<string, { mtimeMs: number; size: number; messages: ChatMessage[] }>();
-  private historyCacheBytes = 0;
-  private static readonly HISTORY_CACHE_MAX_BYTES = 100 * 1024 * 1024;
-
-  /** Parse the session JSONL tail directly (same entry shape pi serves).
-   *  Cached by (mtime,size) so polling/pagination don't re-parse unchanged
-   *  files (a 2MB file parse per request adds up). */
-  private historyFromFile(file: string): ChatMessage[] {
-    const stat = fs.statSync(file);
-    const cached = this.historyCache.get(file);
-    if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
-      // Touch entry for true LRU eviction.
-      this.historyCache.delete(file);
-      this.historyCache.set(file, cached);
-      return cached.messages;
-    }
-    const messages = this.parseHistoryFile(file);
-    // Replace old accounting before overwriting a changed file. The old code
-    // leaked the previous byte estimate on every file update.
-    if (cached) this.historyCacheBytes -= this.estimateMessagesBytes(cached.messages);
-    const bytes = this.estimateMessagesBytes(messages);
-    this.historyCacheBytes += bytes;
-    this.historyCache.set(file, { mtimeMs: stat.mtimeMs, size: stat.size, messages });
-    while (this.historyCache.size > 0 && this.historyCacheBytes > SessionManager.HISTORY_CACHE_MAX_BYTES) {
-      const oldest = this.historyCache.keys().next().value as string;
-      const old = this.historyCache.get(oldest);
-      if (!old) break;
-      this.historyCacheBytes -= this.estimateMessagesBytes(old.messages);
-      this.historyCache.delete(oldest);
-    }
-    return messages;
-  }
-
-  private estimateMessagesBytes(messages: ChatMessage[]): number {
-    return messages.reduce((total, message) => {
-      const calls = message.toolCalls.reduce((n, call) => n + call.name.length + JSON.stringify(call.arguments).length + 64, 0);
-      return total + (message.text?.length ?? 0) + (message.thinking?.length ?? 0) + calls + 128;
-    }, 0);
-  }
-
-  /** Strip lone UTF-16 surrogates from decoded text (Node crashes on
-   *  encode otherwise). Keeps valid pairs. */
-  private static sanitizeText(s: string): string {
-    let out = '';
-    let i = 0;
-    while (i < s.length) {
-      const code = s.charCodeAt(i);
-      if (code >= 0xd800 && code <= 0xdbff && i + 1 < s.length) {
-        const next = s.charCodeAt(i + 1);
-        if (next >= 0xdc00 && next <= 0xdfff) {
-          out += s[i]! + s[i + 1]!;
-          i += 2;
-          continue;
-        }
-        i += 1; // lone high surrogate: drop
-        continue;
+      await child.start({ noLease: true, passName: false });
+      this.throwIfDead(child);
+      const data = await child.request<{ text?: string; cancelled?: boolean }>({ type: 'fork', entryId }, 30_000);
+      if (data.cancelled) throw new SpawnError('Fork cancelled by an extension');
+      const st = await child.request<AgentState>({ type: 'get_state' }, 15_000);
+      if (!st.sessionFile || !st.sessionId || path.resolve(st.sessionFile) === path.resolve(src.file)) {
+        throw new SpawnError('pi did not switch to a new session file after fork');
       }
-      if (code >= 0xdc00 && code <= 0xdfff) {
-        i += 1; // lone low surrogate: drop
-        continue;
-      }
-      out += s[i];
-      i += 1;
+      const { sessionFile: _ignored, ...rest } = st;
+      child.applyState(rest);
+      child.adoptIdentity(st.sessionId, st.sessionFile, name || `${src.name} (fork)`);
+      if (name) await child.request({ type: 'set_session_name', name }).catch(() => undefined);
+      this.register(child);
+      this.invalidateIndex();
+      return { session: await this.summaryOf(child), text: data.text ?? null };
+    } catch (err) {
+      child.stop('fork failed');
+      throw err;
     }
-    return out;
-  }
-
-  private countMessageEntries(file: string): number {
-    // Byte-level scan: count '"type":"message"' occurrences. No string
-    // decoding - malformed UTF-8 / lone surrogates in session files
-    // crashed Node (StringBytes assertion) via toString(). Decode-free
-    // counting is immune; slight overcount (pattern inside message
-    // content) is acceptable for a display counter.
-    const fd = fs.openSync(file, 'r');
-    const pattern = Buffer.from('"type":"message"', 'utf8');
-    const chunk = Buffer.alloc(1024 * 1024);
-    let carry = Buffer.alloc(0);
-    let count = 0;
-    try {
-      let n = 0;
-      do {
-        n = fs.readSync(fd, chunk, 0, chunk.length, null);
-        if (!n) break;
-        const buf = Buffer.concat([carry, chunk.subarray(0, n)]);
-        let idx = 0;
-        let lastEnd = 0;
-        while (true) {
-          const hit = buf.indexOf(pattern, idx);
-          if (hit < 0) break;
-          count++;
-          idx = hit + pattern.length;
-          lastEnd = idx;
-        }
-        carry = buf.subarray(Math.max(lastEnd, buf.length - pattern.length));
-        if (carry.length > 4 * 1024 * 1024) carry = Buffer.alloc(0);
-      } while (n > 0);
-    } finally {
-      fs.closeSync(fd);
-    }
-    return count;
-  }
-
-  private parseHistoryFile(file: string): ChatMessage[] {
-    const fd = fs.openSync(file, 'r');
-    const chunk = Buffer.alloc(1024 * 1024);
-    const out: ChatMessage[] = [];
-    let carry = '';
-    // Streaming decoder: invalid UTF-8 in session files crashed Node
-    // (StringBytes assertion) via toString(). TextDecoder replaces invalid
-    // sequences; stream:true carries split multibyte chars across chunks.
-    const decoder = new TextDecoder('utf8');
-    const consume = (line: string) => {
-      if (!line.trim()) return;
-      let entry: { type?: string; id?: string; message?: AgentMessage };
-      try {
-        entry = JSON.parse(line) as { type?: string; id?: string; message?: AgentMessage };
-      } catch {
-        return;
-      }
-      if (entry.type !== 'message' || !entry.message) return;
-      const msgWithId = { ...entry.message } as AgentMessage;
-      if (entry.id) msgWithId.id = entry.id;
-      const mapped = mapAgentMessage(msgWithId);
-      if (mapped) out.push(mapped);
-    };
-    try {
-      let n = 0;
-      do {
-        n = fs.readSync(fd, chunk, 0, chunk.length, null);
-        if (!n) break;
-        const text = SessionManager.sanitizeText(carry + decoder.decode(chunk.subarray(0, n), { stream: true }));
-        const lines = text.split('\n');
-        carry = lines.pop() ?? '';
-        // Same OOM guard as countMessageEntries: drop monster single lines.
-        if (carry.length > 8 * 1024 * 1024) carry = '';
-        for (const line of lines) consume(line);
-      } while (n > 0);
-      consume(carry + decoder.decode());
-    } finally {
-      fs.closeSync(fd);
-    }
-    return out;
   }
 
   /* ---------------- maintenance ---------------- */
 
-  private sweepIdle(): void {
+  private sweep(): void {
     const now = Date.now();
-    for (const s of this.sessions.values()) {
-      const hasPending = s.queue.some((i) => i.status === 'queued' || i.status === 'running');
-      if (s.running && !s.busy && s.phase !== 'streaming' && !hasPending
+    for (const [key, s] of [...this.sessions]) {
+      const hasActive = s.queue.some(isActive);
+      // H1: never idle-stop proxies or sessions somebody is watching.
+      if (s.hasChild && !s.isBusy && !hasActive && s.sinkCount() === 0
           && now - s.lastActivityAt > this.options.idleKillMs) {
         this.options.log.info({ sessionId: s.id }, 'idle timeout, stopping agent');
-        s.stop();
+        s.stop('idle');
       }
-      // Queue watchdog: recover items stuck in `running` (dispatch write
-      // lost, wedged process without onExit) so the queue keeps moving.
       if (s.queue.some((i) => i.status === 'running')) this.recoverStuckRunning(s);
-      // Queued items with no live agent (e.g. dispatch failed while the
-      // agent was stopped): restart the agent and dispatch — otherwise the
-      // item waits forever because onIdle never fires for a dead process.
-      if (!s.running && s.queue.some((i) => i.status === 'queued')) {
-        this.ensureRunning(s.id).then(() => this.dispatchQueued(s)).catch(() => { /* next sweep retries */ });
+      if (s.queue.some((i) => i.status === 'queued') && !s.dispatching && !s.queueTimer) this.dispatchQueued(s);
+      // Unload dormant registry entries (memory), keeping anything with state.
+      if (!s.running && !hasActive && s.sinkCount() === 0 && !s.restarting && !s.queueTimer
+          && !s.dispatching && now - s.lastActivityAt > UNLOAD_AFTER_MS) {
+        this.sessions.delete(key);
       }
     }
-    // Post-restart sweep: sessions not in memory still have durable queue
-    // files on disk. Discover them and wake their agents so queued prompts
-    // survive server restarts too.
+    for (const [k, v] of this.idempotency) if (now - v.at > CREATE_IDEMPOTENCY_MS) this.idempotency.delete(k);
+    for (const [k, t] of this.lastBridgeExit) if (now - t > 10 * 60_000) this.lastBridgeExit.delete(k);
+    this.wakeDiskQueues();
+  }
+
+  /** Post-restart: sessions not loaded yet may still have durable queued prompts. */
+  private wakeDiskQueues(): void {
+    const queueDir = path.join(this.options.sessionDir, '.queue');
+    let names: string[];
     try {
-      const queueDir = path.join(this.options.sessionDir, '.queue');
-      if (fs.existsSync(queueDir)) {
-        for (const f of fs.readdirSync(queueDir)) {
-          if (!f.endsWith('.json')) continue;
-          try {
-            const items = JSON.parse(fs.readFileSync(path.join(queueDir, f), 'utf8')) as QueueItem[];
-            if (!Array.isArray(items)) continue;
-            const hasPending = items.some((i) => i.status === 'queued' || i.status === 'running');
-            if (!hasPending) continue;
-            // Map the queue file back to its session id via the index.
-            const base = f.replace(/\.json$/, '');
-            for (const [sid, meta] of this.buildIndex()) {
-              const key = crypto.createHash('sha256').update(path.resolve(meta.file)).digest('hex').slice(0, 16);
-              if (base === `${path.basename(meta.file).replace(/\.jsonl$/, '')}-${key}`) {
-                if (!this.sessions.has(sid)) {
-                  this.ensureRunning(sid).catch(() => { /* next sweep retries */ });
-                }
-                break;
-              }
-            }
-          } catch { /* corrupt queue file */ }
-        }
-      }
-    } catch { /* queue dir unreadable */ }
+      names = fs.readdirSync(queueDir).filter((f) => f.endsWith('.json'));
+    } catch {
+      return;
+    }
+    if (!names.length) return;
+    const wanted = new Set(names.map((f) => path.join(queueDir, f)));
+    for (const meta of this.peekIndex().values()) {
+      const qf = queueFilePath(this.options.sessionDir, meta.file);
+      if (!wanted.has(qf) || this.sessions.has(meta.id)) continue;
+      try {
+        const items = restoreItems(JSON.parse(fs.readFileSync(qf, 'utf8')));
+        if (items.some((i) => i.status === 'queued')) this.sessionFor(meta); // wireQueue schedules dispatch
+      } catch { /* corrupt queue file */ }
+    }
   }
 }
 

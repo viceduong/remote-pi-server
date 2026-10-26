@@ -30,6 +30,7 @@ describe('turn idempotency', () => {
       idleKillMs: 60_000,
       extraArgs: [],
       log: pino({ enabled: false }),
+      noTimers: true,
     });
     const sessionFile = path.join(root, 'session.jsonl');
     const session = makeSession(sessionFile);
