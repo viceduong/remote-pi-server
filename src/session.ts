@@ -14,7 +14,10 @@ import {
 } from './lease.js';
 import { LineSplitter, contentText } from './jsonl.js';
 import { FileTailer, type TailBatch } from './tailer.js';
+import { ASK_USER_QUESTION_TOOL, qaFromToolResult } from './qa.js';
 import type {
+  Activity,
+  ActivityKind,
   AgentState,
   AgentStatusFrame,
   RpcEvent,
@@ -87,6 +90,9 @@ interface PendingEcho {
   onEcho: (timestamp: number | null) => void;
 }
 
+/** Result of answering a questionnaire (route maps status → HTTP code). */
+export type AnswerResult = { ok: true } | { ok: false; status: 409 | 502; error: string };
+
 /** Thrown when the bridge cannot take the ownership lease for a spawn. */
 export class LeaseHeldError extends Error {
   readonly code = 409;
@@ -97,13 +103,16 @@ export class LeaseHeldError extends Error {
   }
 }
 
-/** CONTRACT §5: the one function computing client-visible status. */
+/** CONTRACT §5/§7/§8: the one function computing client-visible status. */
 export function computeStatus(s: {
   phase: SessionPhase;
   busy: boolean;
   promptReserved: boolean;
   error: string | null;
   owner: SessionOwner;
+  /** §7 — the caller guarantees: non-null ⇔ busy || promptReserved. */
+  activity?: Activity | null;
+  questionId?: string | null;
 }): AgentStatusFrame {
   let phase: StatusPhase;
   if (s.busy) phase = 'streaming';
@@ -114,7 +123,24 @@ export function computeStatus(s: {
   const busy = phase === 'streaming' || phase === 'waiting';
   const frame: AgentStatusFrame = { type: 'agent_status', phase, busy, working: busy, owner: s.owner };
   if (s.error) frame.error = s.error;
+  if (s.activity !== undefined) frame.activity = s.activity;
+  if (s.questionId !== undefined) frame.questionId = s.questionId;
   return frame;
+}
+
+/** compaction_progress percent → integer 0-100 (undefined when unknown). */
+function percentOf(v: unknown): number | undefined {
+  if (typeof v !== 'number' || !Number.isFinite(v)) return undefined;
+  return Math.max(0, Math.min(100, Math.round(v)));
+}
+
+/** Tool name announced by a toolcall_start (RPC: ev.toolName; else from the partial). */
+function toolcallName(ev: Record<string, unknown>): string | undefined {
+  if (typeof ev.toolName === 'string' && ev.toolName) return ev.toolName;
+  const partial = ev.partial as { content?: { name?: unknown }[] } | undefined;
+  const idx = typeof ev.contentIndex === 'number' ? ev.contentIndex : -1;
+  const block = Array.isArray(partial?.content) ? partial!.content[idx] : undefined;
+  return typeof block?.name === 'string' && block.name ? block.name : undefined;
 }
 
 /**
@@ -125,6 +151,16 @@ export function computeStatus(s: {
  * keep the final message (clients finalize the bubble from it).
  */
 export function trimEventForWire(obj: RpcEvent): RpcEvent {
+  if (obj.type === 'message_start' || obj.type === 'message_end') {
+    // CONTRACT §9: Q&A rows carry `qa` (top level + on the message copy).
+    const qa = qaFromToolResult(obj.message);
+    if (qa) return { ...obj, qa, message: { ...(obj.message as Record<string, unknown>), qa } };
+    return obj;
+  }
+  if (obj.type === 'session_before_compact') {
+    // v4 owners forward this raw — never ship preparation/branchEntries (huge).
+    return { type: obj.type, reason: obj.reason, willRetry: obj.willRetry };
+  }
   if (obj.type !== 'message_update') return obj;
   const ev = obj.assistantMessageEvent as Record<string, unknown> | undefined;
   const evType = typeof ev?.type === 'string' ? ev.type : '';
@@ -144,7 +180,10 @@ export function trimEventForWire(obj: RpcEvent): RpcEvent {
 /** True for tool-call/output events (focus clients drop them entirely). */
 export function isToolEvent(record: { type: string; data: unknown }): boolean {
   if (record.type.startsWith('tool_execution')) return true;
-  const msg = (record.data as { message?: { role?: string; toolName?: string } } | null)?.message;
+  const data = record.data as { qa?: unknown; message?: { role?: string; toolName?: string; qa?: unknown } } | null;
+  // CONTRACT §9: Q&A rows (message_start/_end, file_update) stay in focus streams.
+  if (data?.qa || data?.message?.qa) return false;
+  const msg = data?.message;
   return msg?.role === 'tool' || msg?.role === 'toolResult' || !!msg?.toolName;
 }
 
@@ -197,6 +236,17 @@ export class Session {
   externalOwner: SessionOwner = 'none';
   /** Unanswered questionnaire request (replayed to late subscribers). */
   pendingQuestion: { requestId: string; questions: unknown } | null = null;
+
+  /* CONTRACT §7 activity (derived from the active transport's events) */
+  /** Run-level activity (waiting/thinking/writing/toolcall/retrying) while a run is live. */
+  private run: { kind: ActivityKind; since: number; tool?: string; attempt?: number; maxAttempts?: number; delayMs?: number } | null = null;
+  /** Running tool calls (insertion order = start order): toolCallId → name/start. */
+  private readonly runningTools = new Map<string, { name: string; since: number }>();
+  /** Compaction in progress (overrides the run activity; busy for dispatch). */
+  private compaction: { since: number; reason?: string; percent?: number } | null = null;
+  private questionSince = 0;
+  private busySince = 0;
+  private reservedSince = 0;
 
   /* SSE stream identity */
   epoch = nextStreamEpoch();
@@ -283,7 +333,84 @@ export class Session {
 
   /** Busy for dispatch purposes: mid-run or a prompt is in flight. */
   get isBusy(): boolean {
-    return this.busy || this.phase === 'streaming' || this.promptReserved;
+    return this.busy || this.phase === 'streaming' || this.promptReserved || this.hasLiveActivity();
+  }
+
+  /** A run, tool, compaction or questionnaire is in progress (§7: busy). */
+  private hasLiveActivity(): boolean {
+    return this.run !== null || this.runningTools.size > 0 || this.compaction !== null || this.pendingQuestion !== null;
+  }
+
+  /** CONTRACT §7: what the agent is doing right now (null = idle / no transport). */
+  activity(): Activity | null {
+    if (this.pendingQuestion) return { kind: 'question', since: this.questionSince };
+    if (this.compaction) {
+      const a: Activity = { kind: 'compacting', since: this.compaction.since };
+      if (this.compaction.reason) a.reason = this.compaction.reason;
+      if (this.compaction.percent !== undefined) a.percent = this.compaction.percent;
+      return a;
+    }
+    if (this.runningTools.size > 0) {
+      const first = this.runningTools.values().next().value!;
+      return { kind: 'tool', since: first.since, tool: first.name, toolCount: this.runningTools.size };
+    }
+    if (this.run) {
+      const a: Activity = { kind: this.run.kind, since: this.run.since };
+      if (this.run.tool) a.tool = this.run.tool;
+      if (this.run.attempt !== undefined) a.attempt = this.run.attempt;
+      if (this.run.maxAttempts !== undefined) a.maxAttempts = this.run.maxAttempts;
+      if (this.run.delayMs !== undefined) a.delayMs = this.run.delayMs;
+      return a;
+    }
+    // A run with no activity seen yet (attach mid-run) or a prompt in flight.
+    if (this.busy) return { kind: 'waiting', since: this.busySince };
+    if (this.promptReserved) return { kind: 'waiting', since: this.reservedSince };
+    return null;
+  }
+
+  /** Set the run activity; `since` only moves when the kind/tool changes. Returns true on change. */
+  private setRun(kind: ActivityKind, extra: { tool?: string | undefined; attempt?: number | undefined; maxAttempts?: number | undefined; delayMs?: number | undefined } = {}): boolean {
+    const prev = this.run;
+    if (prev && prev.kind === kind && (extra.tool === undefined || prev.tool === extra.tool)) {
+      const next = { ...prev };
+      for (const [k, v] of Object.entries(extra)) if (v !== undefined) (next as Record<string, unknown>)[k] = v;
+      const changed = JSON.stringify(next) !== JSON.stringify(prev);
+      this.run = next;
+      return changed;
+    }
+    this.run = { kind, since: Date.now() };
+    for (const [k, v] of Object.entries(extra)) if (v !== undefined) (this.run as Record<string, unknown>)[k] = v;
+    return true;
+  }
+
+  /** Forget all activity (run ended / transport gone). */
+  private resetActivity(): void {
+    this.run = null;
+    this.runningTools.clear();
+    this.compaction = null;
+  }
+
+  /** Publish a questionnaire (both transports) — at most one broadcast per requestId. */
+  private setQuestion(requestId: string, questions: unknown): void {
+    if (this.pendingQuestion?.requestId === requestId) return; // replay (owner hello) — already known
+    this.pendingQuestion = { requestId, questions };
+    this.questionSince = Date.now();
+    this.broadcast('agent_question', { requestId, questions });
+    this.emitStatus();
+  }
+
+  /** Resolve the pending questionnaire if it is `requestId` (single resolved broadcast). */
+  private resolveQuestion(requestId: string, emit = true): boolean {
+    if (!this.pendingQuestion || this.pendingQuestion.requestId !== requestId) return false;
+    this.pendingQuestion = null;
+    this.broadcast('agent_question_resolved', { requestId });
+    if (emit) this.emitStatus();
+    return true;
+  }
+
+  /** CONTRACT §8 clearing triggers (abort, run end, exit, detach…). */
+  private clearQuestion(emit = true): void {
+    if (this.pendingQuestion) this.resolveQuestion(this.pendingQuestion.requestId, emit);
   }
 
   get restarting(): boolean {
@@ -295,8 +422,9 @@ export class Session {
   }
 
   reservePrompt(): boolean {
-    if (this.promptReserved || this.busy || this.phase === 'streaming') return false;
+    if (this.isBusy) return false; // incl. compaction / pending question (§7)
     this.promptReserved = true;
+    this.reservedSince = Date.now();
     this.emitStatus();
     return true;
   }
@@ -359,10 +487,12 @@ export class Session {
   statusFrame(): AgentStatusFrame {
     return computeStatus({
       phase: this.phase,
-      busy: this.busy,
+      busy: this.busy || this.hasLiveActivity(),
       promptReserved: this.promptReserved,
       error: this.error,
       owner: this.owner,
+      activity: this.activity(),
+      questionId: this.pendingQuestion?.requestId ?? null,
     });
   }
 
@@ -480,8 +610,16 @@ export class Session {
   /** Abort the current run on whichever transport is active. Real result. */
   async abort(): Promise<boolean> {
     if (!this.running) return false;
+    // A child blocked in the questionnaire select() would sit out its 10-min
+    // timeout — decline it first so the tool returns and the abort lands.
+    if (this.proc?.stdin && this.pendingQuestion) {
+      try {
+        this.proc.stdin.write(`${JSON.stringify({ type: 'extension_ui_response', id: this.pendingQuestion.requestId, cancelled: true })}\n`);
+      } catch { /* abort below still runs */ }
+    }
     try {
       await this.request({ type: 'abort' }, 15_000);
+      this.clearQuestion(false);
       this.emitStatus(true);
       return true;
     } catch (err) {
@@ -509,25 +647,46 @@ export class Session {
   }
 
   /**
-   * Answer a pending questionnaire: write the extension_ui_response back to
-   * pi and fan out the resolved frame so every client dismisses its card.
-   * Only bridge children use the marker transport (TUIs render natively).
+   * Answer a pending questionnaire (CONTRACT §8) and fan out the resolved
+   * frame so every client dismisses its card.
+   *  - bridge child: extension_ui_response with the `pi-answers:` marker;
+   *  - host TUI (owner protocol >= 5): op `answer_question` → the owner calls
+   *    the overlay's done({answers, cancelled}).
+   * 409 = no such pending question; 502 = the transport refused/failed.
    */
-  answerQuestion(requestId: string, answers: unknown[], cancelled: boolean): boolean {
-    if (!this.pendingQuestion || this.pendingQuestion.requestId !== requestId) return false;
-    const frame: Record<string, unknown> = { type: 'extension_ui_response', id: requestId };
-    if (cancelled) frame.cancelled = true;
-    else frame.value = `${RPC_ANSWER_PREFIX}${JSON.stringify({ answers, cancelled: false })}`;
-    if (!this.proc?.stdin) return false;
-    try {
-      this.proc.stdin.write(`${JSON.stringify(frame)}\n`);
-    } catch {
-      return false;
+  async answerQuestion(requestId: string, answers: unknown[], cancelled: boolean): Promise<AnswerResult> {
+    if (!this.pendingQuestion || this.pendingQuestion.requestId !== requestId) {
+      return { ok: false, status: 409, error: 'No pending question with that id' };
     }
-    this.pendingQuestion = null;
-    this.broadcast('agent_question_resolved', { requestId });
-    this.emitStatus();
-    return true;
+    if (this.proc?.stdin) {
+      const frame: Record<string, unknown> = { type: 'extension_ui_response', id: requestId };
+      if (cancelled) frame.cancelled = true;
+      else frame.value = `${RPC_ANSWER_PREFIX}${JSON.stringify({ answers, cancelled: false })}`;
+      try {
+        this.proc.stdin.write(`${JSON.stringify(frame)}\n`);
+      } catch (err) {
+        return { ok: false, status: 502, error: `Could not deliver the answer to the agent: ${(err as Error).message}` };
+      }
+    } else if (this.ownerSocket) {
+      try {
+        await this.request({ type: 'answer_question', requestId, answers, cancelled }, RPC_TIMEOUT_MS);
+      } catch (err) {
+        const msg = (err as Error).message;
+        if (/unknown op/i.test(msg)) {
+          return { ok: false, status: 502, error: 'The host TUI cannot take remote answers (Remote Pi owner extension older than v5) — answer in the terminal' };
+        }
+        if (/unknown requestId|no pending question/i.test(msg)) {
+          // Answered in the terminal meanwhile (its resolved event may still be in flight).
+          this.resolveQuestion(requestId);
+          return { ok: false, status: 409, error: 'No pending question with that id' };
+        }
+        return { ok: false, status: 502, error: `Host TUI rejected the answer: ${msg}` };
+      }
+    } else {
+      return { ok: false, status: 409, error: 'Agent not running' };
+    }
+    this.resolveQuestion(requestId);
+    return { ok: true };
   }
 
   /** Register a dispatched queue item so its user-message echo carries the clientMessageId. */
@@ -539,6 +698,13 @@ export class Session {
     const t = text.trim();
     const idx = this.pendingEcho.findIndex((e) => e.text === t);
     if (idx >= 0) this.pendingEcho.splice(idx, 1)[0]!.onEcho(null);
+  }
+
+  /** Mark a run live; it always has an activity (at least "waiting"). */
+  private setBusy(): void {
+    if (!this.busy) this.busySince = Date.now();
+    this.busy = true;
+    if (!this.run) this.setRun('waiting');
   }
 
   handleEvent(obj: RpcEvent): void {
@@ -553,21 +719,34 @@ export class Session {
         } catch {
           questions = [];
         }
-        const requestId = String(req.id ?? '');
-        this.pendingQuestion = { requestId, questions };
-        this.broadcast('agent_question', { requestId, questions });
+        this.setQuestion(String(req.id ?? ''), questions);
         return; // never forward the raw transport frame
       }
     }
+    // Owner (TUI, protocol >= 5) questionnaire bridge: the same first-class frames.
+    if (obj.type === 'agent_question') {
+      const requestId = typeof obj.requestId === 'string' ? obj.requestId : '';
+      if (requestId) this.setQuestion(requestId, obj.questions ?? []);
+      return;
+    }
+    if (obj.type === 'agent_question_resolved') {
+      if (typeof obj.requestId === 'string') this.resolveQuestion(obj.requestId);
+      return;
+    }
 
     let wire = trimEventForWire(obj);
+    /** Activity/status may have changed → emitStatus (deduped) after the fan-out. */
+    let dirty = false;
+    let settledNow = false;
     switch (obj.type) {
       case 'agent_start':
       case 'turn_start':
-        this.busy = true;
+        this.setBusy();
         this.phase = 'streaming';
         this.error = null;
         this.promptReserved = false;
+        if (this.runningTools.size === 0) this.setRun('waiting');
+        dirty = true;
         break;
       case 'turn_end':
         // pi can still be processing between turn_end and agent_end — keep busy.
@@ -576,20 +755,99 @@ export class Session {
       case 'agent_end': {
         const msgs = obj.messages as unknown[] | undefined;
         if (Array.isArray(msgs)) this.messageCount = msgs.length;
-        if (obj.willRetry === true) break; // an automatic retry follows
+        dirty = true;
+        if (obj.willRetry === true) {
+          // An automatic retry (or overflow compaction + retry) follows.
+          this.runningTools.clear();
+          this.setRun('retrying');
+          break;
+        }
         this.busy = false;
         this.phase = 'awaitingInput';
         this.promptReserved = false;
         this.error = Session.runError(msgs);
+        this.run = null;
+        this.runningTools.clear();
+        this.clearQuestion(false);
+        settledNow = true;
         break;
       }
       case 'agent_settled':
         this.busy = false;
         this.promptReserved = false;
         if (this.phase === 'streaming') this.phase = 'awaitingInput';
+        this.resetActivity();
+        this.clearQuestion(false);
+        dirty = true;
+        settledNow = true;
         break;
       case 'error':
         this.error = String((obj.error as { message?: string } | undefined)?.message ?? obj.error ?? 'agent error');
+        dirty = true;
+        break;
+      case 'message_update': {
+        if (!this.busy) break;
+        const ev = obj.assistantMessageEvent as Record<string, unknown> | undefined;
+        const t = typeof ev?.type === 'string' ? ev.type : '';
+        // Only transitions emit: setRun is a no-op for repeated deltas of one kind.
+        if (t === 'thinking_start' || t === 'thinking_delta') dirty = this.setRun('thinking');
+        else if (t === 'text_start' || t === 'text_delta') dirty = this.setRun('writing');
+        else if (t === 'toolcall_start') dirty = this.setRun('toolcall', { tool: toolcallName(ev!) });
+        else if (t === 'toolcall_delta' && this.run?.kind !== 'toolcall') dirty = this.setRun('toolcall');
+        break;
+      }
+      case 'tool_execution_start': {
+        const id = typeof obj.toolCallId === 'string' ? obj.toolCallId : `anon-${this.seq}`;
+        if (!this.runningTools.has(id)) {
+          this.runningTools.set(id, { name: typeof obj.toolName === 'string' ? obj.toolName : 'tool', since: Date.now() });
+        }
+        if (!this.busy) this.setBusy();
+        dirty = true;
+        break;
+      }
+      case 'tool_execution_end': {
+        if (typeof obj.toolCallId === 'string') this.runningTools.delete(obj.toolCallId);
+        // Tools done → a fresh "waiting" (since = now: the shown kind changed).
+        if (this.runningTools.size === 0 && this.busy) this.run = { kind: 'waiting', since: Date.now() };
+        if (obj.toolName === ASK_USER_QUESTION_TOOL) this.clearQuestion(false);
+        dirty = true;
+        break;
+      }
+      case 'compaction_start':
+      case 'session_before_compact': { // v4 owners forward the raw hook event
+        const reason = typeof obj.reason === 'string' ? obj.reason : undefined;
+        this.compaction = { since: Date.now(), ...(reason ? { reason } : {}) };
+        dirty = true;
+        break;
+      }
+      case 'compaction_progress': {
+        if (!this.compaction) this.compaction = { since: Date.now() };
+        const p = percentOf(obj.percent);
+        if (p !== undefined) this.compaction.percent = p;
+        dirty = true;
+        break;
+      }
+      case 'compaction_end':
+      case 'session_compact':
+      case 'session_compact_failed':
+        if (this.compaction) {
+          this.compaction = null;
+          dirty = true;
+          // Restores the run activity — or idle when no run is live (manual /compact).
+          if (!this.isBusy) settledNow = true;
+        }
+        break;
+      case 'auto_retry_start': {
+        const num = (v: unknown): number | undefined => (typeof v === 'number' && Number.isFinite(v) ? v : undefined);
+        if (!this.busy) this.setBusy();
+        this.runningTools.clear();
+        this.setRun('retrying', { attempt: num(obj.attempt), maxAttempts: num(obj.maxAttempts), delayMs: num(obj.delayMs) });
+        dirty = true;
+        break;
+      }
+      case 'auto_retry_end':
+        if (this.run?.kind === 'retrying' && this.busy) this.setRun('waiting');
+        dirty = true;
         break;
       case 'message_start':
       case 'message_end': {
@@ -615,11 +873,8 @@ export class Session {
     this.pushRing(record);
     this.fanout(record);
 
-    if (obj.type === 'agent_start' || obj.type === 'turn_start' || obj.type === 'agent_end'
-        || obj.type === 'agent_settled' || obj.type === 'error') {
-      this.emitStatus();
-    }
-    if ((obj.type === 'agent_end' && obj.willRetry !== true) || obj.type === 'agent_settled') {
+    if (dirty) this.emitStatus();
+    if (settledNow) {
       this.lastIdleAt = Date.now();
       this.onIdle?.();
     }
@@ -687,6 +942,8 @@ export class Session {
     this.exitEmitted = false;
     this.childReady = false;
     this.busy = false;
+    this.resetActivity();
+    this.clearQuestion(false);
     this.phase = 'idle';
     this.lastActivityAt = Date.now();
     this.newEpoch();
@@ -821,6 +1078,8 @@ export class Session {
     this.busy = false;
     this.promptReserved = false;
     this.phase = 'terminated';
+    this.resetActivity();
+    this.clearQuestion(false);
     this.rejectPending('Agent exited');
     this.log.info({ sessionId: this.id, code, signal }, 'pi exited');
 
@@ -890,9 +1149,10 @@ export class Session {
     else if (typeof m === 'string') this.model = m;
     if (typeof st.messageCount === 'number') this.messageCount = st.messageCount;
     if (st.isStreaming) {
-      this.busy = true;
+      this.setBusy();
       this.phase = 'streaming';
     }
+    if (st.isCompacting === true && !this.compaction) this.compaction = { since: Date.now() };
   }
 
   /** pi resolved a different file than we asked for — move our lease with it. */
@@ -1087,7 +1347,9 @@ export class Session {
     this.closed = false;
     this.exitEmitted = false;
     this.error = null;
-    this.busy = hello.isStreaming === true;
+    this.busy = false;
+    this.resetActivity();
+    if (hello.isStreaming === true) this.setBusy();
     this.phase = this.busy ? 'streaming' : 'idle';
     this.externalOwner = 'tui';
     this.lastActivityAt = Date.now();
@@ -1097,7 +1359,13 @@ export class Session {
     installed = true;
     try {
       const st = await this.request<AgentState & { isStreaming?: boolean }>({ type: 'get_state' }, 5_000);
-      this.busy = st.isStreaming === true;
+      if (st.isStreaming === true) {
+        if (!this.busy) this.setBusy();
+      } else {
+        this.busy = false;
+        this.run = null;
+        this.runningTools.clear();
+      }
       this.phase = this.busy ? 'streaming' : 'idle';
       if (st.sessionName) this.name = st.sessionName;
       if (typeof st.model === 'string') this.model = st.model;
@@ -1136,6 +1404,8 @@ export class Session {
     this.busy = false;
     this.promptReserved = false;
     this.phase = 'terminated';
+    this.resetActivity();
+    this.clearQuestion(false);
     this.rejectPending(`Owner connection closed: ${reason}`);
     this.log.info({ sessionId: this.id, reason }, 'owner detached');
     this.onExit?.();
@@ -1148,7 +1418,14 @@ export class Session {
   /* ---------------- summary ---------------- */
 
   /** Bare runtime facts; the manager builds the wire summary (one builder). */
-  runtime(): { running: boolean; busy: boolean; phase: SessionPhase; owner: SessionOwner; error: string | null } {
-    return { running: this.running, busy: this.isBusy, phase: this.phase, owner: this.owner, error: this.error };
+  runtime(): { running: boolean; busy: boolean; phase: SessionPhase; owner: SessionOwner; error: string | null; activity: Activity | null } {
+    return {
+      running: this.running,
+      busy: this.isBusy,
+      phase: this.phase,
+      owner: this.owner,
+      error: this.error,
+      activity: this.running ? this.activity() : null,
+    };
   }
 }

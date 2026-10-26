@@ -6,12 +6,15 @@ import type { ChatMessage } from './types.js';
  *  - role assistant and trimmed text EXCLUDING thinking non-empty;
  *  - an error row (`isError`, role `error`, or an assistant turn that ended
  *    in an error — `errorMessage` set);
- * Thinking-only assistant rows, tool calls, tool results and custom /
+ *  - the ask_user_question tool result carrying `qa` (CONTRACT §9).
+ * Thinking-only assistant rows, tool calls, other tool results and custom /
  * extension messages are NOT visible. (agent_question cards are SSE-only and
  * never part of /messages.) iOS `isVisibleInFocus(_:)` mirrors this exactly.
  */
 export function isVisibleMessage(m: ChatMessage): boolean {
   const role = m.role as string;
+  // CONTRACT §9: the ask_user_question result (Q&A row) is the one visible tool row.
+  if (m.qa && typeof m.qa === 'object') return true;
   if (role === 'tool' || (typeof m.toolName === 'string' && m.toolName.length > 0)) return false;
   if (role === 'error' || m.isError === true) return true;
   if (m.system === true) return false;

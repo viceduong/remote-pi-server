@@ -157,6 +157,145 @@ describe('owner proxy handshake (H2) and op translation (H3/H5)', () => {
   });
 });
 
+describe('owner proxy questionnaires (CONTRACT §8, owner protocol v5)', () => {
+  let srv: net.Server | null = null;
+  let session: Session;
+  const sockets: net.Socket[] = [];
+  const received: Record<string, unknown>[] = [];
+  const ipcLease = (ipc: string): Lease => ({
+    v: 1, sessionId: 's', epoch: 1, holder: { pid: process.pid, nonce: 'q', startedAtMs: 0 },
+    ipc, acquiredAt: Date.now(), renewedAt: Date.now(), leaseDurationMs: 15_000, kind: 'tui',
+  });
+  const questions = [{ index: 0, header: 'H', question: 'Q?', multiSelect: false, options: [{ label: 'A', description: 'a' }] }];
+  const evLine = (seq: number, event: Record<string, unknown>): string =>
+    `${JSON.stringify({ type: 'event', seq, eventType: event.type, event })}\n`;
+  const tick = (ms = 40) => new Promise((r) => setTimeout(r, ms));
+
+  /** `answerOp` decides the reply to answer_question (v4 owners answer "unknown op"). */
+  async function start(answerOp: (socket: net.Socket, msg: Record<string, unknown>) => void, onHello?: (socket: net.Socket) => void): Promise<string> {
+    const ipc = pipePath();
+    srv = net.createServer((socket) => {
+      sockets.push(socket);
+      let buf = '';
+      socket.on('data', (d) => {
+        buf += d.toString('utf8');
+        let i: number;
+        while ((i = buf.indexOf('\n')) >= 0) {
+          const msg = JSON.parse(buf.slice(0, i)) as Record<string, unknown>;
+          buf = buf.slice(i + 1);
+          received.push(msg);
+          if (msg.op === 'hello') {
+            helloOk(socket);
+            onHello?.(socket);
+          } else if (msg.op === 'answer_question') answerOp(socket, msg);
+          else socket.write(`${JSON.stringify({ type: 'response', id: msg.id, success: true, data: { isStreaming: true } })}\n`);
+        }
+      });
+      socket.on('error', () => undefined);
+    });
+    await new Promise<void>((r) => srv!.listen(ipc, r));
+    return ipc;
+  }
+
+  beforeEach(() => {
+    session = new Session('ownq', 'owner-q', path.join(os.tmpdir(), 'nope-q.jsonl'), 'pi', os.tmpdir(), os.tmpdir(), [], log);
+    received.length = 0;
+  });
+  afterEach(async () => {
+    session.stop('test end');
+    for (const s of sockets.splice(0)) s.destroy();
+    await new Promise<void>((r) => (srv ? srv.close(() => r()) : r()));
+    srv = null;
+  });
+
+  it('owner agent_question → pendingQuestion + one card; answer routes to answer_question; owner resolved is not re-broadcast', async () => {
+    const ipc = await start((socket, msg) => {
+      socket.write(`${JSON.stringify({ type: 'response', id: msg.id, success: true, data: { requestId: msg.requestId } })}\n`);
+      socket.write(evLine(12, { type: 'agent_question_resolved', requestId: msg.requestId }));
+    });
+    await session.attachOwner(ipcLease(ipc));
+    const frames: RingRecord[] = [];
+    session.subscribe({ send: (r) => frames.push(r) });
+    sockets[0]!.write(evLine(10, { type: 'agent_start' }));
+    sockets[0]!.write(evLine(11, { type: 'agent_question', requestId: 'rq-1', questions }));
+    sockets[0]!.write(evLine(11, { type: 'agent_question', requestId: 'rq-1', questions })); // replay dup
+    await tick();
+    expect(session.pendingQuestion).toEqual({ requestId: 'rq-1', questions });
+    expect(session.statusFrame()).toMatchObject({ busy: true, questionId: 'rq-1', activity: { kind: 'question' } });
+    expect(frames.filter((f) => f.type === 'agent_question')).toHaveLength(1);
+    expect(session.ringSnapshot().some((r) => r.type.startsWith('agent_question'))).toBe(false);
+
+    const answers = [{ questionIndex: 0, question: 'Q?', kind: 'option', answer: 'A' }];
+    expect(await session.answerQuestion('rq-1', answers, false)).toEqual({ ok: true });
+    expect(received.find((m) => m.op === 'answer_question')).toMatchObject({ op: 'answer_question', requestId: 'rq-1', answers, cancelled: false });
+    expect(received.find((m) => m.op === 'answer_question')!.type).toBeUndefined();
+    await tick();
+    expect(session.pendingQuestion).toBeNull();
+    expect(frames.filter((f) => f.type === 'agent_question_resolved')).toHaveLength(1);
+    expect((frames.filter((f) => f.type === 'agent_status').at(-1)!.data as { questionId: unknown }).questionId).toBeNull();
+  });
+
+  it('terminal answer: owner pushes agent_question_resolved → cleared; a late remote answer is a 409', async () => {
+    const ipc = await start((socket, msg) => {
+      socket.write(`${JSON.stringify({ type: 'response', id: msg.id, success: false, error: `unknown requestId ${String(msg.requestId)}` })}\n`);
+    });
+    await session.attachOwner(ipcLease(ipc));
+    sockets[0]!.write(evLine(10, { type: 'agent_question', requestId: 'rq-2', questions }));
+    await tick();
+    sockets[0]!.write(evLine(11, { type: 'agent_question_resolved', requestId: 'rq-2' }));
+    await tick();
+    expect(session.pendingQuestion).toBeNull();
+    expect(await session.answerQuestion('rq-2', [], true)).toMatchObject({ ok: false, status: 409 });
+    // Owner says the id is unknown (raced with the terminal) → 409 and cleared.
+    sockets[0]!.write(evLine(12, { type: 'agent_question', requestId: 'rq-3', questions }));
+    await tick();
+    expect(await session.answerQuestion('rq-3', [], true)).toMatchObject({ ok: false, status: 409 });
+    expect(session.pendingQuestion).toBeNull();
+  });
+
+  it('a v4 owner (unknown op answer_question) yields a clear 502 and keeps the question', async () => {
+    const ipc = await start((socket, msg) => {
+      socket.write(`${JSON.stringify({ type: 'response', id: msg.id, success: false, error: 'unknown op answer_question' })}\n`);
+    });
+    await session.attachOwner(ipcLease(ipc));
+    sockets[0]!.write(evLine(10, { type: 'agent_question', requestId: 'rq-4', questions }));
+    await tick();
+    const res = await session.answerQuestion('rq-4', [], true);
+    expect(res).toMatchObject({ ok: false, status: 502 });
+    expect((res as { error: string }).error).toMatch(/older than v5/);
+    expect(session.pendingQuestion?.requestId).toBe('rq-4');
+  });
+
+  it('question replayed after hello is picked up; owner detach clears it (resolved + status)', async () => {
+    const ipc = await start(() => undefined, (socket) => {
+      socket.write(evLine(7, { type: 'agent_question', requestId: 'rq-5', questions }));
+    });
+    const frames: RingRecord[] = [];
+    session.subscribe({ send: (r) => frames.push(r) });
+    await session.attachOwner(ipcLease(ipc));
+    await tick();
+    expect(session.pendingQuestion?.requestId).toBe('rq-5');
+    for (const s of sockets) s.destroy();
+    await tick();
+    expect(session.isProxy).toBe(false);
+    expect(session.pendingQuestion).toBeNull();
+    expect(frames.filter((f) => f.type === 'agent_question_resolved').map((f) => (f.data as { requestId: string }).requestId)).toEqual(['rq-5']);
+    expect(frames.filter((f) => f.type === 'agent_status').at(-1)!.data).toMatchObject({ phase: 'exited', busy: false, activity: null, questionId: null });
+  });
+
+  it('owner compaction events (v5 spelling) drive activity', async () => {
+    const ipc = await start(() => undefined);
+    await session.attachOwner(ipcLease(ipc));
+    sockets[0]!.write(evLine(10, { type: 'agent_start' }));
+    sockets[0]!.write(evLine(11, { type: 'compaction_start', reason: 'threshold' }));
+    await tick();
+    expect(session.statusFrame().activity).toMatchObject({ kind: 'compacting', reason: 'threshold' });
+    sockets[0]!.write(evLine(12, { type: 'compaction_end', reason: 'threshold', aborted: false, willRetry: false }));
+    await tick();
+    expect(session.statusFrame().activity).toMatchObject({ kind: 'waiting' });
+  });
+});
+
 describe('SessionManager ownership (leases only)', () => {
   let root: string;
   let manager: SessionManager;

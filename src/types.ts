@@ -90,6 +90,8 @@ export interface ChatMessage {
   errorMessage: string | null;
   /** CONTRACT §3: set on user rows the server can map to a delivered queue item. */
   clientMessageId?: string;
+  /** CONTRACT §9: set on the toolResult row of `ask_user_question` (visible Q&A row). */
+  qa?: { cancelled: boolean; items: { question: string; answer: string }[] };
 }
 
 /** Runtime phase of a session (derived from the owner's event stream). */
@@ -101,6 +103,28 @@ export type SessionOwner = 'none' | 'tui' | 'bridge';
 /** CONTRACT §5 status phase carried by `agent_status` frames. */
 export type StatusPhase = 'idle' | 'waiting' | 'streaming' | 'error' | 'exited';
 
+/** CONTRACT §7: what the agent is doing right now. */
+export type ActivityKind =
+  | 'waiting' | 'thinking' | 'writing' | 'toolcall' | 'tool' | 'compacting' | 'retrying' | 'question';
+
+export interface Activity {
+  kind: ActivityKind;
+  /** ms epoch when THIS kind/tool started. */
+  since: number;
+  /** toolcall/tool: tool name (first running one). */
+  tool?: string;
+  /** tool: number of tools running in parallel (>= 1). */
+  toolCount?: number;
+  /** compacting: "manual" | "threshold" | "overflow" | "model-switch". */
+  reason?: string;
+  /** compacting: 0-100 integer when known. */
+  percent?: number;
+  /** retrying (RPC children only). */
+  attempt?: number;
+  maxAttempts?: number;
+  delayMs?: number;
+}
+
 export interface AgentStatusFrame {
   type: 'agent_status';
   phase: StatusPhase;
@@ -109,6 +133,10 @@ export interface AgentStatusFrame {
   working: boolean;
   error?: string;
   owner: SessionOwner;
+  /** CONTRACT §7 (null when idle / no transport). */
+  activity?: Activity | null;
+  /** CONTRACT §8: requestId of the pending questionnaire, null when none. */
+  questionId?: string | null;
   [key: string]: unknown;
 }
 
@@ -138,6 +166,8 @@ export interface SessionSummary {
   livePid: number | null;
   /** True when the session file was written in the last 30s. */
   writing: boolean;
+  /** CONTRACT §7: activity of an attached transport (null otherwise). */
+  activity: Activity | null;
 }
 
 export interface ServerConfig {

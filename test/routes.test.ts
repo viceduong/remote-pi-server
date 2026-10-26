@@ -64,6 +64,28 @@ describe('routes', () => {
     expect(body.pending).toEqual([]);
   });
 
+  it('Q&A rows (§9) are visible with qa; answering a non-pending question is a 409; summaries carry activity', async () => {
+    fs.appendFileSync(path.join(root, '--proj--', 's.jsonl'), `${JSON.stringify({
+      type: 'message', id: 'q1',
+      message: {
+        role: 'toolResult', toolCallId: 'tc', toolName: 'ask_user_question', content: [{ type: 'text', text: 'User declined to answer questions' }],
+        details: { answers: [], cancelled: true }, isError: false, timestamp: 5,
+      },
+    })}\n`);
+    const res = await app.inject({ url: `/api/sessions/${ID}/messages?visible=1`, headers: auth });
+    const body = res.json() as { messages: { id: string; role: string; qa?: unknown }[] };
+    expect(body.messages.map((m) => m.id)).toEqual(['u1', 'a2', 'q1']);
+    expect(body.messages[2]).toMatchObject({ role: 'tool', toolName: 'ask_user_question', qa: { cancelled: true, items: [] } });
+
+    const ans = await app.inject({
+      method: 'POST', url: `/api/sessions/${ID}/question/rq-x`, headers: auth, payload: { cancelled: true },
+    });
+    expect(ans.statusCode).toBe(409);
+
+    const sum = await app.inject({ url: `/api/sessions/${ID}`, headers: auth });
+    expect((sum.json() as { session: { activity: unknown } }).session.activity).toBeNull();
+  });
+
   it('validates queries with zod (400 on garbage)', async () => {
     const res = await app.inject({ url: `/api/sessions/${ID}/messages?limit=abc`, headers: auth });
     expect(res.statusCode).toBe(400);

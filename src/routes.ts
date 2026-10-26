@@ -166,8 +166,8 @@ export function registerRoutes(
     if (!body) return;
     const session = await manager.find(id);
     if (!session) return reply.code(404).send({ error: 'Session not found' });
-    const ok = session.answerQuestion(requestId, body.answers ?? [], body.cancelled === true);
-    if (!ok) return reply.code(409).send({ error: 'No pending question with that id' });
+    const res = await session.answerQuestion(requestId, body.answers ?? [], body.cancelled === true);
+    if (!res.ok) return reply.code(res.status).send({ error: res.error });
     return { ok: true };
   });
 

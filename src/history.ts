@@ -1,3 +1,4 @@
+import { qaFromToolResult } from './qa.js';
 import type { AgentMessage, ChatMessage, ContentBlock } from './types.js';
 
 /**
@@ -62,6 +63,9 @@ export function mapAgentMessage(msg: AgentMessage | null | undefined): ChatMessa
         });
       }
     }
+    // CONTRACT §9: ask_user_question results become visible Q&A rows.
+    const qa = qaFromToolResult(msg);
+    if (qa) base.qa = qa;
     return base;
   }
   if (role === 'user') {

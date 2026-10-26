@@ -753,6 +753,8 @@ export class SessionManager {
       live: owner === 'tui',
       livePid: owner === 'tui' ? (s?.ownerLease?.holder.pid ?? leasePid) : null,
       writing: mtime > 0 && now - mtime < WRITING_WINDOW_MS,
+      // CONTRACT §7: only sessions with an attached transport have activity.
+      activity: s?.running ? s.activity() : null,
     };
   }
 
