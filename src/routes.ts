@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import type { FastifyBaseLogger, FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
-import { BusyError, SessionLiveError, SpawnError, type SessionManager } from './manager.js';
+import { AmbiguousModelError, BusyError, ModelNotFoundError, ModelTransportError, SessionLiveError, SpawnError, type SessionManager } from './manager.js';
 import { LeaseHeldError, type Session } from './session.js';
 import { attachSse } from './sse.js';
 import { readTailLines, parseEntry } from './jsonl.js';
@@ -55,7 +55,10 @@ const AnswerQuestionSchema = z.object({
   cancelled: z.boolean().optional(),
 });
 const RenameSchema = z.object({ name: z.string().min(1).max(80) });
-const SetModelSchema = z.object({ modelId: z.string().min(1).max(200) });
+const SetModelSchema = z.object({
+  provider: z.string().min(1).max(200).optional(),
+  modelId: z.string().min(1).max(200),
+});
 const ForkSchema = z.object({
   entryId: z.string().min(1).max(128).optional(),
   name: z.string().max(80).optional(),
@@ -86,6 +89,9 @@ function sendError(reply: Reply, err: unknown): Reply {
     return reply.code(409).send({ error: e.message, code: 'session_live' });
   }
   if (err instanceof SpawnError) return reply.code(409).send({ error: e.message, code: 'spawn_failed' });
+  if (err instanceof ModelNotFoundError) return reply.code(404).send({ error: e.message });
+  if (err instanceof AmbiguousModelError) return reply.code(400).send({ error: e.message, code: 'ambiguous_model' });
+  if (err instanceof ModelTransportError) return reply.code(502).send({ error: e.message });
   return reply.code(409).send({ error: e?.message ?? String(err) });
 }
 
@@ -215,10 +221,32 @@ export function registerRoutes(
 
     try {
       if (body.streamingBehavior) {
-        // Explicit steer/followUp is delegated to pi (or the TUI owner, as
-        // steer/enqueue ops — works with v3 owners too).
-        await session.request({ type: 'prompt', message: body.message, streamingBehavior: body.streamingBehavior }, 8_000);
-        return reply.code(202).send({ accepted: true, queued: false, dispatched: true, queueItemId: null });
+        // §10: a brand-new message sent as steer/followUp. Enqueue first so
+        // clientMessageId idempotency + the clientMessageId echo reconciliation
+        // stay intact, then promote it to immediate delivery with the requested
+        // behavior (bypassing the busy gate). A duplicate clientMessageId that
+        // already ran/finished returns the same item without re-sending.
+        const item = manager.enqueuePrompt(session, body.message, body.clientMessageId);
+        if (item.status === 'failed') {
+          return reply.code(409).send({ error: item.error ?? 'Previously failed idempotent turn', code: 'turn_failed' });
+        }
+        if (item.status === 'queued') {
+          const result = await manager.steerQueueItem(session.id, item.id, body.streamingBehavior);
+          if (result === 'session_live') {
+            return reply.code(409).send({ error: 'Session is driven by another writer — retry', code: 'session_live' });
+          }
+          if (result === 'failed') {
+            return reply.code(502).send({ error: 'Steer delivery failed — message left queued', queueItemId: item.id });
+          }
+        }
+        const dispatched = item.status === 'running' || item.status === 'done';
+        return reply.code(202).send({
+          accepted: true,
+          queued: body.clientMessageId ? isActive(item) : !dispatched,
+          dispatched,
+          queueItemId: item.id,
+          queueDepth: session.queue.filter(isActive).length,
+        });
       }
       // Everything else goes through the durable queue: dispatched at once
       // when the agent is idle, held (never lost, never doubled) when busy.
@@ -257,6 +285,42 @@ export function registerRoutes(
     const ok = await manager.cancelQueueItem(id, itemId);
     if (!ok) return reply.code(404).send({ error: 'Queued item not found' });
     return { ok: true };
+  });
+
+  /*
+   * §10 steer / send-now: promote a queued item into the running turn NOW
+   * (streamingBehavior:"steer"), bypassing the busy gate. Same session_live
+   * ownership rule as /turn (a host TUI is fine — proxied; an unleased external
+   * writer or an unreadable lease is 409). 404 when it is not a currently
+   * `queued` item; 502 when delivery fails (item stays queued).
+   */
+  fastify.post('/api/sessions/:id/queue/:itemId/steer', async (req, reply) => {
+    const id = idOf(req, reply);
+    if (!id) return;
+    const itemId = parse(PARAM_TOKEN, (req.params as { itemId?: string }).itemId, reply, 'itemId');
+    if (!itemId) return;
+
+    const own = await manager.ownership(id);
+    if (!own.session) return reply.code(404).send({ error: 'Session not found' });
+    if (own.owner === 'unknown') {
+      return reply.code(409).send({ error: 'Session ownership is temporarily unreadable — retry', code: 'session_live' });
+    }
+    if (own.owner === 'none' && await manager.hasUnownedRecentWriter(id)) {
+      return reply.code(409).send({
+        error: 'Another pi process (without the ownership lease) is writing this session right now. Let it finish, or retry with force.',
+        code: 'session_live',
+      });
+    }
+
+    try {
+      const result = await manager.steerQueueItem(id, itemId);
+      if (result === 'not_found') return reply.code(404).send({ error: 'Queued item not found' });
+      if (result === 'session_live') return reply.code(409).send({ error: 'Session is driven by another writer — retry', code: 'session_live' });
+      if (result === 'failed') return reply.code(502).send({ error: 'Steer delivery failed — item left queued' });
+      return reply.code(200).send({ ok: true, dispatched: true });
+    } catch (err) {
+      return sendError(reply, err);
+    }
   });
 
   // Full tool result for a toolCallId (skeleton mode fetch-on-expand).
@@ -504,15 +568,38 @@ export function registerRoutes(
     }
   });
 
+  /**
+   * §11 model picker. A host TUI is fine (proxied to its owner extension);
+   * an unleased external writer or an unreadable lease is 409 `session_live`.
+   */
+  const rejectExternalWriter = async (id: string, reply: Reply): Promise<boolean> => {
+    const own = await manager.ownership(id);
+    if (!own.session) {
+      await reply.code(404).send({ error: 'Session not found' });
+      return true;
+    }
+    if (own.owner === 'unknown') {
+      await reply.code(409).send({ error: 'Session ownership is temporarily unreadable — retry', code: 'session_live' });
+      return true;
+    }
+    if (own.owner === 'none' && await manager.hasUnownedRecentWriter(id)) {
+      await reply.code(409).send({
+        error: 'Another pi process (without the ownership lease) is writing this session right now. Let it finish, then retry.',
+        code: 'session_live',
+      });
+      return true;
+    }
+    return false;
+  };
+
   fastify.get('/api/sessions/:id/models', async (req, reply) => {
     const id = idOf(req, reply);
     if (!id) return;
-    if (await rejectHostOwned(id, reply)) return;
+    if (await rejectExternalWriter(id, reply)) return;
     try {
-      return { models: await manager.listModels(id) };
+      return await manager.listModels(id);
     } catch (err) {
-      if (err instanceof BusyError || err instanceof SessionLiveError || err instanceof LeaseHeldError) return sendError(reply, err);
-      return reply.code(404).send({ error: (err as Error).message });
+      return sendError(reply, err);
     }
   });
 
@@ -521,13 +608,12 @@ export function registerRoutes(
     if (!id) return;
     const body = parse(SetModelSchema, req.body, reply, 'body');
     if (!body) return;
-    if (await rejectHostOwned(id, reply)) return;
+    if (await rejectExternalWriter(id, reply)) return;
     try {
-      await manager.setModel(id, body.modelId);
-      return { ok: true };
+      const model = await manager.setModel(id, body.modelId, body.provider);
+      return { ok: true, model };
     } catch (err) {
-      if (err instanceof BusyError || err instanceof SessionLiveError || err instanceof LeaseHeldError) return sendError(reply, err);
-      return reply.code(404).send({ error: (err as Error).message });
+      return sendError(reply, err);
     }
   });
 
@@ -535,12 +621,11 @@ export function registerRoutes(
     const id = idOf(req, reply);
     if (!id) return;
     if (!EmptyBody.safeParse(req.body).success) return reply.code(400).send({ error: 'Invalid body' });
-    if (await rejectHostOwned(id, reply)) return;
+    if (await rejectExternalWriter(id, reply)) return;
     try {
-      return { modelId: await manager.cycleModel(id) };
+      return await manager.cycleModel(id);
     } catch (err) {
-      if (err instanceof BusyError || err instanceof SessionLiveError || err instanceof LeaseHeldError) return sendError(reply, err);
-      return reply.code(404).send({ error: (err as Error).message });
+      return sendError(reply, err);
     }
   });
 

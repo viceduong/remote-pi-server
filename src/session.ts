@@ -15,6 +15,7 @@ import {
 import { LineSplitter, contentText } from './jsonl.js';
 import { FileTailer, type TailBatch } from './tailer.js';
 import { ASK_USER_QUESTION_TOOL, qaFromToolResult } from './qa.js';
+import { modelString, normalizeModel, type ModelEntry } from './models.js';
 import type {
   Activity,
   ActivityKind,
@@ -230,6 +231,11 @@ export class Session {
   piId: string | null = null;
   phase: SessionPhase = 'idle';
   model: string | null = null;
+  /** CONTRACT-V2 §11: the structured current model (null = unknown). */
+  currentModel: ModelEntry | null = null;
+  /** Owner hello facts (proxy transport only; null/[] for children). */
+  ownerProtocol: number | null = null;
+  ownerCapabilities: string[] = [];
   messageCount = 0;
   error: string | null = null;
   /** Ownership seen in the lease while no transport is attached. */
@@ -341,21 +347,32 @@ export class Session {
     return this.run !== null || this.runningTools.size > 0 || this.compaction !== null || this.pendingQuestion !== null;
   }
 
-  /** CONTRACT §7: what the agent is doing right now (null = idle / no transport). */
+  /**
+   * CONTRACT §7: what the agent is doing right now (null = idle / no transport).
+   * `busySince` is stamped from the persisted continuous-busy start — stable across
+   * sub-activity transitions and unchanged on a reconnect snapshot (pure read).
+   */
   activity(): Activity | null {
-    if (this.pendingQuestion) return { kind: 'question', since: this.questionSince };
+    const a = this.rawActivity();
+    if (!a) return null;
+    a.busySince = this.busySince || a.since;
+    return a;
+  }
+
+  private rawActivity(): Activity | null {
+    if (this.pendingQuestion) return { kind: 'question', since: this.questionSince, busySince: 0 };
     if (this.compaction) {
-      const a: Activity = { kind: 'compacting', since: this.compaction.since };
+      const a: Activity = { kind: 'compacting', since: this.compaction.since, busySince: 0 };
       if (this.compaction.reason) a.reason = this.compaction.reason;
       if (this.compaction.percent !== undefined) a.percent = this.compaction.percent;
       return a;
     }
     if (this.runningTools.size > 0) {
       const first = this.runningTools.values().next().value!;
-      return { kind: 'tool', since: first.since, tool: first.name, toolCount: this.runningTools.size };
+      return { kind: 'tool', since: first.since, busySince: 0, tool: first.name, toolCount: this.runningTools.size };
     }
     if (this.run) {
-      const a: Activity = { kind: this.run.kind, since: this.run.since };
+      const a: Activity = { kind: this.run.kind, since: this.run.since, busySince: 0 };
       if (this.run.tool) a.tool = this.run.tool;
       if (this.run.attempt !== undefined) a.attempt = this.run.attempt;
       if (this.run.maxAttempts !== undefined) a.maxAttempts = this.run.maxAttempts;
@@ -363,9 +380,14 @@ export class Session {
       return a;
     }
     // A run with no activity seen yet (attach mid-run) or a prompt in flight.
-    if (this.busy) return { kind: 'waiting', since: this.busySince };
-    if (this.promptReserved) return { kind: 'waiting', since: this.reservedSince };
+    if (this.busy) return { kind: 'waiting', since: this.busySince, busySince: 0 };
+    if (this.promptReserved) return { kind: 'waiting', since: this.reservedSince, busySince: 0 };
     return null;
+  }
+
+  /** Maintain the continuous busy-period start: begin once idle→busy, clear on idle. */
+  private syncBusyPeriod(): void {
+    this.busySince = this.isBusy ? (this.busySince || Date.now()) : 0;
   }
 
   /** Set the run activity; `since` only moves when the kind/tool changes. Returns true on change. */
@@ -383,11 +405,12 @@ export class Session {
     return true;
   }
 
-  /** Forget all activity (run ended / transport gone). */
+  /** Forget all activity (run ended / transport gone). Also ends the busy period. */
   private resetActivity(): void {
     this.run = null;
     this.runningTools.clear();
     this.compaction = null;
+    this.busySince = 0;
   }
 
   /** Publish a questionnaire (both transports) — at most one broadcast per requestId. */
@@ -395,6 +418,7 @@ export class Session {
     if (this.pendingQuestion?.requestId === requestId) return; // replay (owner hello) — already known
     this.pendingQuestion = { requestId, questions };
     this.questionSince = Date.now();
+    this.syncBusyPeriod(); // a question can arrive while otherwise idle (begins a busy period)
     this.broadcast('agent_question', { requestId, questions });
     this.emitStatus();
   }
@@ -425,6 +449,7 @@ export class Session {
     if (this.isBusy) return false; // incl. compaction / pending question (§7)
     this.promptReserved = true;
     this.reservedSince = Date.now();
+    this.syncBusyPeriod(); // idle→busy: the continuous busy period starts here
     this.emitStatus();
     return true;
   }
@@ -432,6 +457,7 @@ export class Session {
   releasePrompt(): void {
     if (!this.promptReserved) return;
     this.promptReserved = false;
+    this.syncBusyPeriod();
     this.emitStatus();
   }
 
@@ -482,6 +508,29 @@ export class Session {
       return;
     }
     this.fanout(this.makeRecord(type, { type, ...data } as RpcEvent));
+  }
+
+  /**
+   * CONTRACT-V2 §11: record the current model (any pi Model-like object) and,
+   * when it actually changed and `emit` is set, broadcast a live
+   * `model_changed {provider, id, name}` frame (not in the ring). Returns the
+   * normalized entry, or null when `raw` is not identifiable.
+   */
+  noteModel(raw: unknown, emit = true): ModelEntry | null {
+    const entry = normalizeModel(raw);
+    if (!entry) return null;
+    const prev = this.currentModel;
+    const changed = !prev || prev.provider !== entry.provider || prev.id !== entry.id;
+    // Keep richer metadata if the new report is slimmer (e.g. name-only event).
+    this.currentModel = changed ? entry : { ...prev, ...entry };
+    this.model = modelString(entry);
+    if (changed && emit) this.broadcast('model_changed', { provider: entry.provider, id: entry.id, name: entry.name });
+    return this.currentModel;
+  }
+
+  /** True when the attached owner can serve §11 model listing (protocol v6+). */
+  get ownerSupportsModels(): boolean {
+    return (this.ownerProtocol ?? 0) >= 6 || this.ownerCapabilities.includes('models');
   }
 
   statusFrame(): AgentStatusFrame {
@@ -702,8 +751,8 @@ export class Session {
 
   /** Mark a run live; it always has an activity (at least "waiting"). */
   private setBusy(): void {
-    if (!this.busy) this.busySince = Date.now();
     this.busy = true;
+    this.busySince = this.busySince || Date.now(); // begin the continuous busy period (kept until idle)
     if (!this.run) this.setRun('waiting');
   }
 
@@ -731,6 +780,12 @@ export class Session {
     }
     if (obj.type === 'agent_question_resolved') {
       if (typeof obj.requestId === 'string') this.resolveQuestion(obj.requestId);
+      return;
+    }
+    // §11: owner v6 forwards TUI model switches (extension `model_select`);
+    // re-emitted as our own deduped live frame, never put in the ring.
+    if (obj.type === 'model_changed' || obj.type === 'model_select') {
+      this.noteModel(obj.type === 'model_select' ? obj.model : obj);
       return;
     }
 
@@ -873,6 +928,9 @@ export class Session {
     this.pushRing(record);
     this.fanout(record);
 
+    // Continuous busy-period start: stamped once idle→busy, held across every
+    // sub-activity transition, cleared only when the session returns to idle.
+    this.syncBusyPeriod();
     if (dirty) this.emitStatus();
     if (settledNow) {
       this.lastIdleAt = Date.now();
@@ -1145,8 +1203,10 @@ export class Session {
     }
     if (st.sessionName) this.name = st.sessionName;
     const m = st.model;
-    if (m && typeof m === 'object') this.model = `${m.provider ?? ''}/${m.modelId ?? m.id ?? ''}`;
-    else if (typeof m === 'string') this.model = m;
+    if (m && typeof m === 'object') {
+      // Startup/refresh snapshots only announce a change, not the first sighting.
+      if (!this.noteModel(m, this.currentModel !== null)) this.model = `${m.provider ?? ''}/${m.modelId ?? m.id ?? ''}`;
+    } else if (typeof m === 'string') this.model = m;
     if (typeof st.messageCount === 'number') this.messageCount = st.messageCount;
     if (st.isStreaming) {
       this.setBusy();
@@ -1343,6 +1403,9 @@ export class Session {
     // Owner could not replay what we missed → clients must reload (reset).
     if (hello.rehydrateFromFile === true) this.newEpoch();
     if (typeof hello.eventSeq === 'number' && this.ownerSeq === 0) this.ownerSeq = hello.eventSeq;
+    this.ownerProtocol = typeof hello.protocolVersion === 'number' ? hello.protocolVersion : null;
+    this.ownerCapabilities = Array.isArray(hello.capabilities) ? hello.capabilities.filter((c): c is string => typeof c === 'string') : [];
+    if (hello.currentModel) this.noteModel(hello.currentModel, false);
     this.stopping = false;
     this.closed = false;
     this.exitEmitted = false;
@@ -1365,10 +1428,14 @@ export class Session {
         this.busy = false;
         this.run = null;
         this.runningTools.clear();
+        this.syncBusyPeriod(); // not streaming after all → end the busy period
       }
       this.phase = this.busy ? 'streaming' : 'idle';
       if (st.sessionName) this.name = st.sessionName;
-      if (typeof st.model === 'string') this.model = st.model;
+      // v6 owners report {provider,id,name}; older ones only the bare id.
+      if (!(st.currentModel && this.noteModel(st.currentModel, this.currentModel !== null)) && typeof st.model === 'string' && !this.currentModel) {
+        this.model = st.model;
+      }
     } catch { /* snapshot from hello is good enough */ }
     this.emitStatus(true);
   }

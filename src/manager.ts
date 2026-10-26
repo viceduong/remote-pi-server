@@ -18,6 +18,7 @@ import {
 } from './lease.js';
 import { SessionFileCache, type FileSummary } from './filecache.js';
 import { stripLoneSurrogates } from './jsonl.js';
+import { modelRefOf, normalizeModel, normalizeModelList, OWNER_TOO_OLD_MESSAGE, resolveModel, type ModelEntry, type ModelListing, type ModelRef } from './models.js';
 import {
   QUEUE_MAX_ACTIVE,
   QUEUE_MAX_ATTEMPTS,
@@ -70,6 +71,21 @@ export class SessionLiveError extends Error {
   constructor(message: string) {
     super(message);
   }
+}
+
+/** §11: unknown model / session (404). */
+export class ModelNotFoundError extends Error {
+  readonly code = 404;
+}
+
+/** §11: legacy `{modelId}` matches several providers (400). */
+export class AmbiguousModelError extends Error {
+  readonly code = 400;
+}
+
+/** §11: the transport could not serve the model op (502). */
+export class ModelTransportError extends Error {
+  readonly code = 502;
 }
 
 /** Lease-derived ownership of a session file. `unknown` = treat as owned. */
@@ -858,23 +874,107 @@ export class SessionManager {
     return this.summaryOf(session);
   }
 
-  async listModels(id: string): Promise<unknown> {
+  /**
+   * CONTRACT-V2 §11: available models + the current one, normalized.
+   * Child → RPC get_available_models (+ get_state); TUI owner v6 → op
+   * get_available_models `{models, current}`; older owners → ModelTransportError.
+   */
+  async listModels(id: string): Promise<ModelListing> {
     const session = await this.ensureRunning(id);
-    if (!session) throw new Error('Session not found');
-    return session.request({ type: 'get_available_models' });
+    if (!session) throw new ModelNotFoundError('Session not found');
+    return this.fetchModels(session);
   }
 
-  async setModel(id: string, modelId: string): Promise<void> {
-    const session = await this.ensureRunning(id);
-    if (!session) throw new Error('Session not found');
-    await session.request({ type: 'set_model', modelId });
+  private async fetchModels(session: Session): Promise<ModelListing> {
+    if (session.isProxy && !session.ownerSupportsModels) throw new ModelTransportError(OWNER_TOO_OLD_MESSAGE);
+    let data: { models?: unknown; current?: unknown };
+    try {
+      data = await session.request<{ models?: unknown; current?: unknown }>({ type: 'get_available_models' });
+    } catch (err) {
+      const msg = (err as Error).message;
+      if (session.isProxy && /unknown op/i.test(msg)) throw new ModelTransportError(OWNER_TOO_OLD_MESSAGE);
+      throw new ModelTransportError(`Could not list models: ${msg}`);
+    }
+    const models = normalizeModelList(data?.models ?? []);
+    let current: ModelRef | null = null;
+    if (session.isProxy) {
+      current = modelRefOf(data?.current);
+      if (current) session.noteModel(data.current, session.currentModel !== null);
+    } else {
+      try {
+        const st = await session.request<AgentState>({ type: 'get_state' });
+        current = modelRefOf(st.model);
+        if (current) session.noteModel(st.model, session.currentModel !== null);
+      } catch { /* list without current beats failing */ }
+    }
+    if (!current && session.currentModel) current = { provider: session.currentModel.provider, id: session.currentModel.id };
+    return { models, current };
   }
 
-  async cycleModel(id: string): Promise<string | null> {
+  /**
+   * CONTRACT-V2 §11: switch model (allowed while busy — pi applies it from the
+   * next turn). Provider required unless the id is unambiguous. Broadcasts
+   * `model_changed` (deduped) and returns `{provider, id, name}`.
+   */
+  async setModel(id: string, modelId: string, provider?: string): Promise<{ provider: string; id: string; name: string }> {
     const session = await this.ensureRunning(id);
-    if (!session) throw new Error('Session not found');
-    const data = await session.request<{ modelId?: string }>({ type: 'cycle_model' });
-    return data.modelId ?? null;
+    if (!session) throw new ModelNotFoundError('Session not found');
+    let known: ModelEntry | null = null;
+    if (!provider) {
+      // Legacy {modelId}: needs the list to pick the provider (v5 owners can't list).
+      const { models } = await this.fetchModels(session);
+      const r = resolveModel(models, modelId);
+      if (!r.ok) {
+        if (r.reason === 'ambiguous') {
+          throw new AmbiguousModelError(`Model id ${modelId} exists for several providers (${(r.candidates ?? []).map((m) => m.provider).join(', ')}) — send provider`);
+        }
+        throw new ModelNotFoundError(`Model not found: ${modelId}`);
+      }
+      known = r.model;
+      provider = r.model.provider;
+      modelId = r.model.id;
+    }
+    let data: unknown;
+    try {
+      data = await session.request({ type: 'set_model', provider, modelId });
+    } catch (err) {
+      const msg = (err as Error).message;
+      if (/not found|unknown model|not available|no auth|no api key/i.test(msg)) throw new ModelNotFoundError(`Model not found: ${provider}/${modelId}`);
+      throw new ModelTransportError(`Model switch failed: ${msg}`);
+    }
+    // Child → the pi Model; owner v6 → {selected}; owner v5 → {model: id}.
+    const d = (data ?? {}) as { selected?: unknown };
+    const reported = normalizeModel(d.selected) ?? normalizeModel(data);
+    const fallback: ModelEntry = known ?? { provider, id: modelId, name: modelId };
+    const entry = reported && reported.provider === provider && reported.id === modelId ? reported : fallback;
+    const noted = session.noteModel(entry) ?? entry;
+    return { provider: noted.provider, id: noted.id, name: noted.name };
+  }
+
+  /**
+   * Next model. Child → RPC cycle_model (respects scoped models); owner →
+   * next entry of the available list (owners have no cycle op).
+   * Returns the bare model id (legacy `{modelId}`) + the structured model.
+   */
+  async cycleModel(id: string): Promise<{ modelId: string | null; model: { provider: string; id: string; name: string } | null }> {
+    const session = await this.ensureRunning(id);
+    if (!session) throw new ModelNotFoundError('Session not found');
+    if (session.isProxy) {
+      const { models, current } = await this.fetchModels(session);
+      if (!models.length) return { modelId: null, model: null };
+      const idx = current ? models.findIndex((m) => m.provider === current.provider && m.id === current.id) : -1;
+      const next = models[(idx + 1) % models.length]!;
+      const m = await this.setModel(id, next.id, next.provider);
+      return { modelId: m.id, model: m };
+    }
+    let data: { model?: unknown } | null;
+    try {
+      data = await session.request<{ model?: unknown } | null>({ type: 'cycle_model' });
+    } catch (err) {
+      throw new ModelTransportError(`Model cycle failed: ${(err as Error).message}`);
+    }
+    const noted = data?.model ? session.noteModel(data.model) : null;
+    return noted ? { modelId: noted.id, model: { provider: noted.provider, id: noted.id, name: noted.name } } : { modelId: null, model: null };
   }
 
   /* ---------------- durable prompt queue ---------------- */
@@ -998,10 +1098,26 @@ export class SessionManager {
     });
   }
 
-  private async send(session: Session, item: QueueItem): Promise<void> {
-    this.options.log.info({ sessionId: session.id, itemId: item.id, attempt: item.attempts }, 'dispatching queued prompt');
+  /**
+   * Deliver a queue item's prompt to the active transport. `streamingBehavior`
+   * (CONTRACT §6/§10) threads straight to the owner `prompt`/`steer`/`enqueue`
+   * op and the RPC child's prompt op; omitted → the agent's busy-based default.
+   * When `steer` is set, a delivery failure keeps the item `queued` without
+   * consuming a retry attempt (§10) instead of the normal backoff/give-up.
+   * Returns true when the prompt was accepted.
+   */
+  private async send(
+    session: Session,
+    item: QueueItem,
+    opts: { streamingBehavior?: 'steer' | 'followUp'; steer?: boolean } = {},
+  ): Promise<boolean> {
+    this.options.log.info({ sessionId: session.id, itemId: item.id, attempt: item.attempts, steer: opts.steer ?? false }, 'dispatching queued prompt');
     try {
-      await session.request({ type: 'prompt', message: item.message }, 30_000);
+      await session.request({
+        type: 'prompt',
+        message: item.message,
+        ...(opts.streamingBehavior ? { streamingBehavior: opts.streamingBehavior } : {}),
+      }, 30_000);
       item.deliveredAt = Date.now();
       if (session.error?.startsWith('Queued message')) session.setError(null);
       // The run may already have ended before the acceptance reply arrived
@@ -1012,13 +1128,77 @@ export class SessionManager {
         this.persistQueue(session);
         this.broadcastQueue(session);
         setImmediate(() => this.dispatchQueued(session));
-        return;
+        return true;
       }
       this.persistQueue(session);
+      return true;
     } catch (err) {
       session.releasePrompt();
       session.cancelEcho(item.message);
-      this.failAttempt(session, item, err as Error);
+      if (opts.steer) {
+        // §10: a failed steer leaves the item queued, untouched by the normal
+        // retry/give-up ladder — undo markRunning's attempt bump so it is not
+        // pushed toward QUEUE_MAX_ATTEMPTS, and clear any backoff so the normal
+        // path can redeliver it as soon as the agent is idle.
+        item.status = 'queued';
+        item.startedAt = null;
+        item.attempts = Math.max(0, (item.attempts ?? 1) - 1);
+        item.error = (err as Error).message || String(err);
+        delete item.nextAttemptAt;
+        if (session.error?.startsWith('Queued message')) session.setError(null);
+        this.persistQueue(session);
+        this.broadcastQueue(session);
+      } else {
+        this.failAttempt(session, item, err as Error);
+      }
+      return false;
+    }
+  }
+
+  /**
+   * CONTRACT §10 — steer / send-now. Promote a `queued` durable item to
+   * immediate delivery with a streaming behavior (default "steer"), bypassing
+   * the busy gate. Brings up a transport if none; marks the item `running` via
+   * the existing markRunning (so its user-row echo reconciles the chip by
+   * clientMessageId exactly like a normal dispatch). Never reorders or
+   * dispatches any OTHER queued item. Returns a disposition for the route.
+   */
+  async steerQueueItem(
+    id: string,
+    itemId: string,
+    behavior: 'steer' | 'followUp' = 'steer',
+  ): Promise<'not_found' | 'session_live' | 'dispatched' | 'failed'> {
+    const found = await this.find(id);
+    if (!found) return 'not_found';
+    // Must currently be a `queued` item of THIS session (else 404).
+    if (!found.queue.some((i) => i.id === itemId && i.status === 'queued')) return 'not_found';
+
+    let session: Session;
+    try {
+      const live = await this.ensureRunning(id);
+      if (!live) return 'not_found';
+      session = live;
+    } catch (err) {
+      // Same ownership rule as send: another writer owns the file → 409.
+      if (err instanceof SessionLiveError || err instanceof LeaseHeldError) return 'session_live';
+      return 'failed'; // BusyError (capacity) / SpawnError / transport error → 502
+    }
+
+    // Re-resolve after the await: the normal path may have claimed it meanwhile.
+    const item = session.queue.find((i) => i.id === itemId && i.status === 'queued');
+    if (!item) return 'not_found';
+
+    // Mirror dispatchQueued's synchronous reserve: markRunning flips the status
+    // to `running` with NO await before it, so dispatchQueued's `queued` filter
+    // skips this item (no double-send). `dispatching` additionally blocks the
+    // normal path from dispatching any OTHER queued item while we steer.
+    session.dispatching = true;
+    this.markRunning(session, item);
+    try {
+      const ok = await this.send(session, item, { streamingBehavior: behavior, steer: true });
+      return ok ? 'dispatched' : 'failed';
+    } finally {
+      session.dispatching = false;
     }
   }
 

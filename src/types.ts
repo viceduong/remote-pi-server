@@ -111,6 +111,10 @@ export interface Activity {
   kind: ActivityKind;
   /** ms epoch when THIS kind/tool started. */
   since: number;
+  /** ms epoch when the CURRENT continuous busy period began (stable across sub-activity
+   *  transitions; set once idle→busy, cleared on idle). Lets clients show an elapsed timer
+   *  that is correct even when they connect mid-run. */
+  busySince: number;
   /** toolcall/tool: tool name (first running one). */
   tool?: string;
   /** tool: number of tools running in parallel (>= 1). */

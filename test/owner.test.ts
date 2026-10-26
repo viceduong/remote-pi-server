@@ -287,12 +287,17 @@ describe('owner proxy questionnaires (CONTRACT §8, owner protocol v5)', () => {
     const ipc = await start(() => undefined);
     await session.attachOwner(ipcLease(ipc));
     sockets[0]!.write(evLine(10, { type: 'agent_start' }));
+    await tick();
+    const busySince = session.statusFrame().activity!.busySince;
+    expect(busySince).toBeGreaterThan(0);
     sockets[0]!.write(evLine(11, { type: 'compaction_start', reason: 'threshold' }));
     await tick();
-    expect(session.statusFrame().activity).toMatchObject({ kind: 'compacting', reason: 'threshold' });
+    expect(session.statusFrame().activity).toMatchObject({ kind: 'compacting', reason: 'threshold', busySince });
+    // A live proxy's summary (runtime) carries the same activity object incl. busySince.
+    expect(session.runtime().activity).toMatchObject({ kind: 'compacting', busySince });
     sockets[0]!.write(evLine(12, { type: 'compaction_end', reason: 'threshold', aborted: false, willRetry: false }));
     await tick();
-    expect(session.statusFrame().activity).toMatchObject({ kind: 'waiting' });
+    expect(session.statusFrame().activity).toMatchObject({ kind: 'waiting', busySince }); // unchanged across the compaction
   });
 });
 
