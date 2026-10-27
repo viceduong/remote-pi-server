@@ -418,6 +418,8 @@ export class Session {
     if (this.pendingQuestion?.requestId === requestId) return; // replay (owner hello) — already known
     this.pendingQuestion = { requestId, questions };
     this.questionSince = Date.now();
+    this.log.info({ sessionId: this.id, requestId, owner: this.owner, sinks: this.sinks.size,
+      questions: Array.isArray(questions) ? questions.length : null }, 'question pending');
     this.syncBusyPeriod(); // a question can arrive while otherwise idle (begins a busy period)
     this.broadcast('agent_question', { requestId, questions });
     this.emitStatus();
@@ -427,6 +429,7 @@ export class Session {
   private resolveQuestion(requestId: string, emit = true): boolean {
     if (!this.pendingQuestion || this.pendingQuestion.requestId !== requestId) return false;
     this.pendingQuestion = null;
+    this.log.info({ sessionId: this.id, requestId }, 'question resolved');
     this.broadcast('agent_question_resolved', { requestId });
     if (emit) this.emitStatus();
     return true;
