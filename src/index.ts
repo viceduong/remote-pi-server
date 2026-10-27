@@ -7,6 +7,7 @@ import { logger } from './logger.js';
 import { SessionManager } from './manager.js';
 import { detectPiVersion } from './pi.js';
 import { registerRoutes } from './routes.js';
+import { parseRoots } from './workdir.js';
 import { rateLimitKey } from './ratelimit.js';
 
 async function main(): Promise<void> {
@@ -18,6 +19,7 @@ async function main(): Promise<void> {
   const manager = new SessionManager({
     sessionDir,
     workdir: config.REMOTE_PI_WORKDIR,
+    workdirRoots: parseRoots(config.REMOTE_PI_WORKDIR_ROOTS, config.REMOTE_PI_WORKDIR),
     bin: config.PI_BIN,
     maxAgents: config.REMOTE_PI_MAX_AGENTS,
     idleKillMs: config.REMOTE_PI_IDLE_KILL_MS,
@@ -71,6 +73,7 @@ async function main(): Promise<void> {
     pi: piVersion ?? 'NOT FOUND (check PI_BIN / PATH)',
     url: `http://${config.REMOTE_PI_HOST}:${config.REMOTE_PI_PORT}`,
     workdir: config.REMOTE_PI_WORKDIR,
+    workdirRoots: manager.workdirRoots.map((r) => r.path),
     sessions: sessionDir,
     maxAgents: config.REMOTE_PI_MAX_AGENTS,
     auth: config.REMOTE_PI_TOKEN ? 'Bearer token' : 'DISABLED (open LAN)',

@@ -28,6 +28,13 @@ describe('loadConfig', () => {
     expect(() => loadConfig({ REMOTE_PI_HOST: '0.0.0.0', REMOTE_PI_ALLOW_ANONYMOUS: '1' })).not.toThrow();
   });
 
+  it('REMOTE_PI_WORKDIR_ROOTS (§12): optional, entries must be absolute', () => {
+    expect(loadConfig({}).REMOTE_PI_WORKDIR_ROOTS).toBeUndefined();
+    const abs = process.platform === 'win32' ? 'D:\\;E:\\work' : '/srv;/home/u';
+    expect(loadConfig({ REMOTE_PI_WORKDIR_ROOTS: abs }).REMOTE_PI_WORKDIR_ROOTS).toBe(abs);
+    expect(() => loadConfig({ REMOTE_PI_WORKDIR_ROOTS: 'relative/dir' })).toThrow(/must be absolute/);
+  });
+
   it('fails fast on invalid values', () => {
     expect(() => loadConfig({ REMOTE_PI_PORT: 'not-a-number' })).toThrow(/Invalid configuration/);
     expect(() => loadConfig({ REMOTE_PI_MAX_AGENTS: '99' })).toThrow(/Invalid configuration/);

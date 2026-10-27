@@ -12,6 +12,7 @@ import { isVisibleMessage } from './visibility.js';
 import { isActive } from './queue.js';
 import type { Env } from './config.js';
 import type { ServerConfig } from './types.js';
+import { listDir, rootPaths, WorkdirError } from './workdir.js';
 
 /* ---------------- request schemas (zod on every body/query) ---------------- */
 
@@ -24,7 +25,12 @@ const CreateSessionSchema = z.object({
   name: z.string().max(80).optional(),
   /** Idempotency key: a repeat within 10 min returns the same session. */
   clientRequestId: IDEMPOTENCY_KEY.optional(),
+  /** CONTRACT §12: absolute dir inside the configured roots (validated by workdir.ts → 403/404/400). */
+  workdir: z.string().min(1).max(4096).optional(),
+  /** §12: `mkdir -p` a missing workdir (default false). */
+  createDir: z.boolean().optional(),
 });
+const DirsQuery = z.object({ path: z.string().min(1).max(4096).optional() });
 
 const TurnSchema = z.object({
   message: z.string().min(1).max(50_000),
@@ -84,6 +90,9 @@ function parse<T extends z.ZodTypeAny>(schema: T, value: unknown, reply: Reply, 
 /** One mapping from domain errors to HTTP (shape: `{error, code?}`). */
 function sendError(reply: Reply, err: unknown): Reply {
   const e = err as Error;
+  if (err instanceof WorkdirError) {
+    return reply.code(err.status).send({ error: e.message, code: err.apiCode, ...(err.roots ? { roots: err.roots } : {}) });
+  }
   if (err instanceof BusyError) return reply.code(503).send({ error: e.message, code: 'busy' });
   if (err instanceof SessionLiveError || err instanceof LeaseHeldError) {
     return reply.code(409).send({ error: e.message, code: 'session_live' });
@@ -148,10 +157,33 @@ export function registerRoutes(
     const body = parse(CreateSessionSchema, req.body ?? {}, reply, 'body');
     if (!body) return;
     try {
-      const session = await manager.create(body.name ?? '', body.clientRequestId);
+      const session = await manager.create(body.name ?? '', body.clientRequestId, {
+        workdir: body.workdir,
+        createDir: body.createDir,
+      });
       return reply.code(201).send({ session: await manager.summaryOf(session) });
     } catch (err) {
       return sendError(reply, err);
+    }
+  });
+
+  // CONTRACT §12: directory picker. No `path` → roots/recent/default; with
+  // `path` → one level of subdirectories (403 outside the roots).
+  fastify.get('/api/dirs', async (req, reply) => {
+    const q = parse(DirsQuery, req.query, reply, 'query');
+    if (!q) return;
+    if (q.path === undefined) {
+      return {
+        roots: rootPaths(manager.workdirRoots),
+        recent: await manager.recentWorkdirs(20),
+        default: manager.defaultWorkdir,
+      };
+    }
+    try {
+      return listDir(q.path, manager.workdirRoots);
+    } catch (err) {
+      if (err instanceof WorkdirError) return sendError(reply, err);
+      throw err;
     }
   });
 

@@ -5,6 +5,7 @@ import type { Logger } from 'pino';
 import { LeaseHeldError, Session, type EventSink } from './session.js';
 import { mapAgentMessage } from './history.js';
 import { manglePath } from './paths.js';
+import { isInside, parseRoots, prepareWorkdir, type WorkdirRoot } from './workdir.js';
 import {
   gcLeases,
   inspectLease,
@@ -37,6 +38,8 @@ import type { AgentMessage, AgentState, ChatMessage, LiveInstance, SessionOwner,
 export interface SessionManagerOptions {
   sessionDir: string;
   workdir: string;
+  /** CONTRACT §12 roots for client-chosen workdirs (default: [workdir]). */
+  workdirRoots?: WorkdirRoot[];
   bin: string;
   maxAgents: number;
   idleKillMs: number;
@@ -86,6 +89,21 @@ export class AmbiguousModelError extends Error {
 /** §11: the transport could not serve the model op (502). */
 export class ModelTransportError extends Error {
   readonly code = 502;
+}
+
+/** POST /api/sessions §12 options. */
+export interface CreateOptions {
+  /** Absolute directory inside the configured roots; absent = server default. */
+  workdir?: string | undefined;
+  /** `mkdir -p` a missing `workdir` (default false → 404 workdir_missing). */
+  createDir?: boolean | undefined;
+}
+
+/** GET /api/dirs `recent` row. */
+export interface RecentWorkdir {
+  path: string;
+  lastUsedAt: number;
+  sessions: number;
 }
 
 /** Lease-derived ownership of a session file. `unknown` = treat as owned. */
@@ -146,9 +164,12 @@ export class SessionManager {
   /** Last time a bridge transport for a file ended (unowned-writer heuristic). */
   private readonly lastBridgeExit = new Map<string, number>();
   readonly files: SessionFileCache;
+  /** CONTRACT §12 allowed roots for client-chosen working directories. */
+  readonly workdirRoots: WorkdirRoot[];
 
   constructor(options: SessionManagerOptions) {
     this.options = options;
+    this.workdirRoots = options.workdirRoots?.length ? options.workdirRoots : parseRoots(undefined, options.workdir);
     fs.mkdirSync(options.sessionDir, { recursive: true });
     this.files = new SessionFileCache({ onAsyncUpdate: () => this.invalidateIndex() });
     if (!options.noTimers) {
@@ -188,9 +209,14 @@ export class SessionManager {
     return crypto.randomUUID().replace(/-/g, '').slice(0, 16);
   }
 
+  /** Server default working directory (REMOTE_PI_WORKDIR). */
+  get defaultWorkdir(): string {
+    return this.options.workdir;
+  }
+
   /** App-created sessions live inside the mangled workdir dir — where pi itself stores them. */
-  sessionFile(id: string): string {
-    return path.join(this.options.sessionDir, manglePath(this.options.workdir), `${id}.jsonl`);
+  sessionFile(id: string, workdir: string = this.options.workdir): string {
+    return path.join(this.options.sessionDir, manglePath(workdir), `${id}.jsonl`);
   }
 
   /* ---------------- discovery ---------------- */
@@ -486,7 +512,7 @@ export class SessionManager {
     this.sessions.set(piId, session);
     session.newEpoch();
     try {
-      const placeholder = this.sessionFile(key);
+      const placeholder = this.sessionFile(key, session.workdir);
       if (path.resolve(placeholder) !== path.resolve(session.file) && fs.existsSync(placeholder)
           && fs.statSync(placeholder).size === 0) {
         fs.unlinkSync(placeholder);
@@ -536,19 +562,26 @@ export class SessionManager {
    * Create a session. `clientRequestId` makes it idempotent: a repeat within
    * 10 min returns the same session (lost HTTP response retries).
    */
-  create(name: string, clientRequestId?: string): Promise<Session> {
-    return this.idempotent(clientRequestId ? `create:${clientRequestId}` : undefined, () => this.createUnlocked(name));
+  create(name: string, clientRequestId?: string, opts: CreateOptions = {}): Promise<Session> {
+    return this.idempotent(clientRequestId ? `create:${clientRequestId}` : undefined, async () => {
+      // §12: validated (and mkdir -p'd) inside the idempotent body — a retried
+      // clientRequestId never re-validates, re-creates the dir or spawns twice.
+      const workdir = opts.workdir === undefined
+        ? this.options.workdir
+        : prepareWorkdir(opts.workdir, this.workdirRoots, opts.createDir === true);
+      return this.createUnlocked(name, workdir);
+    });
   }
 
-  private async createUnlocked(name: string): Promise<Session> {
+  private async createUnlocked(name: string, workdir: string): Promise<Session> {
     if (!this.ensureAgentSlot()) throw new BusyError(this.options.maxAgents);
     const id = this.nextId();
     const session = new Session(
       id,
       name,
-      this.sessionFile(id),
+      this.sessionFile(id, workdir),
       this.options.bin,
-      this.options.workdir,
+      workdir,
       this.options.sessionDir,
       this.options.extraArgs,
       this.options.log,
@@ -811,6 +844,32 @@ export class SessionManager {
   async summaryOf(session: Session): Promise<SessionSummary> {
     const meta = (await this.getIndex()).get(session.id) ?? null;
     return this.summarize(meta, session, await this.leaseFor(meta, session));
+  }
+
+  /**
+   * §12 `recent`: distinct session cwds inside the roots, most recent first —
+   * straight from the session index (no extra disk scan).
+   */
+  async recentWorkdirs(limit = 20): Promise<RecentWorkdir[]> {
+    const win = process.platform === 'win32';
+    const groups = new Map<string, RecentWorkdir>();
+    for (const meta of (await this.getIndex()).values()) {
+      if (!meta.workdir || !path.isAbsolute(meta.workdir)) continue;
+      const dir = path.resolve(meta.workdir);
+      if (!this.workdirRoots.some((r) => isInside(dir, r.path) || isInside(dir, r.real))) continue;
+      const k = win ? dir.toLowerCase() : dir;
+      const used = Math.round(Math.max(meta.lastMessageAt ?? 0, meta.lastActivityAt));
+      const g = groups.get(k);
+      if (!g) groups.set(k, { path: dir, lastUsedAt: used, sessions: 1 });
+      else {
+        g.sessions++;
+        if (used > g.lastUsedAt) {
+          g.lastUsedAt = used;
+          g.path = dir; // spelling of the most recent use
+        }
+      }
+    }
+    return [...groups.values()].sort((a, b) => b.lastUsedAt - a.lastUsedAt).slice(0, limit);
   }
 
   /** /api/status `liveInstances`: host TUIs holding leases. */

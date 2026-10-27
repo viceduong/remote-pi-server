@@ -14,6 +14,8 @@ const EnvSchema = z.object({
   REMOTE_PI_ALLOW_ANONYMOUS: z.string().default('0').transform((v) => v === '1' || v.toLowerCase() === 'true'),
   REMOTE_PI_NAME: z.string().min(1).optional(),
   REMOTE_PI_WORKDIR: z.string().min(1).default(process.cwd()),
+  /** CONTRACT §12: `;`-separated absolute roots a client may pick/create a session workdir in. Default = REMOTE_PI_WORKDIR. */
+  REMOTE_PI_WORKDIR_ROOTS: z.string().optional(),
   REMOTE_PI_SESSION_DIR: z.string().min(1).optional(),
   REMOTE_PI_MAX_AGENTS: z.coerce.number().int().min(1).max(16).default(6),
   REMOTE_PI_IDLE_KILL_MS: z.coerce.number().int().min(60_000).default(45 * 60_000),
@@ -37,6 +39,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Env {
     || config.REMOTE_PI_HOST === '::1';
   if (config.REMOTE_PI_TOKEN === 'CHANGE_ME') {
     throw new Error('REMOTE_PI_TOKEN must be replaced; refusing placeholder secret');
+  }
+  for (const root of (config.REMOTE_PI_WORKDIR_ROOTS ?? '').split(';').map((s) => s.trim()).filter(Boolean)) {
+    if (!path.isAbsolute(root)) throw new Error(`REMOTE_PI_WORKDIR_ROOTS entries must be absolute paths: ${root}`);
   }
   if (!loopback && !config.REMOTE_PI_TOKEN && !config.REMOTE_PI_ALLOW_ANONYMOUS) {
     throw new Error('REMOTE_PI_TOKEN is required when REMOTE_PI_HOST is not loopback');
