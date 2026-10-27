@@ -120,8 +120,6 @@ describe('§10 steer / send-now — manager.steerQueueItem', () => {
 
     const a = manager.enqueuePrompt(session, 'steer me', 'cm-a');
     const b = manager.enqueuePrompt(session, 'leave me', 'cm-b');
-    manager.dispatchQueuedNow(session); // busy → nothing dispatches
-    await tick();
     expect(manager.pendingItems(session).map((i) => i.status)).toEqual(['queued', 'queued']);
 
     const result = await manager.steerQueueItem(ID, a.id);
@@ -153,6 +151,38 @@ describe('§10 steer / send-now — manager.steerQueueItem', () => {
     expect(a.status).toBe('running');
     // Already running → no longer a `queued` item → 404.
     expect(await manager.steerQueueItem(ID, a.id)).toBe('not_found');
+    manager.stopAll();
+  });
+
+  it('while a turn runs, queued prompts are steered in right away, oldest first (host Enter)', async () => {
+    const manager = makeManager();
+    await attachedBusySession(manager);
+    const session = (await manager.find(ID))!;
+    const a = manager.enqueuePrompt(session, 'first', 'cm-1');
+    const b = manager.enqueuePrompt(session, 'second', 'cm-2');
+    manager.dispatchQueuedNow(session);
+    await tick(120);
+    const steers = owner!.received.filter((m) => m.op === 'steer').map((m) => m.message);
+    expect(steers).toEqual(['first', 'second']);
+    expect([a.status, b.status]).toEqual(['running', 'running']);
+    expect(owner!.received.some((m) => m.op === 'abort')).toBe(false); // never interrupts
+    manager.stopAll();
+  });
+
+  it('a rejected steer leaves the item queued without a tight retry loop', async () => {
+    const manager = makeManager();
+    owner = await fakeOwner(false); // rejects prompt/steer
+    const file = writeSession(ID);
+    acquireLease(file, 'nonce', owner.ipc, Date.now(), { kind: 'tui' });
+    await manager.ensureRunning(ID);
+    owner.sockets[0]!.write(evLine(1, 'agent_start'));
+    await tick();
+    const session = (await manager.find(ID))!;
+    const a = manager.enqueuePrompt(session, 'nope', 'cm-nope');
+    manager.dispatchQueuedNow(session);
+    await tick(300);
+    expect(a.status).toBe('queued');
+    expect(owner!.received.filter((m) => m.op === 'steer')).toHaveLength(1); // backed off, not spinning
     manager.stopAll();
   });
 

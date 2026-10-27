@@ -1094,7 +1094,6 @@ export class SessionManager {
   /** Dispatch the next ready queued prompt when the agent can take it. */
   private dispatchQueued(session: Session): void {
     if (session.dispatching || this.shuttingDown) return;
-    if (session.queue.some((i) => i.status === 'running')) return; // one at a time
     const queued = session.queue.filter((i) => i.status === 'queued');
     if (!queued.length) return;
     const now = Date.now();
@@ -1103,7 +1102,15 @@ export class SessionManager {
       this.scheduleDispatch(session, Math.min(...queued.map((i) => i.nextAttemptAt ?? now)) - now);
       return;
     }
-    if (session.isBusy) return; // onIdle re-triggers
+    // A turn is running: deliver queued prompts as STEERING right away (the
+    // host's Enter-while-streaming) — pi injects each after the current tool
+    // call instead of the message waiting for the whole turn to end.
+    if (session.busy && session.running && !session.promptPending) {
+      this.steerQueued(session);
+      return;
+    }
+    if (session.isBusy) return; // prompt in flight / starting — onIdle re-triggers
+    if (session.queue.some((i) => i.status === 'running')) return; // one at a time
     if (session.running) {
       // Transport is up: mark running SYNCHRONOUSLY so the turn response can
       // report `dispatched: true` (no queued chip for an immediate send).
@@ -1118,6 +1125,33 @@ export class SessionManager {
     session.dispatching = true;
     void this.startAndDeliver(session, ready).finally(() => {
       session.dispatching = false;
+    });
+  }
+
+  /**
+   * Deliver every ready `queued` item, oldest first, as a steer into the
+   * running turn. Each is marked `running` (its user-row echo reconciles the
+   * chip; the turn's end settles it `done`). A failed steer leaves that item
+   * `queued` (no attempt consumed) and stops the batch so order is kept.
+   */
+  private steerQueued(session: Session): void {
+    session.dispatching = true;
+    let failed = false;
+    void (async () => {
+      for (const item of session.queue) {
+        if (item.status !== 'queued' || (item.nextAttemptAt ?? 0) > Date.now()) continue;
+        if (!session.busy || !session.running) break; // turn ended — the idle path takes over
+        this.markRunning(session, item);
+        const ok = await this.send(session, item, { streamingBehavior: 'steer', steer: true });
+        if (!ok) { failed = true; break; }
+      }
+    })().finally(() => {
+      session.dispatching = false;
+      if (!session.queue.some((i) => i.status === 'queued')) return;
+      // Items queued meanwhile / a turn that ended mid-batch: go again now.
+      // After a failed steer back off (never a tight retry loop).
+      if (failed) this.scheduleDispatch(session, 5_000);
+      else setImmediate(() => this.dispatchQueued(session));
     });
   }
 
@@ -1353,6 +1387,9 @@ export class SessionManager {
     session.onIdle = () => {
       this.completeRunning(session);
       this.dispatchQueued(session);
+    };
+    session.onBusy = () => {
+      if (session.queue.some((i) => i.status === 'queued')) this.dispatchQueued(session);
     };
     session.onExit = () => {
       this.lastBridgeExit.set(path.resolve(session.file), Date.now());

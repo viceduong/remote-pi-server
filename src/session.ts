@@ -223,6 +223,8 @@ export class Session {
   queueTimer: NodeJS.Timeout | null = null;
   /** Called when a run settles and the agent is ready for the next prompt. */
   onIdle: (() => void) | null = null;
+  /** Called when a turn starts (queued prompts may be steered into it). */
+  onBusy: (() => void) | null = null;
   /** Called whenever the active transport goes away. */
   onExit: (() => void) | null = null;
   /** Called when our bridge lease was taken by someone else (TUI pre-emption). */
@@ -283,6 +285,11 @@ export class Session {
   private restartTimer: NodeJS.Timeout | null = null;
   private crashTimes: number[] = [];
   private promptReserved = false;
+
+  /** A prompt was sent but its turn has not started yet. */
+  get promptPending(): boolean {
+    return this.promptReserved;
+  }
   private pendingEcho: PendingEcho[] = [];
   /** Pass --name on the next spawn (set for brand-new sessions only). */
   passNameOnce = false;
@@ -803,6 +810,8 @@ export class Session {
         this.phase = 'streaming';
         this.error = null;
         this.promptReserved = false;
+        // Prompts queued while this turn was starting can be steered in now.
+        if (this.onBusy) queueMicrotask(() => this.onBusy?.());
         if (this.runningTools.size === 0) this.setRun('waiting');
         dirty = true;
         break;
