@@ -29,7 +29,8 @@ interface FakeOwner {
  * Minimal owner stand-in. `acceptPrompt=false` makes it reject the
  * prompt/steer/enqueue op (reproduces an owner rejecting a steer → 502).
  */
-async function fakeOwner(acceptPrompt = true): Promise<FakeOwner> {
+async function fakeOwner(acceptPrompt = true, settleOnAbort = true): Promise<FakeOwner> {
+  let seq = 100;
   const ipc = pipePath();
   const received: Record<string, unknown>[] = [];
   const sockets: net.Socket[] = [];
@@ -47,6 +48,16 @@ async function fakeOwner(acceptPrompt = true): Promise<FakeOwner> {
           socket.write(`${JSON.stringify({ type: 'response', id: 'hello', success: true, data: { eventSeq: 0, isStreaming: false } })}\n`);
         } else if (msg.op === 'get_state') {
           socket.write(`${JSON.stringify({ type: 'response', id: msg.id, success: true, data: { isStreaming: false } })}\n`);
+        } else if (msg.op === 'abort') {
+          socket.write(`${JSON.stringify({ type: 'response', id: msg.id, success: true, data: {} })}
+`);
+          // Like pi: an interrupted turn ends and settles shortly after.
+          if (settleOnAbort) {
+            setTimeout(() => {
+              socket.write(evLine(++seq, 'agent_end'));
+              socket.write(evLine(++seq, 'agent_settled'));
+            }, 30);
+          }
         } else if ((msg.op === 'steer' || msg.op === 'enqueue' || msg.op === 'prompt') && !acceptPrompt) {
           socket.write(`${JSON.stringify({ type: 'response', id: msg.id, success: false, error: 'owner refused the steer' })}\n`);
         } else {
@@ -102,7 +113,7 @@ describe('§10 steer / send-now — manager.steerQueueItem', () => {
     expect(s!.isBusy).toBe(true);
   }
 
-  it('promotes a queued item mid-turn: delivered as steer, marked running, other items untouched', async () => {
+  it('send-now interrupts the turn, then delivers the item as a FRESH prompt; other items untouched', async () => {
     const manager = makeManager();
     await attachedBusySession(manager);
     const session = (await manager.find(ID))!;
@@ -117,9 +128,13 @@ describe('§10 steer / send-now — manager.steerQueueItem', () => {
     await tick();
     expect(result).toBe('dispatched');
 
-    // The promoted item went out as a `steer` owner op, carrying its message.
-    const steer = owner!.received.find((m) => m.op === 'steer');
-    expect(steer).toMatchObject({ op: 'steer', message: 'steer me' });
+    // Like the host's Alt+Enter: abort first, then a plain prompt (no steer).
+    const ops = owner!.received.map((m) => m.op);
+    const abortAt = ops.indexOf('abort');
+    const promptAt = owner!.received.findIndex((m) => m.op === 'prompt' && m.message === 'steer me');
+    expect(abortAt).toBeGreaterThanOrEqual(0);
+    expect(promptAt).toBeGreaterThan(abortAt);
+    expect(owner!.received.some((m) => m.op === 'steer')).toBe(false);
     // Only the promoted item moved; the other is still queued and never sent.
     expect(a.status).toBe('running');
     expect(b.status).toBe('queued');
@@ -140,6 +155,21 @@ describe('§10 steer / send-now — manager.steerQueueItem', () => {
     expect(await manager.steerQueueItem(ID, a.id)).toBe('not_found');
     manager.stopAll();
   });
+
+  it('falls back to a steer when the interrupted turn does not settle in time', async () => {
+    const manager = makeManager();
+    owner = await fakeOwner(true, false); // abort acknowledged, turn never settles
+    const file = writeSession(ID);
+    acquireLease(file, 'nonce', owner.ipc, Date.now(), { kind: 'tui' });
+    await manager.ensureRunning(ID);
+    owner.sockets[0]!.write(evLine(1, 'agent_start'));
+    await tick();
+    const session = (await manager.find(ID))!;
+    const a = manager.enqueuePrompt(session, 'late', 'cm-late');
+    expect(await manager.steerQueueItem(ID, a.id)).toBe('dispatched');
+    expect(owner!.received.find((m) => m.op === 'steer')).toMatchObject({ message: 'late' });
+    manager.stopAll();
+  }, 15_000);
 
   it('502 (failed) when the owner rejects the steer — item stays queued, attempt not consumed', async () => {
     const manager = makeManager();
@@ -181,7 +211,7 @@ describe('§10 steer / send-now — HTTP routes', () => {
 
   afterEach(async () => { manager?.stopAll(); await app?.close(); });
 
-  it('POST /queue/:itemId/steer dispatches the queued item as a steer owner op', async () => {
+  it('POST /queue/:itemId/steer interrupts and sends the queued item now', async () => {
     owner = await fakeOwner();
     const file = writeSession(ID);
     acquireLease(file, 'nonce', owner.ipc, Date.now(), { kind: 'tui' });
@@ -195,7 +225,8 @@ describe('§10 steer / send-now — HTTP routes', () => {
     await tick();
     expect(res.statusCode).toBe(200);
     expect(res.json()).toEqual({ ok: true, dispatched: true });
-    expect(owner.received.find((m) => m.op === 'steer')).toMatchObject({ message: 'promote me' });
+    expect(owner.received.some((m) => m.op === 'abort')).toBe(true);
+    expect(owner.received.find((m) => m.op === 'prompt' && m.message === 'promote me')).toBeTruthy();
 
     // Absent item → 404.
     const miss = await app.inject({ method: 'POST', url: `/api/sessions/${ID}/queue/nope/steer`, headers: auth });

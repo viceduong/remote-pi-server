@@ -527,8 +527,22 @@ export function registerRoutes(
       status: item.status,
       queuedAt: item.queuedAt,
     }));
+    // CONTRACT §3: user rows the queue delivered carry the sender's
+    // clientMessageId (matched by the echo timestamp recorded at delivery), so
+    // clients reconcile their chips by id instead of by text.
+    const cidByTs = new Map<number, string>();
+    for (const item of session.queue) {
+      if (item.clientMessageId && typeof item.messageTimestamp === 'number') {
+        cidByTs.set(item.messageTimestamp, item.clientMessageId);
+      }
+    }
+    const withIds = <T extends { role?: string; timestamp?: number | null }>(rows: T[]): T[] =>
+      cidByTs.size === 0 ? rows : rows.map((m) => {
+        const cid = m.role === 'user' && typeof m.timestamp === 'number' ? cidByTs.get(m.timestamp) : undefined;
+        return cid ? { ...m, clientMessageId: cid } : m;
+      });
     try {
-      const all = await manager.history(session);
+      const all = withIds(await manager.history(session));
       const pool = q.visible ? all.filter(isVisibleMessage) : all;
       if (q.since) {
         // Durable cursor: only rows strictly after the entry id the client saw.

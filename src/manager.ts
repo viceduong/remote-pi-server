@@ -125,6 +125,8 @@ interface SessionFileMeta {
 }
 
 const ACTIVE_WINDOW_MS = 5 * 60_000;
+/** Send-now: how long to wait for an interrupted turn to settle before falling back to steer. */
+const SEND_NOW_SETTLE_MS = 5_000;
 const WRITING_WINDOW_MS = 30_000;
 const INDEX_TTL_MS = 5_000;
 /** Serve a stale walk while refreshing in the background, up to this age. */
@@ -1252,9 +1254,24 @@ export class SessionManager {
     // skips this item (no double-send). `dispatching` additionally blocks the
     // normal path from dispatching any OTHER queued item while we steer.
     session.dispatching = true;
-    this.markRunning(session, item);
     try {
-      const ok = await this.send(session, item, { streamingBehavior: behavior, steer: true });
+      // "Send now" = the host's Alt+Enter: interrupt the running turn (work so
+      // far is kept), wait for it to settle, then deliver as a FRESH prompt.
+      // Only if the abort does not settle in time fall back to steering, which
+      // pi injects once the current tool finishes. `dispatching` (set above)
+      // keeps the normal path from dispatching anything while we wait.
+      let streamingBehavior: 'steer' | 'followUp' | undefined = behavior;
+      if (behavior === 'steer' && session.isBusy) {
+        await session.abort();
+        const deadline = Date.now() + SEND_NOW_SETTLE_MS;
+        while (session.isBusy && session.running && Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 50));
+        }
+        if (!session.isBusy && session.reservePrompt()) streamingBehavior = undefined;
+      }
+      if (item.status !== 'queued') return 'not_found'; // cancelled while interrupting
+      this.markRunning(session, item);
+      const ok = await this.send(session, item, { ...(streamingBehavior ? { streamingBehavior } : {}), steer: true });
       return ok ? 'dispatched' : 'failed';
     } finally {
       session.dispatching = false;
