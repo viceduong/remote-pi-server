@@ -77,6 +77,8 @@ export interface AgentState {
 export interface ChatMessage {
   /** pi entry id ("m…") — used for forking from a message. */
   id?: string | null;
+  /** CONTRACT-V2 §13: transcript identity (`<role>:<ts>` / `tool:<toolCallId>`, `#n` on collisions). */
+  key?: string;
   role: 'user' | 'assistant' | 'tool';
   text: string;
   thinking: string | null;

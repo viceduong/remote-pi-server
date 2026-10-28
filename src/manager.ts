@@ -4,6 +4,7 @@ import crypto from 'node:crypto';
 import type { Logger } from 'pino';
 import { LeaseHeldError, Session, type EventSink } from './session.js';
 import { mapAgentMessage } from './history.js';
+import { KeyCounter } from './keys.js';
 import { manglePath } from './paths.js';
 import { isInside, parseRoots, prepareWorkdir, type WorkdirRoot } from './workdir.js';
 import {
@@ -406,6 +407,8 @@ export class SessionManager {
 
   private register(session: Session): void {
     this.sessions.set(session.id, session);
+    // CONTRACT-V2 §13: live keys + tailer are seeded from the same file cache as /messages.
+    session.keySource = (file) => this.files.keySnapshot(file);
     this.wireQueue(session);
     session.onFenced = () => this.handleFenced(session);
   }
@@ -1479,7 +1482,15 @@ export class SessionManager {
     if (messages.length === 0 && session.hasChild) {
       try {
         const data = await session.request<{ messages?: AgentMessage[] }>({ type: 'get_messages' }, 15_000);
-        messages = (data.messages ?? []).map(mapAgentMessage).filter((m): m is ChatMessage => m !== null);
+        // §13: same file-order key assignment as the JSONL mapping.
+        const counter = new KeyCounter();
+        messages = (data.messages ?? []).flatMap((raw) => {
+          const key = counter.assign(raw);
+          const m = mapAgentMessage(raw);
+          if (!m) return [];
+          if (key) m.key = key;
+          return [m];
+        });
       } catch { /* agent busy/booting — empty */ }
     }
     return this.decorateEchoes(session, messages);
@@ -1558,6 +1569,7 @@ export class SessionManager {
       this.options.log.child({ fork: true }),
       'app',
     );
+    child.keySource = (file) => this.files.keySnapshot(file);
     try {
       await child.start({ noLease: true, passName: false });
       this.throwIfDead(child);

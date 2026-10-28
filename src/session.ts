@@ -14,11 +14,14 @@ import {
 } from './lease.js';
 import { LineSplitter, contentText } from './jsonl.js';
 import { FileTailer, type TailBatch } from './tailer.js';
+import { LiveKeyTracker, type KeySnapshot } from './keys.js';
+import { canonicalText } from './history.js';
 import { ASK_USER_QUESTION_TOOL, qaFromToolResult } from './qa.js';
 import { modelString, normalizeModel, type ModelEntry } from './models.js';
 import type {
   Activity,
   ActivityKind,
+  AgentMessage,
   AgentState,
   AgentStatusFrame,
   RpcEvent,
@@ -42,6 +45,19 @@ const MAX_RPC_LINE_BYTES = 16 * 1024 * 1024;
 const CRASH_WINDOW_MS = 2 * 60_000;
 const CRASH_LIMIT = 5;
 const CRASH_BACKOFF_CAP_MS = 16_000;
+/** CONTRACT-V2 §13: in-progress assistant text kept for snapshots (UTF-16 units). */
+export const IN_PROGRESS_TEXT_CAP = 1024 * 1024;
+/** Live events are held at most this long while the key seed is read. */
+const KEY_SEED_TIMEOUT_MS = 10_000;
+
+/** Current size of a file (0 when missing) — the attach point of a key window. */
+function fileSize(file: string): number {
+  try {
+    return fs.statSync(file).size;
+  } catch {
+    return 0;
+  }
+}
 
 /** Markers the ask_user_question extension uses when it must fall back to
  *  select() (pi's RPC UI adapter has no custom components). */
@@ -255,6 +271,19 @@ export class Session {
   private questionSince = 0;
   private busySince = 0;
   private reservedSince = 0;
+
+  /* CONTRACT-V2 §13 transcript identity */
+  /** Key state source for the session file (the manager wires its file cache; null = no seed). */
+  keySource: ((file: string) => Promise<KeySnapshot>) | null = null;
+  private readonly keys = new LiveKeyTracker();
+  /** Transport events held while the key seed is being read (null = not seeding). */
+  private keyGate: RpcEvent[] | null = null;
+  private keySeedGen = 0;
+  private keySeedDone: Promise<void> = Promise.resolve();
+  /** File size when the owner proxy detached (replay window start on re-attach). */
+  private ownerDetachSize: number | null = null;
+  /** The in-progress assistant message (streamed text so far, capped). */
+  private streamingMsg: { key: string; timestamp: number | null; text: string; length: number } | null = null;
 
   /* SSE stream identity */
   epoch = nextStreamEpoch();
@@ -595,7 +624,9 @@ export class Session {
     if (this.sinks.size === 0 || this.running) return;
     if (this.tailer && this.tailer.file === this.file && this.tailer.running) return;
     this.stopTailer();
-    this.tailer = new FileTailer(this.file, (batch) => this.onTailBatch(batch));
+    // §13: the tailer keys rows in file order, seeded from the same key state as history.
+    const src = this.keySource;
+    this.tailer = new FileTailer(this.file, (batch) => this.onTailBatch(batch), 250, src);
     this.tailer.start();
   }
 
@@ -679,6 +710,7 @@ export class Session {
     try {
       await this.request({ type: 'abort' }, 15_000);
       this.clearQuestion(false);
+      this.clearStreamingIdentity(false); // §13: abort settled — no message in progress
       this.emitStatus(true);
       return true;
     } catch (err) {
@@ -766,7 +798,114 @@ export class Session {
     if (!this.run) this.setRun('waiting');
   }
 
+  /* ---------------- CONTRACT-V2 §13: transcript identity ---------------- */
+
+  /**
+   * (Re)seed live key assignment from the session file. Rows that ended after
+   * `windowStart` (the transport's attach point) are claimable by identical
+   * live messages instead of being counted twice (see keys.ts). Transport
+   * events are held until the seed is in, so no key is handed out early.
+   * Resolves once seeded (tests await it).
+   */
+  seedKeys(windowStart = fileSize(this.file)): Promise<void> {
+    const gen = ++this.keySeedGen;
+    const src = this.keySource;
+    if (!src) {
+      this.keys.seed(null, windowStart);
+      this.releaseKeyGate();
+      this.keySeedDone = Promise.resolve();
+      return this.keySeedDone;
+    }
+    if (!this.keyGate) this.keyGate = [];
+    const file = this.file;
+    let timer: NodeJS.Timeout | null = null;
+    const timeout = new Promise<null>((resolve) => {
+      timer = setTimeout(() => resolve(null), KEY_SEED_TIMEOUT_MS);
+      timer.unref?.();
+    });
+    this.keySeedDone = Promise.race([src(file).catch(() => null), timeout]).then((snap) => {
+      if (timer) clearTimeout(timer);
+      if (gen !== this.keySeedGen) return; // superseded by a newer seed
+      if (snap) this.keys.seed(snap, windowStart);
+      else this.log.warn({ sessionId: this.id }, 'message key seed unavailable — keeping previous counts');
+      this.releaseKeyGate();
+    });
+    return this.keySeedDone;
+  }
+
+  private releaseKeyGate(): void {
+    const held = this.keyGate;
+    this.keyGate = null;
+    if (!held) return;
+    for (let i = 0; i < held.length; i++) {
+      if (this.keyGate) {
+        // A newer seed started while draining: the rest waits for it (order kept).
+        (this.keyGate as RpcEvent[]).push(...held.slice(i));
+        return;
+      }
+      this.handleEvent(held[i]!);
+    }
+  }
+
+  /** The in-progress assistant message (null when none) — sent as `message_snapshot`. */
+  get inProgress(): { key: string; timestamp: number | null; text: string } | null {
+    const s = this.streamingMsg;
+    return s ? { key: s.key, timestamp: s.timestamp, text: s.text } : null;
+  }
+
+  /** Transport gone / run settled: nothing is open or in progress any more. */
+  private clearStreamingIdentity(detach: boolean): void {
+    this.streamingMsg = null;
+    if (detach) this.keys.detach();
+  }
+
+  /**
+   * Attach `key` (+ `offset` on text_delta, + canonical `text` on message_end /
+   * done|error updates that carry the message) and maintain the in-progress
+   * message. `obj` is the raw event, `wire` its trimmed wire copy.
+   */
+  private stampIdentity(obj: RpcEvent, wire: RpcEvent): RpcEvent {
+    if (obj.type === 'message_start') {
+      const msg = obj.message as AgentMessage | undefined;
+      const key = this.keys.start(msg);
+      if (key && msg?.role === 'assistant') {
+        this.streamingMsg = { key, timestamp: typeof msg.timestamp === 'number' ? msg.timestamp : null, text: '', length: 0 };
+      }
+      return { ...wire, key };
+    }
+    if (obj.type === 'message_end') {
+      const msg = obj.message as AgentMessage | undefined;
+      const key = this.keys.end(msg);
+      if (this.streamingMsg && this.streamingMsg.key === key) this.streamingMsg = null;
+      return { ...wire, key, text: canonicalText(msg) };
+    }
+    if (obj.type !== 'message_update') return wire;
+    const key = this.keys.current;
+    const out: RpcEvent = { ...wire, key };
+    const ev = wire.assistantMessageEvent as Record<string, unknown> | undefined;
+    const t = typeof ev?.type === 'string' ? ev.type : '';
+    if (t === 'text_delta' && key !== null) {
+      const s = this.streamingMsg;
+      if (s && s.key === key) {
+        const delta = typeof ev!.delta === 'string' ? ev!.delta : '';
+        const offset = s.length;
+        s.length += delta.length;
+        if (s.text.length < IN_PROGRESS_TEXT_CAP) s.text += delta.slice(0, IN_PROGRESS_TEXT_CAP - s.text.length);
+        out.offset = offset;
+        out.assistantMessageEvent = { ...ev, offset };
+      }
+    } else if (t === 'done' || t === 'error') {
+      const msg = wire.message as { content?: unknown } | undefined;
+      if (msg && msg.content !== undefined) out.text = canonicalText(msg as AgentMessage);
+    }
+    return out;
+  }
+
   handleEvent(obj: RpcEvent): void {
+    if (this.keyGate) {
+      this.keyGate.push(obj); // key seed in flight — processed in order once it lands
+      return;
+    }
     this.lastActivityAt = Date.now();
     // Questionnaire transport: capture as a first-class agent_question frame.
     if (obj.type === 'extension_ui_request') {
@@ -935,6 +1074,8 @@ export class Session {
       }
       default:
     }
+    wire = this.stampIdentity(obj, wire);
+    if (settledNow) this.clearStreamingIdentity(false); // run settled (incl. abort): nothing in progress
 
     const record = this.makeRecord(wire.type, wire);
     this.pushRing(record);
@@ -992,6 +1133,10 @@ export class Session {
       this.restartTimer = null;
     }
     if (!opts.noLease) this.takeBridgeLease();
+    // §13: nothing of this child was seen yet; events wait for the key seed
+    // (the file is quiescent before spawn, so the window is exact).
+    this.clearStreamingIdentity(true);
+    void this.seedKeys(fileSize(this.file));
     const passName = opts.passName ?? this.passNameOnce;
     this.passNameOnce = false;
     const args = [
@@ -1150,6 +1295,7 @@ export class Session {
     this.phase = 'terminated';
     this.resetActivity();
     this.clearQuestion(false);
+    this.clearStreamingIdentity(true);
     this.rejectPending('Agent exited');
     this.log.info({ sessionId: this.id, code, signal }, 'pi exited');
 
@@ -1231,6 +1377,7 @@ export class Session {
   private rebindFile(newFile: string): void {
     const old = this.file;
     this.file = newFile;
+    void this.seedKeys(fileSize(newFile)); // §13: keys follow the file
     if (this.bridgeLease) {
       releaseLease(old, this.bridgeLease);
       this.bridgeLease = null;
@@ -1259,6 +1406,7 @@ export class Session {
     this.file = file;
     if (name) this.name = name;
     this.newEpoch();
+    void this.seedKeys(fileSize(file)); // §13: the fork file has its own row counts
     if (this.proc) {
       try {
         this.takeBridgeLease();
@@ -1317,6 +1465,9 @@ export class Session {
     if (this.ownerSocket) this.detachOwner(this.ownerSocket, 'reattach', true);
     const identity = `${lease.holder.pid}:${lease.holder.nonce}`;
     const lastSeq = identity === this.ownerIdentity ? this.ownerSeq : 0;
+    // §13 key window: events are only delivered from attach on (pi emits before
+    // it persists), except a ring replay of what we missed since the detach.
+    const keyWindowStart = lastSeq > 0 && this.ownerDetachSize !== null ? Math.min(this.ownerDetachSize, fileSize(this.file)) : fileSize(this.file);
 
     const socket = await new Promise<net.Socket>((resolve, reject) => {
       const s = net.connect(lease.ipc);
@@ -1430,6 +1581,8 @@ export class Session {
     this.lastActivityAt = Date.now();
     this.stopTailer();
     this.log.info({ sessionId: this.id, ipc: lease.ipc, lastSeq }, 'attached to live owner');
+    this.clearStreamingIdentity(true); // mid-message attach: deltas stay key-less until a message_start
+    void this.seedKeys(keyWindowStart); // holds the early/replayed events until seeded
     for (const obj of early.splice(0)) this.onOwnerMessage(obj);
     installed = true;
     try {
@@ -1480,6 +1633,8 @@ export class Session {
     }
     this.ownerSocket = null;
     try { socket.destroy(); } catch { /* ignore */ }
+    this.ownerDetachSize = fileSize(this.file);
+    this.clearStreamingIdentity(true);
     this.busy = false;
     this.promptReserved = false;
     this.phase = 'terminated';

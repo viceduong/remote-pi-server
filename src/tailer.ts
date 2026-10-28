@@ -12,6 +12,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { LineSplitter, entryToChatMessage, parseEntry } from './jsonl.js';
+import { KeyCounter, countsAt, isMessageEntry, scanKeySnapshot, type KeySnapshot } from './keys.js';
 import type { ChatMessage } from './types.js';
 
 export interface TailBatch {
@@ -33,12 +34,29 @@ export class FileTailer {
   private reading: Promise<void> | null = null;
   private again = false;
   private stopped = true;
+  /** CONTRACT-V2 §13: key counter for rows from `consumed` on (null until seeded). */
+  private keys: KeyCounter | null = null;
 
   constructor(
     readonly file: string,
     private readonly onBatch: (batch: TailBatch) => void,
     private readonly debounceMs = 250,
+    /** Key state of the file (counts of every row before the start offset are derived from it). */
+    private readonly keySource: ((file: string) => Promise<KeySnapshot>) | null = null,
   ) {}
+
+  /** Seed the key counter with the counts of all rows before `consumed` (once per start). */
+  private async seedKeys(): Promise<void> {
+    if (this.keys) return;
+    const at = this.consumed;
+    let snap: KeySnapshot;
+    try {
+      snap = this.keySource ? await this.keySource(this.file) : await scanKeySnapshot(this.file, at);
+    } catch {
+      snap = await scanKeySnapshot(this.file, at);
+    }
+    if (!this.keys) this.keys = new KeyCounter(countsAt(snap, at));
+  }
 
   get running(): boolean {
     return !this.stopped;
@@ -54,6 +72,7 @@ export class FileTailer {
       this.consumed = 0; // pi creates the JSONL lazily
     }
     this.splitter.reset();
+    this.keys = null;
     try {
       // Watch the directory: the file may not exist yet.
       const dir = path.dirname(this.file);
@@ -125,6 +144,7 @@ export class FileTailer {
       return;
     }
     try {
+      await this.seedKeys();
       const stat = await fh.stat();
       if (stat.size < this.consumed) {
         await this.resync(fh, stat);
@@ -152,8 +172,10 @@ export class FileTailer {
 
   private lineToMessage(line: string): ChatMessage | null {
     const entry = parseEntry(line);
-    if (!entry) return null;
-    const mapped = entryToChatMessage(entry);
+    if (!isMessageEntry(entry)) return null;
+    // Count EVERY row in file order (even ones deduped below) so keys match history.
+    const key = (this.keys ??= new KeyCounter()).assign(entry.message);
+    const mapped = entryToChatMessage(entry, key);
     if (!mapped) return null;
     if (mapped.id) {
       if (this.seen.has(mapped.id)) return null;
@@ -173,6 +195,7 @@ export class FileTailer {
     // Re-parse from byte 0 with OUR splitter so its trailing partial line
     // (raw bytes) carries over to the next poll untouched.
     this.splitter.reset();
+    const counter = new KeyCounter(); // whole file re-read: recount from scratch
     const entries: ChatMessage[] = [];
     let pos = 0;
     const buf = Buffer.alloc(Math.min(READ_CHUNK, Math.max(1, stat.size)));
@@ -182,11 +205,12 @@ export class FileTailer {
       pos += bytesRead;
       for (const line of this.splitter.push(buf.subarray(0, bytesRead))) {
         const e = parseEntry(line);
-        const m = e ? entryToChatMessage(e) : null;
+        const m = isMessageEntry(e) ? entryToChatMessage(e, counter.assign(e.message)) : null;
         if (m) entries.push(m);
       }
     }
     this.consumed = pos;
+    this.keys = counter;
     const anchor = this.lastId ? entries.findIndex((m) => m.id === this.lastId) : -1;
     const fresh = anchor >= 0
       ? entries.slice(anchor + 1).filter((m) => !m.id || !this.seen.has(m.id))

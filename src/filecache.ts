@@ -16,6 +16,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { LineSplitter, contentText, entryTimestamp, entryToChatMessage, parseEntry, type SessionEntry } from './jsonl.js';
+import { FileKeyState, isMessageEntry, type KeySnapshot } from './keys.js';
 import type { ChatMessage } from './types.js';
 
 export interface FileSummary {
@@ -40,6 +41,8 @@ interface FileState extends FileSummary {
   head: Buffer;
   messages: ChatMessage[] | null;
   msgBytes: number;
+  /** CONTRACT-V2 §13 key state (always maintained, even without the messages tier). */
+  keys: FileKeyState;
 }
 
 export interface FileCacheOptions {
@@ -72,6 +75,7 @@ function emptyState(file: string): FileState {
     head: Buffer.alloc(0),
     messages: null,
     msgBytes: 0,
+    keys: new FileKeyState(),
   };
 }
 
@@ -138,14 +142,14 @@ export class SessionFileCache {
     }
   }
 
-  private applyLine(st: FileState, line: string): void {
+  private applyLine(st: FileState, line: string, end: number): void {
     if (!interesting(line)) return;
     const entry = parseEntry(line);
     if (!entry) return;
-    this.applyEntry(st, entry, line.length);
+    this.applyEntry(st, entry, line.length, end);
   }
 
-  private applyEntry(st: FileState, entry: SessionEntry, lineBytes: number): void {
+  private applyEntry(st: FileState, entry: SessionEntry, lineBytes: number, end = 0): void {
     switch (entry.type) {
       case 'session':
         if (st.headerId === null && typeof entry.id === 'string') st.headerId = entry.id;
@@ -169,8 +173,10 @@ export class SessionFileCache {
             if (t) st.firstUserText = t;
           }
         }
+        // §13: every message row is counted in file order (same rule as the tailer/live path).
+        const key = isMessageEntry(entry) ? st.keys.add(entry.message, end) : null;
         if (st.messages) {
-          const mapped = entryToChatMessage(entry);
+          const mapped = entryToChatMessage(entry, key);
           if (mapped) {
             st.messages.push(mapped);
             st.msgBytes += lineBytes + 128;
@@ -187,8 +193,11 @@ export class SessionFileCache {
     if (st.head.length < HEAD_BYTES && st.consumed < HEAD_BYTES) {
       st.head = Buffer.concat([st.head, chunk.subarray(0, HEAD_BYTES - st.head.length)]);
     }
+    const base = st.consumed - st.splitter.pendingBytes;
     st.consumed += chunk.length;
-    for (const line of st.splitter.push(chunk)) this.applyLine(st, line);
+    const lines = st.splitter.push(chunk);
+    const ends = st.splitter.lastEnds;
+    for (let i = 0; i < lines.length; i++) this.applyLine(st, lines[i]!, base + ends[i]!);
   }
 
 
@@ -327,5 +336,16 @@ export class SessionFileCache {
     const st = await this.update(file, true);
     if (!st) throw Object.assign(new Error(`ENOENT: ${file}`), { code: 'ENOENT' });
     return st.messages ?? [];
+  }
+
+  /**
+   * CONTRACT-V2 §13: key state of the file brought up to date — counts per
+   * base key over every complete line, at the byte offset where the pending
+   * partial line (if any) starts. Seeds live key tracking and the tailer.
+   */
+  async keySnapshot(file: string): Promise<KeySnapshot> {
+    const st = await this.update(file, false);
+    if (!st) return new FileKeyState().snapshot(0);
+    return st.keys.snapshot(st.consumed - st.splitter.pendingBytes);
   }
 }

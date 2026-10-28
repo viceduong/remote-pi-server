@@ -50,9 +50,7 @@ export function mapAgentMessage(msg: AgentMessage | null | undefined): ChatMessa
   };
 
   if (isToolResult) {
-    base.text = typeof msg.content === 'string'
-      ? msg.content
-      : textBlocks(msg.content as ContentBlock[] | undefined);
+    base.text = canonicalText(msg);
     // Keep call args on tool messages so clients can still show them.
     for (const b of contentArr) {
       if (b.type === 'toolCall') {
@@ -69,15 +67,13 @@ export function mapAgentMessage(msg: AgentMessage | null | undefined): ChatMessa
     return base;
   }
   if (role === 'user') {
-    base.text = typeof msg.content === 'string'
-      ? msg.content
-      : textBlocks(msg.content as ContentBlock[] | undefined);
+    base.text = canonicalText(msg);
     // pi serves context-prune summaries as role "user"/"custom"; system notes.
     base.system = isSystemNote || isPruneSummary(base.text);
   } else if (role === 'assistant') {
-    const blocks = (msg.content as ContentBlock[] | undefined) ?? [];    for (const block of blocks) {
-      if (block.type === 'text' && block.text) base.text += block.text;
-      else if (block.type === 'thinking' && block.thinking) base.thinking = block.thinking;
+    base.text = canonicalText(msg);
+    for (const block of contentArr) {
+      if (block.type === 'thinking' && block.thinking) base.thinking = block.thinking;
       else if (block.type === 'toolCall') {
         base.toolCalls.push({
           id: block.id ?? null,
@@ -92,7 +88,7 @@ export function mapAgentMessage(msg: AgentMessage | null | undefined): ChatMessa
         ? `${msg.provider}/${msg.model}`
         : null;
   } else {
-    base.text = textBlocks(msg.content as ContentBlock[] | undefined);
+    base.text = canonicalText(msg);
   }
 
   return base;
@@ -109,11 +105,28 @@ function parseArguments(raw: unknown): Record<string, unknown> {
   return {};
 }
 
-function textBlocks(blocks: ContentBlock[] | undefined): string {
-  return (blocks ?? [])
-    .filter((b): b is ContentBlock & { text: string } => b.type === 'text' && typeof b.text === 'string')
-    .map((b) => b.text)
-    .join('\n');
+/**
+ * THE canonical text of a message content field (CONTRACT-V2 §13): a string
+ * content as-is, otherwise its `text` blocks concatenated with NO separator
+ * (thinking / toolCall / image blocks excluded). No separator because the
+ * streamed text of an assistant message is the plain concatenation of its
+ * text_deltas across all text blocks — so the final row text equals the
+ * streamed text, live and from history. Used for every role (history rows,
+ * live message_end `text`, echo matching, first-user-text summaries).
+ */
+export function textOf(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  let out = '';
+  for (const b of content as { type?: unknown; text?: unknown }[]) {
+    if (b && b.type === 'text' && typeof b.text === 'string') out += b.text;
+  }
+  return out;
+}
+
+/** Canonical visible text of a pi message (history rows and live message_end `text`). */
+export function canonicalText(msg: AgentMessage | null | undefined): string {
+  return msg ? textOf(msg.content) : '';
 }
 
 /** context-prune summary style: "### Tool Call N: …" / "## Tool Call Summary". */

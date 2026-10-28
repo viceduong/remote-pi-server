@@ -4,7 +4,7 @@
  * lone-surrogate stripping, and the single "read the tail and parse" helper.
  */
 import fs from 'node:fs';
-import { mapAgentMessage } from './history.js';
+import { mapAgentMessage, textOf } from './history.js';
 import type { AgentMessage, ChatMessage } from './types.js';
 
 /**
@@ -39,6 +39,13 @@ const CR = 0x0d;
 export class LineSplitter {
   private remainder: Buffer = EMPTY;
   private skipping = false;
+  /**
+   * For the lines returned by the last push(): byte offset just after each
+   * line's '
+', relative to the start of the bytes held BEFORE that push
+   * (i.e. absolute end = (bytesFedBefore - pendingBytesBefore) + lastEnds[i]).
+   */
+  lastEnds: number[] = [];
 
   constructor(private readonly maxLineBytes = 64 * 1024 * 1024) {}
 
@@ -56,6 +63,8 @@ export class LineSplitter {
   push(chunk: Uint8Array): string[] {
     const buf = this.remainder.length ? Buffer.concat([this.remainder, chunk]) : Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
     const lines: string[] = [];
+    const ends: number[] = [];
+    this.lastEnds = ends;
     let start = 0;
     for (;;) {
       const nl = buf.indexOf(LF, start);
@@ -66,6 +75,7 @@ export class LineSplitter {
         this.skipping = false; // tail of an oversized line — discard
       } else if (end > start) {
         lines.push(decodeUtf8(buf.subarray(start, end)));
+        ends.push(nl + 1);
       }
       start = nl + 1;
     }
@@ -129,22 +139,22 @@ export function entryTimestamp(entry: SessionEntry): number | null {
   return null;
 }
 
-/** Map a `type:"message"` entry to the wire ChatMessage (entry id attached). */
-export function entryToChatMessage(entry: SessionEntry): ChatMessage | null {
+/**
+ * Map a `type:"message"` entry to the wire ChatMessage (entry id attached).
+ * `key` (CONTRACT-V2 §13) is assigned by the caller in file order.
+ */
+export function entryToChatMessage(entry: SessionEntry, key?: string | null): ChatMessage | null {
   if (entry.type !== 'message' || !entry.message) return null;
   const msg = { ...entry.message } as AgentMessage;
   if (typeof entry.id === 'string') msg.id = entry.id;
-  return mapAgentMessage(msg);
+  const mapped = mapAgentMessage(msg);
+  if (mapped && key) mapped.key = key;
+  return mapped;
 }
 
-/** Plain text of a user/assistant content field. */
+/** Plain text of a content field — THE canonical text function (history.textOf). */
 export function contentText(content: unknown): string {
-  if (typeof content === 'string') return content;
-  if (!Array.isArray(content)) return '';
-  return (content as { type?: string; text?: string }[])
-    .filter((b) => b && b.type === 'text' && typeof b.text === 'string')
-    .map((b) => b.text ?? '')
-    .join('');
+  return textOf(content);
 }
 
 /**

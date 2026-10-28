@@ -136,7 +136,9 @@ export function attachSse(
 
   // Delta coalescing: text/thinking deltas stream at token rate; merge them
   // per sink and flush every 60 ms as one delta carrying the LAST id.
-  let deltaBuf: { kind: 'text' | 'thinking'; contentIndex: number; text: string; id: string } | null = null;
+  // §13: only deltas of the SAME message key merge (and text deltas only when
+  // contiguous by offset); the merged frame carries the FIRST delta's offset.
+  let deltaBuf: { kind: 'text' | 'thinking'; contentIndex: number; text: string; id: string; key: string | null; offset: number | undefined } | null = null;
   let deltaTimer: NodeJS.Timeout | null = null;
 
   function flushDeltas(): void {
@@ -145,10 +147,14 @@ export function attachSse(
     const buf = deltaBuf;
     if (!buf) return;
     deltaBuf = null;
-    const data = {
+    const data: Record<string, unknown> = {
       type: 'message_update',
-      assistantMessageEvent: { type: `${buf.kind}_delta`, contentIndex: buf.contentIndex, delta: buf.text },
+      key: buf.key,
+      assistantMessageEvent: buf.offset === undefined
+        ? { type: `${buf.kind}_delta`, contentIndex: buf.contentIndex, delta: buf.text }
+        : { type: `${buf.kind}_delta`, contentIndex: buf.contentIndex, delta: buf.text, offset: buf.offset },
     };
+    if (buf.offset !== undefined) data.offset = buf.offset;
     sendFrame(encodeFrame('message_update', buf.id, JSON.stringify(data)));
   }
 
@@ -160,12 +166,19 @@ export function attachSse(
       if (ev && (ev.type === 'text_delta' || ev.type === 'thinking_delta')) {
         const kind = ev.type === 'text_delta' ? 'text' as const : 'thinking' as const;
         const contentIndex = ev.contentIndex ?? 0;
-        if (deltaBuf && deltaBuf.kind === kind && deltaBuf.contentIndex === contentIndex) {
-          deltaBuf.text += ev.delta ?? '';
+        const d = record.data as { key?: unknown; offset?: unknown };
+        const key = typeof d.key === 'string' ? d.key : null;
+        const offset = typeof d.offset === 'number' ? d.offset : undefined;
+        const delta = ev.delta ?? '';
+        const contiguous = deltaBuf !== null && (deltaBuf.offset === undefined
+          ? offset === undefined
+          : offset !== undefined && deltaBuf.offset + deltaBuf.text.length === offset);
+        if (deltaBuf && deltaBuf.kind === kind && deltaBuf.contentIndex === contentIndex && deltaBuf.key === key && contiguous) {
+          deltaBuf.text += delta;
           deltaBuf.id = record.id;
         } else {
           flushDeltas();
-          deltaBuf = { kind, contentIndex, text: ev.delta ?? '', id: record.id };
+          deltaBuf = { kind, contentIndex, text: delta, id: record.id, key, offset };
         }
         if (!deltaTimer) deltaTimer = setTimeout(flushDeltas, DELTA_FLUSH_MS);
         return;
@@ -204,6 +217,19 @@ export function attachSse(
       type: 'agent_question',
       requestId: session.pendingQuestion.requestId,
       questions: session.pendingQuestion.questions,
+    })));
+  }
+  // CONTRACT-V2 §13: the in-progress assistant message, authoritative up to now
+  // (after the status snapshot; also covers the reset path above).
+  const inProgress = session.inProgress;
+  if (inProgress) {
+    sendFrame(encodeFrame('message_snapshot', currentId(), JSON.stringify({
+      type: 'message_snapshot',
+      key: inProgress.key,
+      role: 'assistant',
+      timestamp: inProgress.timestamp,
+      text: inProgress.text,
+      streaming: true,
     })));
   }
   if (extras.queueSnapshot) {
