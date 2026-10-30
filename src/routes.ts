@@ -13,6 +13,7 @@ import { isActive } from './queue.js';
 import type { Env } from './config.js';
 import type { ServerConfig } from './types.js';
 import { listDir, rootPaths, WorkdirError } from './workdir.js';
+import { NotifyPutSchema, NotifySettingsError, publicSettings, type NotifyService } from './notify.js';
 
 /* ---------------- request schemas (zod on every body/query) ---------------- */
 
@@ -106,9 +107,9 @@ function sendError(reply: Reply, err: unknown): Reply {
 
 export function registerRoutes(
   fastify: FastifyInstance,
-  opts: { config: Env; manager: SessionManager; piVersion: string | null; log: FastifyBaseLogger },
+  opts: { config: Env; manager: SessionManager; piVersion: string | null; log: FastifyBaseLogger; notify?: NotifyService },
 ): void {
-  const { config, manager, piVersion, log } = opts;
+  const { config, manager, piVersion, log, notify } = opts;
 
   fastify.addHook('onRequest', async (req, reply) => {
     if (req.url === '/api/health') return;
@@ -122,7 +123,7 @@ export function registerRoutes(
     piVersion,
     api: '1.0',
     workdir: config.REMOTE_PI_WORKDIR,
-    features: ['chat', 'sessions', 'abort', 'history', 'sse', 'contract-v2'],
+    features: ['chat', 'sessions', 'abort', 'history', 'sse', 'contract-v2', ...(notify ? ['notify'] : [])],
   };
 
   const idOf = (req: FastifyRequest, reply: Reply): string | null =>
@@ -744,6 +745,36 @@ export function registerRoutes(
     const session = await manager.sessionForSSE(id);
     if (!session) return reply.code(404).send({ error: 'Session not found' });
     attachSse(req, reply, session, log, { queueSnapshot: () => manager.pendingItems(session) });
+  });
+
+  /* ---------------- CONTRACT-V2 §14: Bark turn-end notifications ---------------- */
+  // Secrets (device key, encryption key/iv) are write-only: no route ever returns them.
+
+  fastify.get('/api/notify', async (_req, reply) => {
+    if (!notify) return reply.code(404).send({ error: 'Notifications not available' });
+    return publicSettings(notify.settings.get());
+  });
+
+  fastify.put('/api/notify', async (req, reply) => {
+    if (!notify) return reply.code(404).send({ error: 'Notifications not available' });
+    const r = NotifyPutSchema.safeParse(req.body ?? {});
+    if (!r.success) {
+      // Never echo the offending values (they may be secrets): paths + messages only.
+      return reply.code(400).send({ error: 'Invalid notify settings', issues: r.error.issues.map((i) => ({ path: i.path, message: i.message })) });
+    }
+    try {
+      return publicSettings(notify.settings.update(r.data));
+    } catch (err) {
+      if (err instanceof NotifySettingsError) return reply.code(400).send({ error: err.message, code: 'invalid_notify_settings' });
+      throw err;
+    }
+  });
+
+  fastify.post('/api/notify/test', async (req, reply) => {
+    if (!notify) return reply.code(404).send({ error: 'Notifications not available' });
+    if (!EmptyBody.safeParse(req.body).success) return reply.code(400).send({ error: 'Invalid body' });
+    const r = await notify.test();
+    return { ok: r.ok, status: r.status, ...(r.error ? { error: r.error } : {}) };
   });
 }
 

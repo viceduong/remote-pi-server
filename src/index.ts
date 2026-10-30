@@ -9,6 +9,8 @@ import { detectPiVersion } from './pi.js';
 import { registerRoutes } from './routes.js';
 import { parseRoots } from './workdir.js';
 import { rateLimitKey } from './ratelimit.js';
+import { NotifyService } from './notify.js';
+import path from 'node:path';
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -26,6 +28,18 @@ async function main(): Promise<void> {
     extraArgs: config.REMOTE_PI_EXTRA_ARGS.split(/\s+/).filter(Boolean),
     log: logger,
   });
+
+  // CONTRACT §14: file-based turn-end notifications (Bark). The dot dir is
+  // skipped by the session walk / watchers.
+  const notify = config.REMOTE_PI_NOTIFY
+    ? new NotifyService({
+      dataDir: config.REMOTE_PI_DATA_DIR ?? path.join(sessionDir, '.remote-pi'),
+      sessionDir,
+      resolveSession: (file) => manager.describeFile(file),
+      keySource: (file) => manager.files.keySnapshot(file),
+      log: logger.child({ mod: 'notify' }),
+    })
+    : null;
 
   const app = Fastify({
     logger: false, // request logs off; app errors go through our pino logger
@@ -50,9 +64,11 @@ async function main(): Promise<void> {
     void reply.code(err.statusCode ?? 500).send({ error: err.message ?? 'Internal error' });
   });
 
-  registerRoutes(app, { config, manager, piVersion, log: logger as unknown as FastifyBaseLogger });
+  registerRoutes(app, { config, manager, piVersion, log: logger as unknown as FastifyBaseLogger, ...(notify ? { notify } : {}) });
 
   await app.listen({ host: config.REMOTE_PI_HOST, port: config.REMOTE_PI_PORT });
+
+  notify?.start().catch((err: Error) => logger.warn({ err: err.message }, 'notify watcher failed to start'));
 
   // Memory + sink telemetry (growth curve proves a leak or a fix).
   const memTimer = setInterval(() => {
@@ -90,6 +106,7 @@ async function main(): Promise<void> {
     const hardExit = setTimeout(() => process.exit(1), 10_000);
     hardExit.unref();
     try {
+      notify?.stop();
       await manager.shutdown(5_000);
       await app.close();
     } catch (err) {

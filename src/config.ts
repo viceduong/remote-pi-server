@@ -17,6 +17,10 @@ const EnvSchema = z.object({
   /** CONTRACT §12: `;`-separated absolute roots a client may pick/create a session workdir in. Default = REMOTE_PI_WORKDIR. */
   REMOTE_PI_WORKDIR_ROOTS: z.string().optional(),
   REMOTE_PI_SESSION_DIR: z.string().min(1).optional(),
+  /** Server-owned state (notification settings/dedupe). Default `<sessionDir>/.remote-pi`. */
+  REMOTE_PI_DATA_DIR: z.string().min(1).optional(),
+  /** CONTRACT §14: set to 0 to disable the turn-end watcher entirely. */
+  REMOTE_PI_NOTIFY: z.string().default('1').transform((v) => !(v === '0' || v.toLowerCase() === 'false')),
   REMOTE_PI_MAX_AGENTS: z.coerce.number().int().min(1).max(16).default(6),
   REMOTE_PI_IDLE_KILL_MS: z.coerce.number().int().min(60_000).default(45 * 60_000),
   REMOTE_PI_EXTRA_ARGS: z.string().default(''),

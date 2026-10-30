@@ -377,6 +377,24 @@ export class SessionManager {
     return lookup(await this.getIndex(true)) ?? null;
   }
 
+  /**
+   * CONTRACT-V2 §14: session id + display name for a session FILE (turn-end
+   * notifications). Same names as the session list; re-walks once on a miss
+   * (a session created seconds ago). Null when the file is not indexed.
+   */
+  async describeFile(file: string): Promise<{ id: string; name: string; workdir: string | null } | null> {
+    const norm = (f: string): string => (process.platform === 'win32' ? path.resolve(f).toLowerCase() : path.resolve(f));
+    const want = norm(file);
+    const find = (index: Map<string, SessionFileMeta>): SessionFileMeta | undefined => {
+      for (const meta of index.values()) if (norm(meta.file) === want) return meta;
+      return undefined;
+    };
+    const meta = find(await this.getIndex()) ?? find(await this.getIndex(true));
+    if (!meta) return null;
+    const s = this.sessions.get(meta.id);
+    return { id: meta.id, name: (s?.running ? s.name : meta.name) || meta.name, workdir: meta.workdir };
+  }
+
   private sessionByFile(file: string): Session | undefined {
     const key = path.resolve(file);
     for (const s of this.sessions.values()) if (path.resolve(s.file) === key) return s;
