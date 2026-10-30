@@ -316,6 +316,7 @@ describe('settings', () => {
     expect(publicSettings(d)).toEqual({
       enabled: false, barkServer: 'https://api.day.app', hasDeviceKey: false,
       encryption: { enabled: false, algorithm: 'AES128', mode: 'CBC', hasKey: false }, level: 'active',
+      skipSubagents: true,
     });
     const s = applyPut(d, { deviceKey: 'abc', encryption: { key: '1234567890123456' } });
     expect(publicSettings(s)).toMatchObject({ enabled: true, hasDeviceKey: true, encryption: { enabled: true, hasKey: true } });
@@ -375,6 +376,7 @@ describe('notify routes + service', () => {
     expect(put.json()).toEqual({
       enabled: true, barkServer: stub.url, hasDeviceKey: true,
       encryption: { enabled: true, algorithm: 'AES256', mode: 'CBC', hasKey: true }, level: 'timeSensitive',
+      skipSubagents: true,
     });
     const get = await app.inject({ url: '/api/notify', headers: auth });
     for (const res of [put, get]) {

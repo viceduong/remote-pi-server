@@ -51,6 +51,8 @@ export interface NotifySettings {
     iv: string | null;
   };
   level: BarkLevel;
+  /** Skip turn ends of pi-subagents child sessions (default true). */
+  skipSubagents: boolean;
 }
 
 /** GET /api/notify — secrets never included. */
@@ -60,6 +62,7 @@ export interface PublicNotifySettings {
   hasDeviceKey: boolean;
   encryption: { enabled: boolean; algorithm: BarkAlgorithm; mode: BarkMode; hasKey: boolean };
   level: BarkLevel;
+  skipSubagents: boolean;
 }
 
 export function defaultSettings(): NotifySettings {
@@ -69,6 +72,7 @@ export function defaultSettings(): NotifySettings {
     deviceKey: null,
     encryption: { enabled: null, algorithm: 'AES128', mode: 'CBC', key: null, iv: null },
     level: 'active',
+    skipSubagents: true,
   };
 }
 
@@ -87,6 +91,7 @@ export function publicSettings(s: NotifySettings): PublicNotifySettings {
       hasKey: !!s.encryption.key,
     },
     level: s.level,
+    skipSubagents: s.skipSubagents,
   };
 }
 
@@ -115,6 +120,7 @@ export const NotifyPutSchema = z.object({
     iv: secret(64).optional(),
   }).strict().optional(),
   level: z.enum(BARK_LEVELS).optional(),
+  skipSubagents: z.boolean().optional(),
 }).strict();
 export type NotifyPut = z.infer<typeof NotifyPutSchema>;
 
@@ -130,6 +136,7 @@ const StoredSchema = z.object({
     iv: z.string().nullable().catch(null),
   }).catch(defaultSettings().encryption),
   level: z.enum(BARK_LEVELS).catch('active'),
+  skipSubagents: z.boolean().catch(true),
 });
 
 export class NotifySettingsError extends Error {}
@@ -150,6 +157,7 @@ export function applyPut(cur: NotifySettings, put: NotifyPut): NotifySettings {
       iv: clear(put.encryption?.iv, cur.encryption.iv),
     },
     level: put.level ?? cur.level,
+    skipSubagents: put.skipSubagents ?? cur.skipSubagents,
   };
   const e = next.encryption;
   if (e.key || e.iv) {
@@ -689,6 +697,80 @@ export interface NotifyServiceOptions {
   log: Logger;
   bark?: BarkClientOptions;
   watcher?: Partial<Omit<TurnWatcherOptions, 'sessionDir' | 'onTurnEnd' | 'state' | 'keySource' | 'log'>>;
+  /** Custom pi-subagents agent definitions (`*.md`); default ~/.pi/agent/agents. */
+  agentsDir?: string;
+}
+
+/* ======================= subagent sessions ======================= */
+
+/** Agent types of `@tintinweb/pi-subagents` (its built-ins). */
+const BUILTIN_SUBAGENT_TYPES = ['general-purpose', 'explore', 'plan'];
+
+export function defaultAgentsDir(): string {
+  return path.join(process.env.USERPROFILE ?? process.env.HOME ?? '', '.pi', 'agent', 'agents');
+}
+
+/**
+ * A pi-subagents child session is created with a header `parentSession` (its
+ * spawner) and named `<agentType>#<agentId[0..8]>` (or just `<agentType>`).
+ * Forks also carry `parentSession` but not such a name, so they still notify.
+ */
+export function isSubagentHeader(parentSession: unknown, name: string | null, agentTypes: ReadonlySet<string>): boolean {
+  if (typeof parentSession !== 'string' || parentSession.length === 0 || !name) return false;
+  const n = name.trim();
+  if (/#[A-Za-z0-9]{8}$/.test(n)) return true;
+  return agentTypes.has(n.toLowerCase());
+}
+
+/** Classifies session files once (header + first session_info name), cached per file. */
+export class SubagentClassifier {
+  private readonly cache = new Map<string, boolean>();
+  private readonly types: Set<string>;
+
+  constructor(agentsDir: string) {
+    this.types = new Set(BUILTIN_SUBAGENT_TYPES);
+    try {
+      for (const f of fs.readdirSync(agentsDir)) {
+        if (f.toLowerCase().endsWith('.md')) this.types.add(f.slice(0, -3).toLowerCase());
+      }
+    } catch { /* no custom agents */ }
+  }
+
+  async isSubagent(file: string): Promise<boolean> {
+    const hit = this.cache.get(file);
+    if (hit !== undefined) return hit;
+    let result = false;
+    try {
+      const head = await readHead(file, 64 * 1024);
+      const lines = head.split('\n');
+      let parent: unknown;
+      let name: string | null = null;
+      for (let i = 0; i < Math.min(lines.length, 40); i++) {
+        const line = lines[i]!.trim();
+        if (!line) continue;
+        let entry: { type?: string; parentSession?: unknown; name?: unknown };
+        try { entry = JSON.parse(line); } catch { continue; }
+        if (i === 0 && entry.type === 'session') parent = entry.parentSession;
+        if (entry.type === 'session_info' && typeof entry.name === 'string') { name = entry.name; break; }
+      }
+      result = isSubagentHeader(parent, name, this.types);
+    } catch { /* unreadable → treat as main */ }
+    // pi-subagents names the session at creation (before any turn), so one
+    // read decides it for the file's lifetime.
+    this.cache.set(file, result);
+    return result;
+  }
+}
+
+async function readHead(file: string, max: number): Promise<string> {
+  const fh = await fs.promises.open(file, 'r');
+  try {
+    const buf = Buffer.alloc(max);
+    const { bytesRead } = await fh.read(buf, 0, max, 0);
+    return buf.subarray(0, bytesRead).toString('utf8');
+  } finally {
+    await fh.close();
+  }
 }
 
 export class NotifyService {
@@ -698,8 +780,10 @@ export class NotifyService {
   /** Last delivery (diagnostics/tests). */
   lastResult: (BarkResult & { key: string }) | null = null;
   private inflight: Promise<unknown> = Promise.resolve();
+  readonly subagents: SubagentClassifier;
 
   constructor(private readonly opts: NotifyServiceOptions) {
+    this.subagents = new SubagentClassifier(opts.agentsDir ?? defaultAgentsDir());
     this.settings = new NotifySettingsStore(path.join(opts.dataDir, 'notify.json'), opts.log);
     this.state = new NotifyState(path.join(opts.dataDir, 'notify-state.json'));
     this.watcher = new TurnWatcher({
@@ -735,6 +819,7 @@ export class NotifyService {
     const run = (async () => {
       const s = this.settings.get();
       if (!notifyEnabled(s)) return;
+      if (s.skipSubagents && await this.subagents.isSubagent(turn.file)) return;
       const msg = await this.messageFor(turn);
       let body: BarkRequestBody;
       try {
