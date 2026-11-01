@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import type { FastifyBaseLogger, FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
-import { AmbiguousModelError, BusyError, ModelNotFoundError, ModelTransportError, SessionLiveError, SpawnError, type SessionManager } from './manager.js';
+import { AmbiguousModelError, BusyError, ModelNotFoundError, ModelTransportError, SessionLiveError, SpawnError, type CancelResult, type SessionManager } from './manager.js';
 import { LeaseHeldError, type Session } from './session.js';
 import { attachSse } from './sse.js';
 import { readTailLines, parseEntry } from './jsonl.js';
@@ -103,6 +103,19 @@ function sendError(reply: Reply, err: unknown): Reply {
   if (err instanceof AmbiguousModelError) return reply.code(400).send({ error: e.message, code: 'ambiguous_model' });
   if (err instanceof ModelTransportError) return reply.code(502).send({ error: e.message });
   return reply.code(409).send({ error: e?.message ?? String(err) });
+}
+
+/** CONTRACT-V2 §15 cancel disposition → HTTP. */
+function sendCancel(reply: Reply, r: CancelResult): Reply {
+  switch (r.result) {
+    case 'cancelled': return reply.code(200).send({ ok: true });
+    case 'not_found': return reply.code(404).send({ error: 'Queued item not found' });
+    case 'already_delivered':
+      return reply.code(409).send({ error: 'The agent already received this message', code: 'already_delivered' });
+    case 'unsupported': return reply.code(502).send({ error: r.error, code: 'clear_queue_unsupported' });
+    case 'busy': return reply.header('retry-after', '1').code(503).send({ error: r.error, code: 'busy' });
+    case 'failed': return reply.code(502).send({ error: r.error });
+  }
 }
 
 export function registerRoutes(
@@ -315,9 +328,19 @@ export function registerRoutes(
     if (!id) return;
     const itemId = parse(PARAM_TOKEN, (req.params as { itemId?: string }).itemId, reply, 'itemId');
     if (!itemId) return;
-    const ok = await manager.cancelQueueItem(id, itemId);
-    if (!ok) return reply.code(404).send({ error: 'Queued item not found' });
-    return { ok: true };
+    return sendCancel(reply, await manager.cancelQueueItem(id, itemId));
+  });
+
+  /*
+   * §15: cancel addressed by clientMessageId (a send whose POST response never
+   * arrived). Same semantics as DELETE /queue/:itemId; 404 when unknown.
+   */
+  fastify.delete('/api/sessions/:id/queue/by-client/:clientMessageId', async (req, reply) => {
+    const id = idOf(req, reply);
+    if (!id) return;
+    const cmid = parse(IDEMPOTENCY_KEY, (req.params as { clientMessageId?: string }).clientMessageId, reply, 'clientMessageId');
+    if (!cmid) return;
+    return sendCancel(reply, await manager.cancelQueueItemByClientId(id, cmid));
   });
 
   /*

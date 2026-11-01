@@ -26,11 +26,13 @@ import {
   QUEUE_MAX_ATTEMPTS,
   backoffMs,
   isActive,
+  isSteeredPending,
   newQueueId,
   pendingView,
   pruneQueue,
   queueFilePath,
   restoreItems,
+  type DeliveredAs,
   type PendingItemView,
   type QueueItem,
 } from './queue.js';
@@ -128,6 +130,21 @@ interface SessionFileMeta {
 const ACTIVE_WINDOW_MS = 5 * 60_000;
 /** Send-now: how long to wait for an interrupted turn to settle before falling back to steer. */
 const SEND_NOW_SETTLE_MS = 5_000;
+/** §15 cancel: max wait for the session's dispatch slot (another send in flight). */
+const CANCEL_LOCK_WAIT_MS = 15_000;
+/** §15 cancel (RPC child): max wait for a point where pi's queue mirror is exact. */
+const CANCEL_SAFE_WAIT_MS = 10_000;
+/** §15 cancel: clear_queue / re-queue RPC timeout (generous — a timeout here is ambiguous). */
+const CANCEL_RPC_TIMEOUT_MS = 30_000;
+
+/** §15 cancel disposition (the route maps it to HTTP). */
+export type CancelResult =
+  | { result: 'cancelled' }
+  | { result: 'not_found' }
+  | { result: 'already_delivered' }
+  | { result: 'unsupported'; error: string }
+  | { result: 'busy'; error: string }
+  | { result: 'failed'; error: string };
 const WRITING_WINDOW_MS = 30_000;
 const INDEX_TTL_MS = 5_000;
 /** Serve a stale walk while refreshing in the background, up to this age. */
@@ -1206,10 +1223,13 @@ export class SessionManager {
     this.persistQueue(session);
     this.broadcastQueue(session);
     session.resetCrashBudget();
-    session.expectEcho(item.message, item.clientMessageId, (ts) => {
-      if (ts !== null) {
-        item.messageTimestamp = ts;
+    session.expectEcho(item.message, item.clientMessageId, (ts, echoed) => {
+      if (echoed) {
+        // §15: pi emitted the user row — the item left pi's queue (no longer cancellable).
+        item.echoedAt = Date.now();
+        if (ts !== null) item.messageTimestamp = ts;
         this.persistQueue(session);
+        if (item.steered) this.broadcastQueue(session);
       }
     });
   }
@@ -1229,12 +1249,22 @@ export class SessionManager {
   ): Promise<boolean> {
     this.options.log.info({ sessionId: session.id, itemId: item.id, attempt: item.attempts, steer: opts.steer ?? false }, 'dispatching queued prompt');
     try {
-      await session.request({
+      const data = await session.request<Record<string, unknown> | null>({
         type: 'prompt',
         message: item.message,
         ...(opts.streamingBehavior ? { streamingBehavior: opts.streamingBehavior } : {}),
       }, 30_000);
+      // §15: remember how pi took it. An explicit behavior is a steer/follow-up;
+      // an owner `prompt` op without one reports whether it queued it (busy → followUp).
+      let kind: DeliveredAs = opts.streamingBehavior ?? 'prompt';
+      if (!opts.streamingBehavior && data && data.queued === true
+          && (data.deliverAs === 'steer' || data.deliverAs === 'followUp')) {
+        kind = data.deliverAs;
+      }
+      item.deliveredAs = kind;
+      item.steered = kind !== 'prompt';
       item.deliveredAt = Date.now();
+      if (item.steered && item.status === 'running') this.broadcastQueue(session);
       if (session.error?.startsWith('Queued message')) session.setError(null);
       // The run may already have ended before the acceptance reply arrived
       // (owner extensions emit events synchronously): settle it now.
@@ -1300,15 +1330,17 @@ export class SessionManager {
       return 'failed'; // BusyError (capacity) / SpawnError / transport error → 502
     }
 
-    // Re-resolve after the await: the normal path may have claimed it meanwhile.
+    // `dispatching` blocks the normal path from dispatching any OTHER queued
+    // item while we steer. Wait for the slot (a §15 cancel's clear_queue +
+    // re-queue, or another send, may hold it) instead of barging in.
+    if (!await this.acquireDispatch(session, CANCEL_LOCK_WAIT_MS)) return 'failed';
+    // Re-resolve after the awaits: the normal path may have claimed it meanwhile.
+    // markRunning below flips it to `running` synchronously (no double-send).
     const item = session.queue.find((i) => i.id === itemId && i.status === 'queued');
-    if (!item) return 'not_found';
-
-    // Mirror dispatchQueued's synchronous reserve: markRunning flips the status
-    // to `running` with NO await before it, so dispatchQueued's `queued` filter
-    // skips this item (no double-send). `dispatching` additionally blocks the
-    // normal path from dispatching any OTHER queued item while we steer.
-    session.dispatching = true;
+    if (!item) {
+      session.dispatching = false;
+      return 'not_found';
+    }
     try {
       // "Send now" = the host's Alt+Enter: interrupt the running turn (work so
       // far is kept), wait for it to settle, then deliver as a FRESH prompt.
@@ -1472,16 +1504,159 @@ export class SessionManager {
     return session ? pendingView(session.queue) : null;
   }
 
-  /** Cancel a queued item. Returns false if unknown/not queued. */
-  async cancelQueueItem(id: string, itemId: string): Promise<boolean> {
+  /**
+   * CONTRACT-V2 §15 — cancel a pending item by id. A `queued` item is simply
+   * removed (unchanged behaviour). A `running` item that pi still holds in its
+   * steering / follow-up queue is pulled back out (see cancelSteered).
+   */
+  async cancelQueueItem(id: string, itemId: string): Promise<CancelResult> {
     const session = await this.find(id);
-    if (!session) return false;
-    const idx = session.queue.findIndex((i) => i.id === itemId && i.status === 'queued');
-    if (idx < 0) return false;
-    session.queue.splice(idx, 1);
+    if (!session) return { result: 'not_found' };
+    return this.cancelItem(session, (i) => i.id === itemId);
+  }
+
+  /** §15 — the same, addressed by clientMessageId (a send whose POST response was lost). */
+  async cancelQueueItemByClientId(id: string, clientMessageId: string): Promise<CancelResult> {
+    const session = await this.find(id);
+    if (!session) return { result: 'not_found' };
+    return this.cancelItem(session, (i) => i.clientMessageId === clientMessageId);
+  }
+
+  private removeQueued(session: Session, item: QueueItem): CancelResult {
+    const idx = session.queue.indexOf(item);
+    if (idx >= 0) session.queue.splice(idx, 1);
     this.persistQueue(session);
     this.broadcastQueue(session);
+    return { result: 'cancelled' };
+  }
+
+  private async cancelItem(session: Session, match: (i: QueueItem) => boolean): Promise<CancelResult> {
+    const item = session.queue.find(match);
+    if (!item) return { result: 'not_found' };
+    switch (item.status) {
+      case 'queued': return this.removeQueued(session, item);
+      case 'cancelled': return { result: 'cancelled' }; // idempotent repeat
+      case 'done': return { result: 'already_delivered' };
+      case 'failed': return { result: 'not_found' };
+      default: break;
+    }
+    // running: never cancellable once it started a turn or was echoed.
+    if (item.deliveredAt && (!item.steered || item.echoedAt)) return { result: 'already_delivered' };
+
+    // Serialize with the server's own dispatching (steerQueued / a send in
+    // flight) so nothing is sent to pi between clear_queue and the re-queue.
+    if (!await this.acquireDispatch(session, CANCEL_LOCK_WAIT_MS)) {
+      return { result: 'busy', error: 'Another delivery to the agent is in progress — retry' };
+    }
+    try {
+      // The slot holder may have settled it meanwhile (failed steer → queued, …).
+      const status = item.status as QueueItem['status'];
+      if (status === 'queued') return this.removeQueued(session, item);
+      if (status === 'cancelled') return { result: 'cancelled' };
+      if (status === 'done') return { result: 'already_delivered' };
+      if (status !== 'running') return { result: 'not_found' };
+      if (!isSteeredPending(item)) return { result: 'already_delivered' };
+      return await this.cancelSteered(session, item);
+    } finally {
+      session.dispatching = false;
+      if (session.queue.some((i) => i.status === 'queued')) setImmediate(() => this.dispatchQueued(session));
+    }
+  }
+
+  private async acquireDispatch(session: Session, timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (session.dispatching) {
+      if (Date.now() >= deadline) return false;
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    session.dispatching = true;
     return true;
+  }
+
+  /**
+   * §15: pi can only clear its WHOLE queue. clear_queue → drop the first
+   * occurrence of this item's text → re-queue everything else (incl. messages
+   * typed in the host terminal) in the original order with the original kind.
+   * Caller holds the dispatch slot.
+   */
+  private async cancelSteered(session: Session, item: QueueItem): Promise<CancelResult> {
+    if (!session.running) return { result: 'already_delivered' };
+    if (session.isProxy && !session.ownerHas('clear_queue')) {
+      return {
+        result: 'unsupported',
+        error: 'The host TUI cannot cancel a steered message (Remote Pi owner extension older than v7 — run /reload in the TUI)',
+      };
+    }
+    const gone = (): boolean => !!item.echoedAt || item.status !== 'running';
+    if (session.hasChild) {
+      // pi's mirror lists lag the agent queue between a drain and its
+      // message_start: wait for a point where they are exact.
+      const deadline = Date.now() + CANCEL_SAFE_WAIT_MS;
+      while (!session.queueClearSafe) {
+        if (gone() || !session.running) return { result: 'already_delivered' };
+        if (Date.now() >= deadline) return { result: 'busy', error: 'The agent is between turns — retry in a moment' };
+        await new Promise((r) => setTimeout(r, 50));
+      }
+    }
+    if (gone()) return { result: 'already_delivered' };
+
+    let cleared: { steering?: unknown; followUp?: unknown } | null;
+    try {
+      cleared = await session.request<{ steering?: unknown; followUp?: unknown } | null>({ type: 'clear_queue' }, CANCEL_RPC_TIMEOUT_MS);
+    } catch (err) {
+      const msg = (err as Error).message || String(err);
+      if (/unknown (op|command)/i.test(msg)) {
+        return { result: 'unsupported', error: `The agent does not support clear_queue: ${msg}` };
+      }
+      this.options.log.error({ sessionId: session.id, itemId: item.id, err: msg }, 'clear_queue failed — pi queue state unknown');
+      return { result: 'failed', error: `clear_queue failed: ${msg}` };
+    }
+    const strings = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []);
+    const steering = strings(cleared?.steering);
+    const followUp = strings(cleared?.followUp);
+
+    // Echoed during the round trip → pi delivered it; an identical text still
+    // in the lists belongs to someone else (e.g. typed in the terminal). Remove nothing.
+    let removed = false;
+    if (!gone()) {
+      const lists: string[][] = item.deliveredAs === 'followUp' ? [followUp, steering] : [steering, followUp];
+      outer: for (const exact of [true, false]) {
+        for (const list of lists) {
+          const idx = list.findIndex((t) => (exact ? t === item.message : t.trim() === item.message.trim()));
+          if (idx >= 0) {
+            list.splice(idx, 1);
+            removed = true;
+            break outer;
+          }
+        }
+      }
+    }
+
+    // Re-queue the rest, original order and kind. The owner maps prompt+steer →
+    // op `steer`, prompt+followUp → op `enqueue` (Session.toOwnerOp).
+    const lost: string[] = [];
+    const batches: [string[], 'steer' | 'followUp'][] = [[steering, 'steer'], [followUp, 'followUp']];
+    for (const [texts, streamingBehavior] of batches) {
+      for (const message of texts) {
+        try {
+          await session.request({ type: 'prompt', message, streamingBehavior }, CANCEL_RPC_TIMEOUT_MS);
+        } catch (err) {
+          lost.push(message);
+          this.options.log.error({ sessionId: session.id, err: (err as Error).message, streamingBehavior, chars: message.length }, 're-queue after clear_queue failed');
+        }
+      }
+    }
+    if (lost.length) session.setError(`${lost.length} queued message(s) could not be restored after a cancel`);
+    this.options.log.info({ sessionId: session.id, itemId: item.id, removed, requeued: steering.length + followUp.length - lost.length }, 'steered item cancel');
+
+    if (!removed) return { result: 'already_delivered' };
+    item.status = 'cancelled';
+    item.completedAt = Date.now();
+    item.steered = false;
+    session.cancelEcho(item.message, item.clientMessageId);
+    this.persistQueue(session);
+    this.broadcastQueue(session);
+    return { result: 'cancelled' };
   }
 
   /* ---------------- history ---------------- */

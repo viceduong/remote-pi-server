@@ -104,7 +104,8 @@ interface PendingRpc {
 interface PendingEcho {
   text: string;
   clientMessageId: string | undefined;
-  onEcho: (timestamp: number | null) => void;
+  /** `echoed` = pi emitted the user row (false: the expectation was dropped). */
+  onEcho: (timestamp: number | null, echoed: boolean) => void;
 }
 
 /** Result of answering a questionnaire (route maps status → HTTP code). */
@@ -734,7 +735,7 @@ export class Session {
       p.reject(new Error(reason));
     }
     this.pending.clear();
-    for (const echo of this.pendingEcho.splice(0)) echo.onEcho(null);
+    for (const echo of this.pendingEcho.splice(0)) echo.onEcho(null, false);
   }
 
   /**
@@ -781,14 +782,39 @@ export class Session {
   }
 
   /** Register a dispatched queue item so its user-message echo carries the clientMessageId. */
-  expectEcho(text: string, clientMessageId: string | undefined, onEcho: (timestamp: number | null) => void): void {
+  expectEcho(text: string, clientMessageId: string | undefined, onEcho: (timestamp: number | null, echoed: boolean) => void): void {
     this.pendingEcho.push({ text: text.trim(), clientMessageId, onEcho });
   }
 
-  cancelEcho(text: string): void {
+  /** Drop an echo expectation (prefers the one carrying `clientMessageId` when given). */
+  cancelEcho(text: string, clientMessageId?: string): void {
     const t = text.trim();
-    const idx = this.pendingEcho.findIndex((e) => e.text === t);
-    if (idx >= 0) this.pendingEcho.splice(idx, 1)[0]!.onEcho(null);
+    let idx = clientMessageId ? this.pendingEcho.findIndex((e) => e.clientMessageId === clientMessageId) : -1;
+    if (idx < 0) idx = this.pendingEcho.findIndex((e) => e.text === t);
+    if (idx >= 0) this.pendingEcho.splice(idx, 1)[0]!.onEcho(null, false);
+  }
+
+  /** §15: the owner advertised `cap` in its hello (proxy transport only). */
+  ownerHas(cap: string): boolean {
+    return this.ownerCapabilities.includes(cap);
+  }
+
+  /**
+   * §15 (RPC child): pi's `clear_queue` returns its steering/follow-up MIRROR
+   * lists, which lag the agent's real queue: the loop drains steering after
+   * `turn_end` (and follow-ups when it would stop) but only removes the text
+   * from the mirror at that message's `message_start` — possibly much later
+   * (prepareNextTurn may compact). Clearing inside that window would report a
+   * message as still queued although it is about to be delivered. It is safe
+   * while a tool runs or an assistant message streams (no drain in between),
+   * or when the agent is fully idle.
+   */
+  get queueClearSafe(): boolean {
+    if (!this.running) return false;
+    if (this.compaction) return false;
+    if (this.runningTools.size > 0) return true;
+    if (this.streamingMsg) return true;
+    return !this.busy && !this.promptReserved && this.phase !== 'streaming';
   }
 
   /** Mark a run live; it always has an activity (at least "waiting"). */
@@ -1066,7 +1092,7 @@ export class Session {
             if (echo.clientMessageId) wire = { ...wire, clientMessageId: echo.clientMessageId };
             if (obj.type === 'message_end') {
               this.pendingEcho.splice(idx, 1);
-              echo.onEcho(typeof msg.timestamp === 'number' ? msg.timestamp : null);
+              echo.onEcho(typeof msg.timestamp === 'number' ? msg.timestamp : null, true);
             }
           }
         }

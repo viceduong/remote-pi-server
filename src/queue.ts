@@ -14,7 +14,11 @@
 import path from 'node:path';
 import crypto from 'node:crypto';
 
-export type QueueStatus = 'queued' | 'running' | 'done' | 'failed';
+/** `cancelled` (CONTRACT-V2 §15): a steered item pulled back out of pi's queue. */
+export type QueueStatus = 'queued' | 'running' | 'done' | 'failed' | 'cancelled';
+
+/** How a delivered item reached pi (§15): a fresh turn, or held in pi's steering / follow-up queue. */
+export type DeliveredAs = 'prompt' | 'steer' | 'followUp';
 
 export interface QueueItem {
   id: string;
@@ -34,6 +38,12 @@ export interface QueueItem {
   deliveredAt?: number;
   /** Timestamp of the user message pi wrote for this item (clientMessageId echo). */
   messageTimestamp?: number;
+  /** §15: how pi accepted it (set on delivery). */
+  deliveredAs?: DeliveredAs;
+  /** §15: true once delivered as a steer / follow-up (held in pi's queue), until settled. */
+  steered?: boolean;
+  /** §15: when pi emitted this item's user row (it left pi's queue — no longer cancellable). */
+  echoedAt?: number;
 }
 
 /** Finished items are retained this long, then pruned from the durable file. */
@@ -57,6 +67,13 @@ export interface PendingItemView {
   completedAt: null;
   error: string | null;
   attempts: number;
+  /** §15: delivered as a steer/follow-up and still held in pi's queue (cancellable). */
+  steered: boolean;
+}
+
+/** §15: still sitting in pi's steering/follow-up queue (delivered, not yet echoed). */
+export function isSteeredPending(i: QueueItem): boolean {
+  return i.status === 'running' && !!i.steered && !!i.deliveredAt && !i.echoedAt;
 }
 
 export function pendingView(items: readonly QueueItem[]): PendingItemView[] {
@@ -70,6 +87,7 @@ export function pendingView(items: readonly QueueItem[]): PendingItemView[] {
     completedAt: null,
     error: i.error,
     attempts: i.attempts ?? 0,
+    steered: isSteeredPending(i),
   }));
 }
 
