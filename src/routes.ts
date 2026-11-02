@@ -14,6 +14,7 @@ import type { Env } from './config.js';
 import type { ServerConfig } from './types.js';
 import { listDir, rootPaths, WorkdirError } from './workdir.js';
 import { NotifyPutSchema, NotifySettingsError, publicSettings, type NotifyService } from './notify.js';
+import { OUTPUT_TAIL_DEFAULT, OUTPUT_TAIL_MAX, resolveShellDirs, ShellStore, SHELL_ID_RE } from './shells.js';
 
 /* ---------------- request schemas (zod on every body/query) ---------------- */
 
@@ -71,6 +72,9 @@ const ForkSchema = z.object({
   name: z.string().max(80).optional(),
   clientRequestId: IDEMPOTENCY_KEY.optional(),
 });
+/** §16 */
+const SHELL_ID = z.string().regex(SHELL_ID_RE);
+const ShellOutputQuery = z.object({ tail: intQ(OUTPUT_TAIL_DEFAULT, 1, OUTPUT_TAIL_MAX) });
 const EmptyBody = z.union([z.object({}).passthrough(), z.null(), z.undefined()]);
 
 // App-created ids are 16-hex; discovered pi session ids are UUIDs or <ts>_<uuid>.
@@ -120,9 +124,10 @@ function sendCancel(reply: Reply, r: CancelResult): Reply {
 
 export function registerRoutes(
   fastify: FastifyInstance,
-  opts: { config: Env; manager: SessionManager; piVersion: string | null; log: FastifyBaseLogger; notify?: NotifyService },
+  opts: { config: Env; manager: SessionManager; piVersion: string | null; log: FastifyBaseLogger; notify?: NotifyService; shells?: ShellStore },
 ): void {
   const { config, manager, piVersion, log, notify } = opts;
+  const shells = opts.shells ?? new ShellStore(resolveShellDirs(config.REMOTE_PI_BG_BASH_DIRS));
 
   fastify.addHook('onRequest', async (req, reply) => {
     if (req.url === '/api/health') return;
@@ -136,7 +141,7 @@ export function registerRoutes(
     piVersion,
     api: '1.0',
     workdir: config.REMOTE_PI_WORKDIR,
-    features: ['chat', 'sessions', 'abort', 'history', 'sse', 'contract-v2', ...(notify ? ['notify'] : [])],
+    features: ['chat', 'sessions', 'abort', 'history', 'sse', 'contract-v2', 'background-shells', ...(notify ? ['notify'] : [])],
   };
 
   const idOf = (req: FastifyRequest, reply: Reply): string | null =>
@@ -684,6 +689,64 @@ export function registerRoutes(
       return { ok: true, model };
     } catch (err) {
       return sendError(reply, err);
+    }
+  });
+
+  /* ---------------- §16 background running bash + background shells ---------------- */
+
+  fastify.post('/api/sessions/:id/background', async (req, reply) => {
+    const id = idOf(req, reply);
+    if (!id) return;
+    if (!EmptyBody.safeParse(req.body).success) return reply.code(400).send({ error: 'Invalid body' });
+    const r = await manager.backgroundBash(id);
+    if (r.status === 200) return { ok: true, detached: r.detached };
+    return reply.code(r.status).send({ error: r.error, ...(r.code ? { code: r.code } : {}) });
+  });
+
+  /** Session file for the shell routes (404 sent when unknown). */
+  const shellSession = async (req: FastifyRequest, reply: Reply, withShell: boolean): Promise<{ file: string; shellId: string } | null> => {
+    const id = idOf(req, reply);
+    if (!id) return null;
+    let shellId = '';
+    if (withShell) {
+      const sid = parse(SHELL_ID, (req.params as { shellId?: string }).shellId, reply, 'shell id');
+      if (!sid) return null;
+      shellId = sid;
+    }
+    const file = await manager.sessionFileOf(id);
+    if (!file) {
+      await reply.code(404).send({ error: 'Session not found' });
+      return null;
+    }
+    return { file, shellId };
+  };
+
+  fastify.get('/api/sessions/:id/shells', async (req, reply) => {
+    const s = await shellSession(req, reply, false);
+    if (!s) return;
+    return { shells: shells.list(s.file) };
+  });
+
+  fastify.get('/api/sessions/:id/shells/:shellId/output', async (req, reply) => {
+    const q = parse(ShellOutputQuery, req.query, reply, 'query');
+    if (!q) return;
+    const s = await shellSession(req, reply, true);
+    if (!s) return;
+    const out = shells.output(s.file, s.shellId, q.tail);
+    if (!out) return reply.code(404).send({ error: 'Shell not found' });
+    return out;
+  });
+
+  fastify.post('/api/sessions/:id/shells/:shellId/kill', async (req, reply) => {
+    if (!EmptyBody.safeParse(req.body).success) return reply.code(400).send({ error: 'Invalid body' });
+    const s = await shellSession(req, reply, true);
+    if (!s) return;
+    const r = await shells.kill(s.file, s.shellId);
+    switch (r.result) {
+      case 'killed': return { ok: true };
+      case 'not_found': return reply.code(404).send({ error: 'Shell not found' });
+      case 'not_running': return reply.code(409).send({ error: `Shell is ${r.status}`, code: 'not_running', status: r.status });
+      case 'failed': return reply.code(502).send({ error: r.error });
     }
   });
 

@@ -19,6 +19,13 @@ const EnvSchema = z.object({
   REMOTE_PI_SESSION_DIR: z.string().min(1).optional(),
   /** Server-owned state (notification settings/dedupe). Default `<sessionDir>/.remote-pi`. */
   REMOTE_PI_DATA_DIR: z.string().min(1).optional(),
+  /**
+   * CONTRACT §16: `;`-separated pi-bash OUTPUT_DIRs holding `<shellId>.json/.log`.
+   * Default = pi-bash's own `join(os.tmpdir(), "pi-bg-bash")` resolved in the server's
+   * environment (= bridge children), plus on Windows `%USERPROFILE%\AppData\Local\Temp\pi-bg-bash`
+   * (host TUIs, when the server runs as a service with another TEMP).
+   */
+  REMOTE_PI_BG_BASH_DIRS: z.string().optional(),
   /** CONTRACT §14: set to 0 to disable the turn-end watcher entirely. */
   REMOTE_PI_NOTIFY: z.string().default('1').transform((v) => !(v === '0' || v.toLowerCase() === 'false')),
   REMOTE_PI_MAX_AGENTS: z.coerce.number().int().min(1).max(16).default(6),

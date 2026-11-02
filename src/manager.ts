@@ -89,6 +89,17 @@ export class AmbiguousModelError extends Error {
   readonly code = 400;
 }
 
+/** §16 background route outcome. */
+export type BackgroundResult =
+  | { status: 200; detached: boolean | null }
+  | { status: 404 | 409 | 502; error: string; code?: string };
+
+/** §16: extension command the owner extension (v8) registers in every pi process. */
+export const REMOTE_BACKGROUND_COMMAND = '/remote-background';
+const BACKGROUND_RPC_TIMEOUT_MS = 10_000;
+const OWNER_NO_BACKGROUND_MESSAGE =
+  'The host TUI cannot background a running command (Remote Pi owner extension older than v8) — reload the TUI (/reload)';
+
 /** §11: the transport could not serve the model op (502). */
 export class ModelTransportError extends Error {
   readonly code = 502;
@@ -1074,6 +1085,50 @@ export class SessionManager {
     }
     const noted = data?.model ? session.noteModel(data.model) : null;
     return noted ? { modelId: noted.id, model: { provider: noted.provider, id: noted.id, name: noted.name } } : { modelId: null, model: null };
+  }
+
+  /* ---------------- §16 background running bash ---------------- */
+
+  /**
+   * CONTRACT-V2 §16: detach the running bash (Ctrl+B). Never brings a transport
+   * up — with none attached nothing can be running here (409).
+   *  - TUI owner v8 → op `background_bash` → `{detached}` (`unsupported` → 502);
+   *  - RPC child → RPC `prompt "/remote-background"` (pi runs extension commands
+   *    immediately, even while streaming; no user row, no LLM call) → detached null.
+   */
+  async backgroundBash(id: string): Promise<BackgroundResult> {
+    const session = await this.find(id);
+    if (!session) return { status: 404, error: 'Session not found' };
+    if (!session.running || session.runningToolNames().length === 0) {
+      return { status: 409, error: 'No command is running', code: 'not_running' };
+    }
+    if (session.isProxy) {
+      if (!session.ownerHas('background_bash')) return { status: 502, error: OWNER_NO_BACKGROUND_MESSAGE, code: 'background_unsupported' };
+      let data: { detached?: unknown; unsupported?: unknown } | null;
+      try {
+        data = await session.request<{ detached?: unknown; unsupported?: unknown } | null>({ type: 'background_bash' }, BACKGROUND_RPC_TIMEOUT_MS);
+      } catch (err) {
+        const msg = (err as Error).message || String(err);
+        if (/unknown op/i.test(msg)) return { status: 502, error: OWNER_NO_BACKGROUND_MESSAGE, code: 'background_unsupported' };
+        return { status: 502, error: `Host TUI could not background the command: ${msg}` };
+      }
+      if (data?.unsupported === true) {
+        return { status: 502, error: 'pi on the host cannot background a running command (patched pi core with signalBashDetach required)', code: 'background_unsupported' };
+      }
+      return { status: 200, detached: data?.detached === true };
+    }
+    try {
+      await session.request({ type: 'prompt', message: REMOTE_BACKGROUND_COMMAND }, BACKGROUND_RPC_TIMEOUT_MS);
+    } catch (err) {
+      return { status: 502, error: `The agent could not background the command: ${(err as Error).message || String(err)}` };
+    }
+    return { status: 200, detached: null };
+  }
+
+  /** §16: the session's pi file (for the shell store), or null when unknown. */
+  async sessionFileOf(id: string): Promise<string | null> {
+    const session = await this.find(id);
+    return session?.file ?? null;
   }
 
   /* ---------------- durable prompt queue ---------------- */

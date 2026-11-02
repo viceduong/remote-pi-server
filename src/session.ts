@@ -794,6 +794,11 @@ export class Session {
     if (idx >= 0) this.pendingEcho.splice(idx, 1)[0]!.onEcho(null, false);
   }
 
+  /** §16: names of the tools currently executing (from the §7 activity tracking). */
+  runningToolNames(): string[] {
+    return [...this.runningTools.values()].map((t) => t.name);
+  }
+
   /** §15: the owner advertised `cap` in its hello (proxy transport only). */
   ownerHas(cap: string): boolean {
     return this.ownerCapabilities.includes(cap);
