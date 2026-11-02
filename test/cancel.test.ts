@@ -243,8 +243,24 @@ describe('§15 cancel a steered item — TUI owner v7', () => {
     userEcho(owner!, 'app one');
     await tick();
     expect(session.queue.find((i) => i.clientMessageId === 'cm-1')!.echoedAt).toBeTruthy();
-    expect(pendingView(session.queue).find((v) => v.clientMessageId === 'cm-1')!.steered).toBe(false);
+    // Delivered into the running turn → finished, no longer pending.
+    expect(pendingView(session.queue).find((v) => v.clientMessageId === 'cm-1')).toBeUndefined();
     expect((await del(ID, two.id)).statusCode).toBe(200);
+  });
+
+  it('a steered item is done as soon as pi echoes it, while the long turn keeps running', async () => {
+    const { session, queueFrames } = await busyTui(ID);
+    await steerIn(session, [['mid-turn note', 'cm-mid']]);
+    const item = session.queue.find((i) => i.clientMessageId === 'cm-mid')!;
+    expect(item.status).toBe('running');
+    const before = queueFrames().length;
+    userEcho(owner!, 'mid-turn note');
+    await tick();
+    expect(session.isBusy).toBe(true); // the agent's turn is still going
+    expect(item.status).toBe('done');
+    expect(manager!.pendingItems(session).some((v) => v.clientMessageId === 'cm-mid')).toBe(false);
+    const last = queueFrames().slice(before).pop() as { items: { clientMessageId?: string }[] };
+    expect(last.items.some((i) => i.clientMessageId === 'cm-mid')).toBe(false);
   });
 
   it('a follow-up item keeps its kind; cancelling the follow-up itself removes it from followUp', async () => {
@@ -278,7 +294,7 @@ describe('§15 cancel a steered item — TUI owner v7', () => {
     expect(res.statusCode).toBe(409);
     expect(res.json().code).toBe('already_delivered');
     expect(owner!.steering).toEqual(['typed in terminal', 'other']); // everything else re-queued
-    expect(racer.status).toBe('running');
+    expect(racer.status).toBe('done'); // pi delivered it into the turn → finished
     expect(racer.echoedAt).toBeTruthy();
   });
 

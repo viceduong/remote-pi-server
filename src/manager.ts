@@ -1283,8 +1283,9 @@ export class SessionManager {
         // §15: pi emitted the user row — the item left pi's queue (no longer cancellable).
         item.echoedAt = Date.now();
         if (ts !== null) item.messageTimestamp = ts;
+        const completed = this.completeIfInjected(item);
         this.persistQueue(session);
-        if (item.steered) this.broadcastQueue(session);
+        if (item.steered || completed) this.broadcastQueue(session);
       }
     });
   }
@@ -1297,6 +1298,19 @@ export class SessionManager {
    * consuming a retry attempt (§10) instead of the normal backoff/give-up.
    * Returns true when the prompt was accepted.
    */
+  /**
+   * A steered / follow-up item is finished once pi echoes it into the
+   * conversation: it does not own a turn, so it must not stay `running` (and
+   * show as pending in clients) until the agent's whole — possibly hours-long —
+   * turn ends. Prompt items that started a turn still settle at idle.
+   */
+  private completeIfInjected(item: QueueItem): boolean {
+    if (item.status !== 'running' || !item.echoedAt || !item.deliveredAs || item.deliveredAs === 'prompt') return false;
+    item.status = 'done';
+    item.completedAt = Date.now();
+    return true;
+  }
+
   private async send(
     session: Session,
     item: QueueItem,
@@ -1319,6 +1333,12 @@ export class SessionManager {
       item.deliveredAs = kind;
       item.steered = kind !== 'prompt';
       item.deliveredAt = Date.now();
+      // The echo can beat the acceptance reply (owner events are synchronous).
+      if (this.completeIfInjected(item)) {
+        this.persistQueue(session);
+        this.broadcastQueue(session);
+        return true;
+      }
       if (item.steered && item.status === 'running') this.broadcastQueue(session);
       if (session.error?.startsWith('Queued message')) session.setError(null);
       // The run may already have ended before the acceptance reply arrived
@@ -1451,6 +1471,7 @@ export class SessionManager {
     let changed = false;
     for (const item of session.queue) {
       if (item.status !== 'running') continue;
+      if (this.completeIfInjected(item)) { changed = true; continue; }
       const age = now - (item.startedAt ?? now);
       if (item.deliveredAt) {
         if (!session.isBusy && (now - item.deliveredAt > 180_000 || age > SessionManager.STUCK_RUNNING_MS)) {
