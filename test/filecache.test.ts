@@ -37,6 +37,16 @@ describe('SessionFileCache', () => {
     expect((await cache.summary(file))!.messageCount).toBe(2);
   });
 
+  it('tracks the last model from model_change entries and assistant messages', async () => {
+    fs.writeFileSync(file, header + '{"type":"model_change","provider":"merge-gateway","modelId":"zai/glm-5.3-flash"}\n');
+    const cache = new SessionFileCache();
+    expect((await cache.summary(file))!.model).toBe('merge-gateway/zai/glm-5.3-flash');
+    fs.appendFileSync(file, `${JSON.stringify({ type: 'message', id: 'a1', message: { role: 'assistant', provider: 'p2', model: 'm2', content: [], timestamp: 3 } })}\n`);
+    expect((await cache.summary(file))!.model).toBe('p2/m2');
+    fs.writeFileSync(file, header + msg('m1', 'user', 'no model yet', 1));
+    expect((await new SessionFileCache().summary(file))!.model).toBeNull();
+  });
+
   it('full re-parse on shrink and on a rewritten head', async () => {
     fs.writeFileSync(file, header + msg('m1', 'user', 'a', 1) + msg('m2', 'user', 'b', 2));
     const cache = new SessionFileCache();

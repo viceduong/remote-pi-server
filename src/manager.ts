@@ -134,6 +134,8 @@ interface SessionFileMeta {
   lastActivityAt: number;
   messageCount: number;
   lastMessageAt: number | null;
+  /** Last model recorded in the file (`provider/id`), for sessions not open live. */
+  model: string | null;
   /** A `<file>.lease` sidecar was present at the last directory walk. */
   hasLease: boolean;
 }
@@ -324,6 +326,7 @@ export class SessionManager {
           lastActivityAt: Math.round(s.lastActivityAt),
           messageCount: s.messageCount,
           lastMessageAt: null,
+          model: s.model,
           hasLease: true,
         });
       }
@@ -381,6 +384,7 @@ export class SessionManager {
       lastActivityAt: Math.round(stat.mtimeMs),
       messageCount: sum.messageCount,
       lastMessageAt: sum.lastMessageAt,
+      model: sum.model,
       hasLease,
     };
   }
@@ -839,7 +843,7 @@ export class SessionManager {
       name: (s?.running ? s.name : meta?.name) ?? s?.name ?? 'pi session',
       running: owner !== 'none',
       busy,
-      model: s?.model ?? null,
+      model: s?.model ?? meta?.model ?? null,
       messageCount: meta?.messageCount ?? s?.messageCount ?? 0,
       createdAt: meta?.createdAt ?? s?.createdAt ?? now,
       lastActivityAt,

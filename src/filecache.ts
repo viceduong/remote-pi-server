@@ -27,6 +27,8 @@ export interface FileSummary {
   firstUserText: string | null;
   messageCount: number;
   lastMessageAt: number | null;
+  /** Last model named in the file (`provider/id`): model_change entries and assistant messages. */
+  model: string | null;
   size: number;
   mtimeMs: number;
   /** False while an async (re)parse is still pending for this file. */
@@ -67,6 +69,7 @@ function emptyState(file: string): FileState {
     firstUserText: null,
     messageCount: 0,
     lastMessageAt: null,
+    model: null,
     size: 0,
     mtimeMs: 0,
     complete: false,
@@ -83,8 +86,8 @@ function emptyState(file: string): FileState {
 function interesting(line: string): boolean {
   if (!line.startsWith('{"type":"')) return true; // unknown layout — parse it
   const rest = line.slice(9, 30);
-  // message, session, session_info, session_renamed
-  return rest.startsWith('message"') || rest.startsWith('session');
+  // message, session, session_info, session_renamed, model_change
+  return rest.startsWith('message"') || rest.startsWith('session') || rest.startsWith('model_change"');
 }
 
 export class SessionFileCache {
@@ -162,10 +165,19 @@ export class SessionFileCache {
         st.sessionName = name || null;
         return;
       }
+      case 'model_change': {
+        const e = entry as { provider?: unknown; modelId?: unknown };
+        if (typeof e.provider === 'string' && typeof e.modelId === 'string' && e.modelId) st.model = `${e.provider}/${e.modelId}`;
+        return;
+      }
       case 'message': {
         st.messageCount++;
         const ts = entryTimestamp(entry);
         if (ts !== null) st.lastMessageAt = ts;
+        const am = (entry.message ?? entry) as { role?: string; provider?: unknown; model?: unknown };
+        if (am.role === 'assistant' && typeof am.provider === 'string' && typeof am.model === 'string' && am.model) {
+          st.model = `${am.provider}/${am.model}`;
+        }
         if (st.firstUserText === null) {
           const m = (entry.message ?? entry) as { role?: string; content?: unknown };
           if (m.role === 'user') {
@@ -255,6 +267,7 @@ export class SessionFileCache {
     } catch { /* unreadable */ }
     st.messageCount = 0;
     st.lastMessageAt = null;
+    st.model = null;
     st.size = stat.size;
     st.mtimeMs = stat.mtimeMs;
     st.complete = false;
