@@ -77,7 +77,9 @@ export function isSteeredPending(i: QueueItem): boolean {
 }
 
 export function pendingView(items: readonly QueueItem[]): PendingItemView[] {
-  return items.filter(isActive).map((i) => ({
+  // An echoed item is already a user row in the transcript: it is not pending
+  // for clients any more, even while the turn it started is still running.
+  return items.filter((i) => isActive(i) && !i.echoedAt).map((i) => ({
     id: i.id,
     ...(i.clientMessageId ? { clientMessageId: i.clientMessageId } : {}),
     message: i.message,

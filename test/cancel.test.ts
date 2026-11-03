@@ -298,6 +298,27 @@ describe('§15 cancel a steered item — TUI owner v7', () => {
     expect(racer.echoedAt).toBeTruthy();
   });
 
+  it('missed live echo: the sweep confirms delivery from the session file and clears the chip', async () => {
+    const { session, queueFrames } = await busyTui(ID);
+    await steerIn(session, [['buy 1 new account', 'cm-m']]);
+    const item = session.queue.find((i) => i.clientMessageId === 'cm-m')!;
+    expect(item.deliveredAt).toBeTruthy();
+    expect(item.echoedAt).toBeFalsy(); // pi never echoed it to the server
+    item.deliveredAt = Date.now() - 20_000;
+    const ts = item.queuedAt + 30;
+    fs.appendFileSync(session.file, `${JSON.stringify({ type: 'message', id: 'u1', timestamp: new Date(ts).toISOString(),
+      message: { role: 'user', content: [{ type: 'text', text: 'buy 1 new account' }], timestamp: ts } })}
+`);
+    const before = queueFrames().length;
+    manager!.recoverStuckRunning(session);
+    await tick(120);
+    expect(item.echoedAt).toBeTruthy();
+    expect(item.messageTimestamp).toBe(ts);
+    expect(item.status).toBe('done');
+    expect(pendingView(session.queue)).toEqual([]);
+    expect(queueFrames().length).toBeGreaterThan(before);
+  });
+
   it('echo race with a duplicate text: the echoed item never removes the identical terminal message', async () => {
     const { session } = await busyTui(ID);
     await steerIn(session, [['continue', 'cm-c']]);

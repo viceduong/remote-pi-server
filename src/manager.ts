@@ -1469,9 +1469,13 @@ export class SessionManager {
   recoverStuckRunning(session: Session): void {
     const now = Date.now();
     let changed = false;
+    let needsEchoCheck = false;
     for (const item of session.queue) {
       if (item.status !== 'running') continue;
       if (this.completeIfInjected(item)) { changed = true; continue; }
+      // A live echo can be missed (transport hiccup, attach race): the
+      // persisted user row is authoritative. See reconcileEchoes().
+      if (item.deliveredAt && !item.echoedAt && now - item.deliveredAt > 15_000) needsEchoCheck = true;
       const age = now - (item.startedAt ?? now);
       if (item.deliveredAt) {
         if (!session.isBusy && (now - item.deliveredAt > 180_000 || age > SessionManager.STUCK_RUNNING_MS)) {
@@ -1485,11 +1489,49 @@ export class SessionManager {
         changed = true;
       }
     }
+    if (needsEchoCheck) void this.reconcileEchoes(session);
     if (changed) {
       if (!session.isBusy) session.releasePrompt();
       this.persistQueue(session);
       this.broadcastQueue(session);
       this.dispatchQueued(session);
+    }
+  }
+
+  /**
+   * Mark delivered-but-unechoed items as echoed when their user row is in the
+   * session file: same text, timestamped at/after the item was queued, and
+   * not already claimed by another item (oldest item claims the oldest row).
+   */
+  private async reconcileEchoes(session: Session): Promise<void> {
+    let rows: ChatMessage[];
+    try {
+      rows = await this.history(session);
+    } catch {
+      return;
+    }
+    const claimed = new Set(session.queue.map((i) => i.messageTimestamp).filter((t): t is number => typeof t === 'number'));
+    const waiting = session.queue
+      .filter((i) => i.status === 'running' && i.deliveredAt && !i.echoedAt)
+      .sort((a, b) => a.queuedAt - b.queuedAt);
+    let changed = false;
+    for (const item of waiting) {
+      const text = item.message.trim();
+      const row = rows.find((m) => m.role === 'user' && typeof m.timestamp === 'number'
+        && m.timestamp >= item.queuedAt - 5_000 && !claimed.has(m.timestamp)
+        && (m.text ?? '').trim() === text);
+      if (!row || typeof row.timestamp !== 'number') continue;
+      claimed.add(row.timestamp);
+      item.echoedAt = Date.now();
+      item.messageTimestamp = row.timestamp;
+      session.cancelEcho(item.message, item.clientMessageId);
+      this.completeIfInjected(item);
+      this.options.log.info({ sessionId: session.id, itemId: item.id }, 'queue item echo recovered from the session file');
+      changed = true;
+    }
+    if (changed) {
+      this.persistQueue(session);
+      this.broadcastQueue(session);
     }
   }
 

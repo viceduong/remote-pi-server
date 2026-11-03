@@ -1099,6 +1099,10 @@ export class Session {
               this.pendingEcho.splice(idx, 1);
               echo.onEcho(typeof msg.timestamp === 'number' ? msg.timestamp : null, true);
             }
+          } else if (obj.type === 'message_end') {
+            // Diagnostics for missed echoes (lengths only, never content).
+            this.log.info({ sessionId: this.id, textLen: text.length, waiting: this.pendingEcho.map((e) => e.text.length) },
+              'user message did not match any pending echo');
           }
         }
         break;
