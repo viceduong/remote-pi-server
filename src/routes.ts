@@ -74,10 +74,8 @@ const SetModelSchema = z.object({
   provider: z.string().min(1).max(200).optional(),
   modelId: z.string().min(1).max(200),
 });
-const ForkSchema = z.object({
+const RewindSchema = z.object({
   entryId: z.string().min(1).max(128).optional(),
-  name: z.string().max(80).optional(),
-  clientRequestId: IDEMPOTENCY_KEY.optional(),
 });
 /** §16 */
 const SHELL_ID = z.string().regex(SHELL_ID_RE);
@@ -789,22 +787,22 @@ export function registerRoutes(
     return ok ? { ok: true } : { ok: false, error: 'Abort was not acknowledged by the agent' };
   });
 
-  fastify.post('/api/sessions/:id/fork', async (req, reply) => {
+  // §18: rewind in place — move the SAME session's active leaf to before a
+  // user message. No new session; the caller continues from that point.
+  fastify.post('/api/sessions/:id/rewind', async (req, reply) => {
     const id = idOf(req, reply);
     if (!id) return;
-    const body = parse(ForkSchema, req.body ?? {}, reply, 'body');
+    const body = parse(RewindSchema, req.body ?? {}, reply, 'body');
     if (!body) return;
-    // Fork runs in a dedicated child that only READS the source file, so it
-    // is safe for TUI-owned sessions too; never mid-turn.
     const src = await manager.find(id);
     if (!src) return reply.code(404).send({ error: 'Session not found' });
-    if (src.isBusy) return reply.code(409).send({ error: 'Agent is busy — fork when it finishes' });
+    if (src.isBusy) return reply.code(409).send({ error: 'Agent is busy — rewind when it finishes' });
     const entryId = body.entryId ?? await manager.lastUserEntryId(id);
-    if (!entryId) return reply.code(400).send({ error: 'No forkable user message found' });
+    if (!entryId) return reply.code(400).send({ error: 'No user message to rewind to' });
     try {
-      const result = await manager.fork(id, entryId, body.name, body.clientRequestId);
+      const result = await manager.rewind(id, entryId);
       if (!result) return reply.code(404).send({ error: 'Session not found' });
-      return reply.code(201).send({ session: result.session, forkedFrom: result.text });
+      return reply.code(200).send({ ok: true, text: result.text });
     } catch (err) {
       return sendError(reply, err);
     }

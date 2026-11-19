@@ -317,4 +317,34 @@ describe('§10 steer / send-now — HTTP routes', () => {
     expect(prompt).toBeTruthy();
     expect(prompt!.images).toEqual(images);
   });
+
+  it('POST /rewind navigates the tree to the user message parent, same session (§18)', async () => {
+    owner = await fakeOwner();
+    const dir = path.join(root, '--proj--');
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, `${ID}.jsonl`);
+    fs.writeFileSync(file, [
+      JSON.stringify({ type: 'session', id: ID, cwd: root }),
+      JSON.stringify({ type: 'message', id: 'a0', parentId: null, message: { role: 'assistant', content: [{ type: 'text', text: 'hi' }], timestamp: 1 } }),
+      JSON.stringify({ type: 'message', id: 'u1', parentId: 'a0', message: { role: 'user', content: [{ type: 'text', text: 'do the thing' }], timestamp: 2 } }),
+      JSON.stringify({ type: 'message', id: 'a1', parentId: 'u1', message: { role: 'assistant', content: [{ type: 'text', text: 'done' }], timestamp: 3 } }),
+      '',
+    ].join('\n'));
+    acquireLease(file, 'nonce', owner.ipc, Date.now(), { kind: 'tui' });
+    await startApp(makeManager());
+    const s = await manager!.ensureRunning(ID);
+    await tick();
+    expect(s!.isBusy).toBe(false);
+
+    const res = await app.inject({
+      method: 'POST', url: `/api/sessions/${ID}/rewind`, headers: auth,
+      payload: { entryId: 'u1' },
+    });
+    await tick();
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({ ok: true, text: 'do the thing' });
+    const nav = owner.received.find((m) => m.op === 'navigate_tree');
+    expect(nav).toBeTruthy();
+    expect(nav!.targetId).toBe('a0'); // u1's parent
+  });
 });

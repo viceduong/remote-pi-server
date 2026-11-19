@@ -19,7 +19,7 @@ import {
   type LeaseInspection,
 } from './lease.js';
 import { SessionFileCache, type FileSummary } from './filecache.js';
-import { stripLoneSurrogates } from './jsonl.js';
+import { contentText, stripLoneSurrogates } from './jsonl.js';
 import { modelRefOf, normalizeModel, normalizeModelList, OWNER_TOO_OLD_MESSAGE, resolveModel, type ModelEntry, type ModelListing, type ModelRef } from './models.js';
 import {
   QUEUE_MAX_ACTIVE,
@@ -1870,57 +1870,57 @@ export class SessionManager {
     return null;
   }
 
-  /* ---------------- fork ---------------- */
+  /* ---------------- rewind ---------------- */
 
   /**
-   * Fork at a user entry. pi 0.85 RPC `fork` switches the PROCESS to a brand
-   * new session file. So: spawn a dedicated child on the source file (it only
-   * reads it and never takes the source lease), fork there, read get_state
-   * for the new sessionFile/sessionId, and keep that child as the NEW session
-   * keyed by its real pi id. The source session (and its owner/child/viewers)
-   * is never touched.
+   * The JSONL `parentId` of an entry (the entry immediately before it in the
+   * active branch), plus the user-message text of the entry itself. Used to
+   * rewind to BEFORE a user message: navigate the tree to its parent.
    */
-  fork(id: string, entryId: string, name?: string, clientRequestId?: string): Promise<{ session: SessionSummary; text: string | null } | null> {
-    return this.idempotent(clientRequestId ? `fork:${clientRequestId}` : undefined, () => this.forkUnlocked(id, entryId, name));
+  private rewindTarget(file: string, entryId: string): { parentId: string | null; text: string } | null {
+    let data: string;
+    try {
+      data = fs.readFileSync(file, 'utf8');
+    } catch {
+      return null;
+    }
+    for (const line of data.split('\n')) {
+      if (!line || line.indexOf(entryId) === -1) continue;
+      let e: { id?: string; type?: string; parentId?: string | null; message?: { role?: string; content?: unknown } };
+      try { e = JSON.parse(line); } catch { continue; }
+      if (e.id !== entryId) continue;
+      const text = e.message?.role === 'user' ? contentText(e.message.content).trim() : '';
+      return { parentId: typeof e.parentId === 'string' ? e.parentId : null, text };
+    }
+    return null;
   }
 
-  private async forkUnlocked(id: string, entryId: string, name?: string): Promise<{ session: SessionSummary; text: string | null } | null> {
-    const src = await this.find(id);
-    if (!src) return null;
-    if (src.isBusy) throw new SpawnError('Agent is busy — fork when the current turn finishes');
-    if (!this.ensureAgentSlot()) throw new BusyError(this.options.maxAgents);
-    const child = new Session(
-      `${this.nextId()}`,
-      name || `${src.name} (fork)`,
-      src.file,
-      this.options.bin,
-      src.workdir,
-      this.options.sessionDir,
-      this.options.extraArgs,
-      this.options.log.child({ fork: true }),
-      'app',
-    );
-    child.keySource = (file) => this.files.keySnapshot(file);
-    try {
-      await child.start({ noLease: true, passName: false });
-      this.throwIfDead(child);
-      const data = await child.request<{ text?: string; cancelled?: boolean }>({ type: 'fork', entryId }, 30_000);
-      if (data.cancelled) throw new SpawnError('Fork cancelled by an extension');
-      const st = await child.request<AgentState>({ type: 'get_state' }, 15_000);
-      if (!st.sessionFile || !st.sessionId || path.resolve(st.sessionFile) === path.resolve(src.file)) {
-        throw new SpawnError('pi did not switch to a new session file after fork');
-      }
-      const { sessionFile: _ignored, ...rest } = st;
-      child.applyState(rest);
-      child.adoptIdentity(st.sessionId, st.sessionFile, name || `${src.name} (fork)`);
-      if (name) await child.request({ type: 'set_session_name', name }).catch(() => undefined);
-      this.register(child);
-      this.invalidateIndex();
-      return { session: await this.summaryOf(child), text: data.text ?? null };
-    } catch (err) {
-      child.stop('fork failed');
-      throw err;
-    }
+  /**
+   * CONTRACT §18 — rewind in place. Move the session's active leaf to BEFORE a
+   * user message (its JSONL parent) via pi `navigate_tree`. Same session, same
+   * process: the turns from that point on leave the active branch and the
+   * caller continues right away. Returns the rewound message's text so the
+   * client can refill its composer.
+   */
+  async rewind(id: string, entryId: string): Promise<{ text: string; cancelled: boolean } | null> {
+    const s = await this.find(id);
+    if (!s) return null;
+    if (s.isBusy) throw new SpawnError('Agent is busy — rewind when the current turn finishes');
+    const target = this.rewindTarget(s.file, entryId);
+    if (!target || !target.parentId) throw new SpawnError('No earlier point to rewind to');
+    const data = await s.request<{ cancelled?: boolean }>({ type: 'navigate_tree', targetId: target.parentId }, 30_000);
+    if (data.cancelled) throw new SpawnError('Rewind cancelled by an extension');
+    // The active branch changed under the same file. Drop any queued items
+    // (they belong to the abandoned branch), re-read the file, and start a new
+    // stream epoch so every client reloads the transcript at the rewind point.
+    for (const item of s.queue) this.queueImages.delete(item.id);
+    s.queue = [];
+    this.persistQueue(s);
+    this.files.delete(s.file);
+    this.invalidateIndex();
+    s.newEpoch();
+    this.broadcastQueue(s);
+    return { text: target.text, cancelled: false };
   }
 
   /* ---------------- maintenance ---------------- */
