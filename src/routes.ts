@@ -34,11 +34,18 @@ const CreateSessionSchema = z.object({
 });
 const DirsQuery = z.object({ path: z.string().min(1).max(4096).optional() });
 
+// §17: inline images on a prompt. `data` is raw base64 (no data: prefix);
+// capped so a turn body stays well under the body limit (≈6MB base64 total).
+const ImageSchema = z.object({
+  data: z.string().min(1).max(8_000_000),
+  mimeType: z.enum(['image/jpeg', 'image/png', 'image/webp', 'image/gif']),
+});
 const TurnSchema = z.object({
   message: z.string().min(1).max(50_000),
   streamingBehavior: z.enum(['steer', 'followUp']).optional(),
   // Client-generated idempotency key; legacy clients may omit it.
   clientMessageId: IDEMPOTENCY_KEY.optional(),
+  images: z.array(ImageSchema).max(8).optional(),
 });
 const TurnQuery = z.object({ force: flag });
 const ListQuery = z.object({ limit: intQ(50, 1, 200), before: tsQ });
@@ -277,7 +284,7 @@ export function registerRoutes(
         // stay intact, then promote it to immediate delivery with the requested
         // behavior (bypassing the busy gate). A duplicate clientMessageId that
         // already ran/finished returns the same item without re-sending.
-        const item = manager.enqueuePrompt(session, body.message, body.clientMessageId);
+        const item = manager.enqueuePrompt(session, body.message, body.clientMessageId, body.images);
         if (item.status === 'failed') {
           return reply.code(409).send({ error: item.error ?? 'Previously failed idempotent turn', code: 'turn_failed' });
         }
@@ -301,7 +308,7 @@ export function registerRoutes(
       }
       // Everything else goes through the durable queue: dispatched at once
       // when the agent is idle, held (never lost, never doubled) when busy.
-      const item = manager.enqueuePrompt(session, body.message, body.clientMessageId);
+      const item = manager.enqueuePrompt(session, body.message, body.clientMessageId, body.images);
       if (item.status === 'failed') {
         return reply.code(409).send({ error: item.error ?? 'Previously failed idempotent turn', code: 'turn_failed' });
       }

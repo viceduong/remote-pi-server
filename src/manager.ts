@@ -34,6 +34,7 @@ import {
   restoreItems,
   type DeliveredAs,
   type PendingItemView,
+  type PromptImage,
   type QueueItem,
 } from './queue.js';
 import type { AgentMessage, AgentState, ChatMessage, LiveInstance, SessionOwner, SessionSummary } from './types.js';
@@ -196,6 +197,12 @@ export class SessionManager {
   private readonly idempotency = new Map<string, { at: number; promise: Promise<unknown> }>();
   /** Last time a bridge transport for a file ended (unowned-writer heuristic). */
   private readonly lastBridgeExit = new Map<string, number>();
+  /**
+   * §17: inline prompt images, held in memory by queue-item id until the item
+   * is delivered to pi. Kept off QueueItem so they never hit the queue file or
+   * the pending wire view (images are large base64 and single-use).
+   */
+  private readonly queueImages = new Map<string, PromptImage[]>();
   readonly files: SessionFileCache;
   /** CONTRACT §12 allowed roots for client-chosen working directories. */
   readonly workdirRoots: WorkdirRoot[];
@@ -1142,7 +1149,7 @@ export class SessionManager {
    * are stripped (Node's encoder crashed on them); valid pairs — emoji —
    * are preserved.
    */
-  enqueuePrompt(session: Session, rawMessage: string, clientMessageId?: string): QueueItem {
+  enqueuePrompt(session: Session, rawMessage: string, clientMessageId?: string, images?: PromptImage[]): QueueItem {
     const message = stripLoneSurrogates(rawMessage);
     if (clientMessageId) {
       const existing = session.queue.find((item) => item.clientMessageId === clientMessageId);
@@ -1160,6 +1167,7 @@ export class SessionManager {
       error: null,
       attempts: 0,
     };
+    if (images && images.length) this.queueImages.set(item.id, images);
     session.queue.push(item);
     this.persistQueue(session);
     this.broadcastQueue(session);
@@ -1320,13 +1328,18 @@ export class SessionManager {
     item: QueueItem,
     opts: { streamingBehavior?: 'steer' | 'followUp'; steer?: boolean } = {},
   ): Promise<boolean> {
-    this.options.log.info({ sessionId: session.id, itemId: item.id, attempt: item.attempts, steer: opts.steer ?? false }, 'dispatching queued prompt');
+    const images = this.queueImages.get(item.id);
+    this.options.log.info({ sessionId: session.id, itemId: item.id, attempt: item.attempts, steer: opts.steer ?? false, images: images?.length ?? 0 }, 'dispatching queued prompt');
     try {
       const data = await session.request<Record<string, unknown> | null>({
         type: 'prompt',
         message: item.message,
+        ...(images && images.length ? { images } : {}),
         ...(opts.streamingBehavior ? { streamingBehavior: opts.streamingBehavior } : {}),
       }, 30_000);
+      // Images are single-use: once pi accepted the prompt, drop them so a
+      // retry never re-sends and memory is freed.
+      this.queueImages.delete(item.id);
       // §15: remember how pi took it. An explicit behavior is a steer/follow-up;
       // an owner `prompt` op without one reports whether it queued it (busy → followUp).
       let kind: DeliveredAs = opts.streamingBehavior ?? 'prompt';
@@ -1452,6 +1465,7 @@ export class SessionManager {
       item.status = 'failed';
       item.error = msg;
       item.completedAt = Date.now();
+      this.queueImages.delete(item.id);
       this.options.log.error({ sessionId: session.id, itemId: item.id, err: msg }, 'queued prompt failed permanently');
       session.setError(`Queued message failed after ${attempts} attempts: ${msg}`);
     } else {
@@ -1647,6 +1661,7 @@ export class SessionManager {
   private removeQueued(session: Session, item: QueueItem): CancelResult {
     const idx = session.queue.indexOf(item);
     if (idx >= 0) session.queue.splice(idx, 1);
+    this.queueImages.delete(item.id);
     this.persistQueue(session);
     this.broadcastQueue(session);
     return { result: 'cancelled' };
@@ -1775,6 +1790,7 @@ export class SessionManager {
     item.status = 'cancelled';
     item.completedAt = Date.now();
     item.steered = false;
+    this.queueImages.delete(item.id);
     session.cancelEcho(item.message, item.clientMessageId);
     this.persistQueue(session);
     this.broadcastQueue(session);

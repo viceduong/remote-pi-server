@@ -43,7 +43,7 @@ async function main(): Promise<void> {
 
   const app = Fastify({
     logger: false, // request logs off; app errors go through our pino logger
-    bodyLimit: 1_048_576,
+    bodyLimit: 12_582_912, // 12 MB: a prompt can carry up to 8 inline images (§17)
     // cloudflared / local reverse proxies connect from loopback: trust only
     // those hops for X-Forwarded-For so req.ip is the real client.
     trustProxy: ['127.0.0.1', '::1'],

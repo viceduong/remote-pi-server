@@ -20,6 +20,12 @@ export type QueueStatus = 'queued' | 'running' | 'done' | 'failed' | 'cancelled'
 /** How a delivered item reached pi (§15): a fresh turn, or held in pi's steering / follow-up queue. */
 export type DeliveredAs = 'prompt' | 'steer' | 'followUp';
 
+/** §17: a base64 image attached to a prompt (raw base64, no data: prefix). */
+export interface PromptImage {
+  data: string;
+  mimeType: string;
+}
+
 export interface QueueItem {
   id: string;
   /** Client-generated idempotency key; optional for legacy API clients. */

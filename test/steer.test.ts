@@ -299,4 +299,22 @@ describe('§10 steer / send-now — HTTP routes', () => {
     expect((again.json() as { queueItemId: string }).queueItemId).toBe(body.queueItemId);
     expect(owner.received.filter((m) => m.op === 'steer')).toHaveLength(1);
   });
+
+  it('POST /turn with images threads them to the prompt op (§17)', async () => {
+    owner = await fakeOwner();
+    const file = writeSession(ID);
+    acquireLease(file, 'nonce', owner.ipc, Date.now(), { kind: 'tui' });
+    await startApp(makeManager());
+
+    const images = [{ data: 'aGVsbG8=', mimeType: 'image/png' }];
+    const res = await app.inject({
+      method: 'POST', url: `/api/sessions/${ID}/turn`, headers: auth,
+      payload: { message: 'what is this', images, clientMessageId: 'cm-img' },
+    });
+    await tick();
+    expect(res.statusCode).toBe(202);
+    const prompt = owner.received.find((m) => m.op === 'prompt' && m.message === 'what is this');
+    expect(prompt).toBeTruthy();
+    expect(prompt!.images).toEqual(images);
+  });
 });
