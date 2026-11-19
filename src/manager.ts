@@ -19,7 +19,7 @@ import {
   type LeaseInspection,
 } from './lease.js';
 import { SessionFileCache, type FileSummary } from './filecache.js';
-import { contentText, stripLoneSurrogates } from './jsonl.js';
+import { stripLoneSurrogates } from './jsonl.js';
 import { modelRefOf, normalizeModel, normalizeModelList, OWNER_TOO_OLD_MESSAGE, resolveModel, type ModelEntry, type ModelListing, type ModelRef } from './models.js';
 import {
   QUEUE_MAX_ACTIVE,
@@ -1873,54 +1873,71 @@ export class SessionManager {
   /* ---------------- rewind ---------------- */
 
   /**
-   * The JSONL `parentId` of an entry (the entry immediately before it in the
-   * active branch), plus the user-message text of the entry itself. Used to
-   * rewind to BEFORE a user message: navigate the tree to its parent.
-   */
-  private rewindTarget(file: string, entryId: string): { parentId: string | null; text: string } | null {
-    let data: string;
-    try {
-      data = fs.readFileSync(file, 'utf8');
-    } catch {
-      return null;
-    }
-    for (const line of data.split('\n')) {
-      if (!line || line.indexOf(entryId) === -1) continue;
-      let e: { id?: string; type?: string; parentId?: string | null; message?: { role?: string; content?: unknown } };
-      try { e = JSON.parse(line); } catch { continue; }
-      if (e.id !== entryId) continue;
-      const text = e.message?.role === 'user' ? contentText(e.message.content).trim() : '';
-      return { parentId: typeof e.parentId === 'string' ? e.parentId : null, text };
-    }
-    return null;
-  }
-
-  /**
-   * CONTRACT §18 — rewind in place. Move the session's active leaf to BEFORE a
-   * user message (its JSONL parent) via pi `navigate_tree`. Same session, same
-   * process: the turns from that point on leave the active branch and the
-   * caller continues right away. Returns the rewound message's text so the
-   * client can refill its composer.
+   * CONTRACT §18 — rewind in place. pi `fork` at a user entry truncates to a
+   * NEW session file holding only the branch BEFORE that message (and drops
+   * its text into the editor). The transcript pipeline is linear (file order,
+   * no branch tree), so a branched leaf in the same file would still render
+   * every entry; a fresh truncated file renders exactly the rewound history.
+   *
+   * To keep it the SAME session for the app, the live session's own process
+   * forks (switching itself to the new file), then the Session KEEPS its
+   * app-facing id and only adopts the new file + pi id, reseeds §13 keys, and
+   * starts a new stream epoch so clients reload the truncated transcript. The
+   * forked-from user text is returned for the composer.
    */
   async rewind(id: string, entryId: string): Promise<{ text: string; cancelled: boolean } | null> {
     const s = await this.find(id);
     if (!s) return null;
     if (s.isBusy) throw new SpawnError('Agent is busy — rewind when the current turn finishes');
-    const target = this.rewindTarget(s.file, entryId);
-    if (!target || !target.parentId) throw new SpawnError('No earlier point to rewind to');
-    const data = await s.request<{ cancelled?: boolean }>({ type: 'navigate_tree', targetId: target.parentId }, 30_000);
-    if (data.cancelled) throw new SpawnError('Rewind cancelled by an extension');
-    // The active branch changed under the same file. Drop any queued items
-    // (they belong to the abandoned branch), re-read the file, and start a new
-    // stream epoch so every client reloads the transcript at the rewind point.
+    const appId = s.id;
+    const srcFile = s.file;
+    const srcName = s.name;
+    const srcWorkdir = s.workdir;
+    if (!this.ensureAgentSlot()) throw new BusyError(this.options.maxAgents);
+    // Fork in a dedicated child that only READS the source file (never takes
+    // the source lease, never touches a host TUI owner). pi `fork` switches
+    // THAT child to a new truncated file holding only the branch before the
+    // message. We then retire the old transport and adopt the fork as the SAME
+    // app session (keeping its id), so the linear transcript pipeline renders
+    // exactly the rewound history.
+    const child = new Session(
+      `${this.nextId()}`, srcName, srcFile, this.options.bin, srcWorkdir,
+      this.options.sessionDir, this.options.extraArgs, this.options.log.child({ rewind: true }), 'app',
+    );
+    child.keySource = (file) => this.files.keySnapshot(file);
+    let newFile: string;
+    let newPiId: string;
+    let forkedText = '';
+    try {
+      await child.start({ noLease: true, passName: false });
+      this.throwIfDead(child);
+      const data = await child.request<{ text?: string; cancelled?: boolean }>({ type: 'fork', entryId }, 30_000);
+      if (data.cancelled) throw new SpawnError('Rewind cancelled by an extension');
+      const st = await child.request<AgentState>({ type: 'get_state' }, 15_000);
+      if (!st.sessionFile || !st.sessionId || path.resolve(st.sessionFile) === path.resolve(srcFile)) {
+        throw new SpawnError('pi did not switch to the rewound session file');
+      }
+      newFile = st.sessionFile;
+      newPiId = st.sessionId;
+      forkedText = data.text ?? '';
+    } catch (err) {
+      child.stop('rewind failed');
+      throw err;
+    }
+    // Retire the old session transport; adopt the fork child under the SAME
+    // app-facing id so the client stays put.
     for (const item of s.queue) this.queueImages.delete(item.id);
     s.queue = [];
     this.persistQueue(s);
-    this.files.delete(s.file);
+    this.sessions.delete(appId);
+    s.stop('rewound');
+    child.id = appId;
+    child.adoptForkedFile(newPiId, newFile);
+    child.name = srcName;
+    this.register(child);
     this.invalidateIndex();
-    s.newEpoch();
-    this.broadcastQueue(s);
-    return { text: target.text, cancelled: false };
+    this.broadcastQueue(child);
+    return { text: forkedText, cancelled: false };
   }
 
   /* ---------------- maintenance ---------------- */

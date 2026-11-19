@@ -113,14 +113,33 @@ function userEcho(o: FakeOwner, text: string, socket?: net.Socket): void {
 function writeFakePi(dir: string): string {
   const script = path.join(dir, 'fake-pi.mjs');
   fs.writeFileSync(script, `
+import fs from 'node:fs';
+import path from 'node:path';
 import readline from 'node:readline';
 const out = (o) => process.stdout.write(JSON.stringify(o) + '\\n');
 let steering = [], followUp = [];
+let forked = null; // { file, id } after a fork (§18 rewind)
+// The session file pi was launched with is the --session arg.
+const sessionArg = (() => { const i = process.argv.indexOf('--session'); return i >= 0 ? process.argv[i + 1] : null; })();
+const srcId = (() => {
+  try { return JSON.parse(fs.readFileSync(sessionArg, 'utf8').split('\\n')[0]).id; } catch { return 'src'; }
+})();
 readline.createInterface({ input: process.stdin }).on('line', (line) => {
   const c = JSON.parse(line);
   const ok = (data) => out({ id: c.id, type: 'response', command: c.type, success: true, ...(data === undefined ? {} : { data }) });
   switch (c.type) {
-    case 'get_state': return ok({ isStreaming: false, messageCount: 0 });
+    case 'get_state':
+      return ok(forked
+        ? { isStreaming: false, messageCount: 0, sessionFile: forked.file, sessionId: forked.id }
+        : { isStreaming: false, messageCount: 0, sessionFile: sessionArg, sessionId: srcId });
+    case 'fork': {
+      const dir = path.dirname(sessionArg || '.');
+      const id = 'rw-' + (c.entryId || 'x');
+      const file = path.join(dir, id + '.jsonl');
+      fs.writeFileSync(file, JSON.stringify({ type: 'session', id, cwd: dir }) + '\\n');
+      forked = { file, id };
+      return ok({ text: 'rewound text', cancelled: false });
+    }
     case 'prompt':
       if (c.streamingBehavior === 'steer') steering.push(c.message);
       else if (c.streamingBehavior === 'followUp') followUp.push(c.message);
@@ -460,5 +479,27 @@ describe('§15 cancel a steered item — bridge RPC child', () => {
     expect(res.statusCode).toBe(409);
     expect(res.json().code).toBe('already_delivered');
     expect((await peek(session)).steering).toEqual(['soon']); // fake pi never "delivered" it; untouched
+  });
+
+  it('§18 rewind: forks to a truncated file and keeps the same app session id', async () => {
+    writeSession(ID);
+    await startApp(writeFakePi(root));
+    const session = (await manager!.ensureRunning(ID))!;
+    expect(session.hasChild).toBe(true);
+    await tick();
+
+    const res = await app!.inject({
+      method: 'POST', url: `/api/sessions/${ID}/rewind`, headers: auth,
+      payload: { entryId: 'u1' },
+    });
+    await tick(80);
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({ ok: true, text: 'rewound text' });
+
+    // Same app-facing id still resolves; it now points at the truncated file.
+    const after = await manager!.find(ID);
+    expect(after).toBeTruthy();
+    expect(after!.id).toBe(ID);
+    expect(path.basename(after!.file)).toBe('rw-u1.jsonl');
   });
 });

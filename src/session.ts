@@ -1456,6 +1456,29 @@ export class Session {
   }
 
   /**
+   * §18 rewind: adopt the truncated fork file while KEEPING the app-facing id,
+   * so the client stays on the same session. Only the pi identity + file swap;
+   * §13 keys reseed and a new epoch makes clients reload the truncated history.
+   */
+  adoptForkedFile(piId: string, file: string): void {
+    this.piId = piId;
+    this.file = file;
+    this.newEpoch();
+    void this.seedKeys(fileSize(file));
+    if (this.proc) {
+      try {
+        this.takeBridgeLease();
+        const lease = this.bridgeLease as Lease | null;
+        if (lease && this.proc.pid) {
+          renewLease(this.file, lease, Date.now(), { holder: { ...lease.holder, pid: this.proc.pid } });
+        }
+      } catch (err) {
+        this.log.warn({ sessionId: this.id, err: (err as Error).message }, 'rewind lease failed');
+      }
+    }
+  }
+
+  /**
    * Stop the active transport. Children are killed (exit is reported by the
    * close handler); owner proxies only drop our pipe (never the host TUI).
    * Every path emits agent_exited + agent_status.
