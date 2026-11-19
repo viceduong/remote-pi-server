@@ -1006,6 +1006,42 @@ export class SessionManager {
     return this.fetchModels(session);
   }
 
+  /** models.json content, cached briefly (providers that pin an exact model set). */
+  private modelsJsonCache: { at: number; pinned: Map<string, Set<string>> } | null = null;
+
+  /**
+   * Providers that declare an explicit `models` array in models.json pin their
+   * list: pi still merges a stale, version-gated pi.dev catalog overlay on top
+   * (and never prunes it), so for those providers we keep only the ids the user
+   * actually configured. Providers without a models.json `models` array (e.g.
+   * ones served purely from the live catalog) are left untouched.
+   */
+  private configuredModelSets(): Map<string, Set<string>> {
+    const now = Date.now();
+    if (this.modelsJsonCache && now - this.modelsJsonCache.at < 5_000) return this.modelsJsonCache.pinned;
+    const pinned = new Map<string, Set<string>>();
+    try {
+      const file = path.resolve(this.options.sessionDir, '..', 'models.json');
+      const raw = JSON.parse(fs.readFileSync(file, 'utf8')) as { providers?: Record<string, { models?: { id?: string }[] }> };
+      for (const [id, prov] of Object.entries(raw.providers ?? {})) {
+        if (Array.isArray(prov?.models) && prov.models.length) {
+          pinned.set(id, new Set(prov.models.map((m) => m.id).filter((x): x is string => typeof x === 'string')));
+        }
+      }
+    } catch { /* no models.json / unreadable → prune nothing */ }
+    this.modelsJsonCache = { at: now, pinned };
+    return pinned;
+  }
+
+  private pruneToConfiguredModels<T extends { provider: string; id: string }>(models: T[]): T[] {
+    const pinned = this.configuredModelSets();
+    if (pinned.size === 0) return models;
+    return models.filter((m) => {
+      const set = pinned.get(m.provider);
+      return !set || set.has(m.id);
+    });
+  }
+
   private async fetchModels(session: Session): Promise<ModelListing> {
     if (session.isProxy && !session.ownerSupportsModels) throw new ModelTransportError(OWNER_TOO_OLD_MESSAGE);
     let data: { models?: unknown; current?: unknown };
@@ -1016,7 +1052,8 @@ export class SessionManager {
       if (session.isProxy && /unknown op/i.test(msg)) throw new ModelTransportError(OWNER_TOO_OLD_MESSAGE);
       throw new ModelTransportError(`Could not list models: ${msg}`);
     }
-    const models = normalizeModelList(data?.models ?? []);
+    let models = normalizeModelList(data?.models ?? []);
+    models = this.pruneToConfiguredModels(models);
     let current: ModelRef | null = null;
     if (session.isProxy) {
       current = modelRefOf(data?.current);
