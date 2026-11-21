@@ -315,7 +315,8 @@ describe('§10 steer / send-now — HTTP routes', () => {
     expect(res.statusCode).toBe(202);
     const prompt = owner.received.find((m) => m.op === 'prompt' && m.message === 'what is this');
     expect(prompt).toBeTruthy();
-    expect(prompt!.images).toEqual(images);
+    // pi's ImageContent needs a type tag; the server adds it before handoff.
+    expect(prompt!.images).toEqual([{ type: 'image', data: 'aGVsbG8=', mimeType: 'image/png' }]);
   });
 
 });

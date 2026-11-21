@@ -1371,7 +1371,11 @@ export class SessionManager {
       const data = await session.request<Record<string, unknown> | null>({
         type: 'prompt',
         message: item.message,
-        ...(images && images.length ? { images } : {}),
+        // pi's ImageContent requires a `type: "image"` tag; the wire shape is
+        // just {data, mimeType}, so add it here before handing off to pi.
+        ...(images && images.length
+          ? { images: images.map((im) => ({ type: 'image' as const, data: im.data, mimeType: im.mimeType })) }
+          : {}),
         ...(opts.streamingBehavior ? { streamingBehavior: opts.streamingBehavior } : {}),
       }, 30_000);
       // Images are single-use: once pi accepted the prompt, drop them so a
