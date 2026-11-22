@@ -94,6 +94,10 @@ export interface ChatMessage {
   clientMessageId?: string;
   /** CONTRACT §9: set on the toolResult row of `ask_user_question` (visible Q&A row). */
   qa?: { cancelled: boolean; items: { question: string; answer: string }[] };
+  /** §17: image attachments on this row, metadata only (bytes fetched lazily
+   * via GET /messages/:entryId/images/:index). `index` is the image's position
+   * among image blocks in the entry's content. */
+  images?: { index: number; mimeType: string }[];
 }
 
 /** Runtime phase of a session (derived from the owner's event stream). */

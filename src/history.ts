@@ -70,6 +70,8 @@ export function mapAgentMessage(msg: AgentMessage | null | undefined): ChatMessa
     base.text = canonicalText(msg);
     // pi serves context-prune summaries as role "user"/"custom"; system notes.
     base.system = isSystemNote || isPruneSummary(base.text);
+    const images = imageMetadata(contentArr);
+    if (images.length) base.images = images;
   } else if (role === 'assistant') {
     base.text = canonicalText(msg);
     for (const block of contentArr) {
@@ -93,6 +95,19 @@ export function mapAgentMessage(msg: AgentMessage | null | undefined): ChatMessa
 
   return base;
 }
+/** §17: image blocks in an entry's content → {index, mimeType} metadata (no bytes). */
+export function imageMetadata(content: ContentBlock[]): { index: number; mimeType: string }[] {
+  const out: { index: number; mimeType: string }[] = [];
+  let i = 0;
+  for (const b of content) {
+    if (b.type === 'image' && typeof b.data === 'string' && b.data) {
+      out.push({ index: i, mimeType: typeof b.mimeType === 'string' ? b.mimeType : 'image/jpeg' });
+      i++;
+    }
+  }
+  return out;
+}
+
 function parseArguments(raw: unknown): Record<string, unknown> {
   if (raw && typeof raw === 'object') return raw as Record<string, unknown>;
   if (typeof raw === 'string') {

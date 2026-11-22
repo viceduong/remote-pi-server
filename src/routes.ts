@@ -611,6 +611,20 @@ export function registerRoutes(
     }
   });
 
+  // §17: lazily fetch the bytes of an image attached to a user message.
+  fastify.get('/api/sessions/:id/messages/:entryId/images/:index', async (req, reply) => {
+    const id = idOf(req, reply);
+    if (!id) return;
+    const { entryId, index } = req.params as { entryId: string; index: string };
+    const idx = Number(index);
+    if (!entryId || !Number.isInteger(idx) || idx < 0 || idx > 31) {
+      return reply.code(400).send({ error: 'Invalid image reference' });
+    }
+    const img = await manager.readImage(id, entryId, idx);
+    if (!img) return reply.code(404).send({ error: 'Image not found' });
+    return reply.header('content-type', img.mimeType).header('cache-control', 'private, max-age=31536000, immutable').send(img.data);
+  });
+
   fastify.get('/api/sessions/:id/state', async (req, reply) => {
     const id = idOf(req, reply);
     if (!id) return;

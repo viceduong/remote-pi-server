@@ -1911,6 +1911,43 @@ export class SessionManager {
     return null;
   }
 
+  /**
+   * §17: the bytes of the `index`-th image block in the entry `entryId`, read
+   * lazily from the session JSONL (images are never held in the ChatMessage
+   * list). Returns null if the entry/image is not found.
+   */
+  async readImage(id: string, entryId: string, index: number): Promise<{ data: Buffer; mimeType: string } | null> {
+    const s = await this.find(id);
+    if (!s) return null;
+    let file: string;
+    try {
+      file = fs.readFileSync(s.file, 'utf8');
+    } catch {
+      return null;
+    }
+    for (const line of file.split('\n')) {
+      if (!line || line.indexOf(entryId) === -1) continue;
+      let e: { id?: string; message?: { content?: unknown } };
+      try { e = JSON.parse(line); } catch { continue; }
+      if (e.id !== entryId) continue;
+      const content = e.message?.content;
+      if (!Array.isArray(content)) return null;
+      let i = 0;
+      for (const b of content) {
+        if (b && typeof b === 'object' && (b as { type?: string }).type === 'image') {
+          const blk = b as { data?: unknown; mimeType?: unknown };
+          if (typeof blk.data !== 'string' || !blk.data) continue;
+          if (i === index) {
+            return { data: Buffer.from(blk.data, 'base64'), mimeType: typeof blk.mimeType === 'string' ? blk.mimeType : 'image/jpeg' };
+          }
+          i++;
+        }
+      }
+      return null;
+    }
+    return null;
+  }
+
   /* ---------------- rewind ---------------- */
 
   /**
