@@ -313,8 +313,10 @@ describe('§10 steer / send-now — HTTP routes', () => {
     });
     await tick();
     expect(res.statusCode).toBe(202);
-    const prompt = owner.received.find((m) => m.op === 'prompt' && m.message === 'what is this');
+    const prompt = owner.received.find((m) => m.op === 'prompt' && typeof m.message === 'string' && (m.message as string).startsWith('what is this'));
     expect(prompt).toBeTruthy();
+    // §17: the image is written to a temp file and its path appended to the text.
+    expect(prompt!.message).toMatch(/\[image: .*\.png\]/);
     // pi's ImageContent needs a type tag; the server adds it before handoff.
     expect(prompt!.images).toEqual([{ type: 'image', data: 'aGVsbG8=', mimeType: 'image/png' }]);
   });

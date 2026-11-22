@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import type { Logger } from 'pino';
@@ -1186,13 +1187,40 @@ export class SessionManager {
    * are stripped (Node's encoder crashed on them); valid pairs — emoji —
    * are preserved.
    */
+  /** §17: write images to the system temp dir, returning their absolute paths. */
+  private saveImageFiles(images: PromptImage[]): string[] {
+    const extOf = (mime: string): string =>
+      mime === 'image/png' ? 'png' : mime === 'image/webp' ? 'webp' : mime === 'image/gif' ? 'gif' : 'jpg';
+    const out: string[] = [];
+    for (const im of images) {
+      try {
+        const file = path.join(os.tmpdir(), `pi-remote-${crypto.randomUUID()}.${extOf(im.mimeType)}`);
+        fs.writeFileSync(file, Buffer.from(im.data, 'base64'));
+        out.push(file);
+      } catch (err) {
+        this.options.log.warn({ err: (err as Error).message }, 'image temp write failed');
+      }
+    }
+    return out;
+  }
+
   enqueuePrompt(session: Session, rawMessage: string, clientMessageId?: string, images?: PromptImage[]): QueueItem {
-    const message = stripLoneSurrogates(rawMessage);
+    let message = stripLoneSurrogates(rawMessage);
     if (clientMessageId) {
       const existing = session.queue.find((item) => item.clientMessageId === clientMessageId);
       if (existing) return existing;
     }
     if (session.queue.filter(isActive).length >= QUEUE_MAX_ACTIVE) throw new Error('Prompt queue is full');
+    // §17: also write each image to a temp file and append its path to the
+    // message, matching pi's clipboard-paste behavior — the model sees the
+    // image inline AND the agent can read/process the file by path.
+    if (images && images.length) {
+      const paths = this.saveImageFiles(images);
+      if (paths.length) {
+        const list = paths.map((p) => `[image: ${p}]`).join('\n');
+        message = message ? `${message}\n\n${list}` : list;
+      }
+    }
     const item: QueueItem = {
       id: newQueueId(),
       ...(clientMessageId ? { clientMessageId } : {}),
