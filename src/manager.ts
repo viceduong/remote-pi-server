@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import os from 'node:os';
+import readline from 'node:readline';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import type { Logger } from 'pino';
@@ -1947,33 +1948,39 @@ export class SessionManager {
   async readImage(id: string, entryId: string, index: number): Promise<{ data: Buffer; mimeType: string } | null> {
     const s = await this.find(id);
     if (!s) return null;
-    let file: string;
+    // Stream line-by-line: session files can be hundreds of MB (image-heavy
+    // sessions), which exceeds Node's max string length — readFileSync('utf8')
+    // on such a file throws, so never load it whole.
+    let found: { data: Buffer; mimeType: string } | null = null;
     try {
-      file = fs.readFileSync(s.file, 'utf8');
+      const rl = readline.createInterface({ input: fs.createReadStream(s.file, 'utf8'), crlfDelay: Infinity });
+      for await (const line of rl) {
+        if (!line || line.indexOf(entryId) === -1) continue;
+        let e: { id?: string; message?: { content?: unknown } };
+        try { e = JSON.parse(line); } catch { continue; }
+        if (e.id !== entryId) continue;
+        const content = e.message?.content;
+        if (Array.isArray(content)) {
+          let i = 0;
+          for (const b of content) {
+            if (b && typeof b === 'object' && (b as { type?: string }).type === 'image') {
+              const blk = b as { data?: unknown; mimeType?: unknown };
+              if (typeof blk.data !== 'string' || !blk.data) continue;
+              if (i === index) {
+                found = { data: Buffer.from(blk.data, 'base64'), mimeType: typeof blk.mimeType === 'string' ? blk.mimeType : 'image/jpeg' };
+                break;
+              }
+              i++;
+            }
+          }
+        }
+        break; // the entry id is unique: stop at the first matching line
+      }
+      rl.close();
     } catch {
       return null;
     }
-    for (const line of file.split('\n')) {
-      if (!line || line.indexOf(entryId) === -1) continue;
-      let e: { id?: string; message?: { content?: unknown } };
-      try { e = JSON.parse(line); } catch { continue; }
-      if (e.id !== entryId) continue;
-      const content = e.message?.content;
-      if (!Array.isArray(content)) return null;
-      let i = 0;
-      for (const b of content) {
-        if (b && typeof b === 'object' && (b as { type?: string }).type === 'image') {
-          const blk = b as { data?: unknown; mimeType?: unknown };
-          if (typeof blk.data !== 'string' || !blk.data) continue;
-          if (i === index) {
-            return { data: Buffer.from(blk.data, 'base64'), mimeType: typeof blk.mimeType === 'string' ? blk.mimeType : 'image/jpeg' };
-          }
-          i++;
-        }
-      }
-      return null;
-    }
-    return null;
+    return found;
   }
 
   /* ---------------- rewind ---------------- */
