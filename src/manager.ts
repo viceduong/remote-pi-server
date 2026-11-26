@@ -1111,6 +1111,30 @@ export class SessionManager {
     return { provider: noted.provider, id: noted.id, name: noted.name };
   }
 
+  /** §11: the thinking levels the app offers (pi's fixed set). */
+  static readonly THINKING_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh'] as const;
+
+  /**
+   * Set the reasoning/thinking level. Owner op is `set_thinking {level}`; the
+   * RPC child uses `set_thinking_level {level}`. Returns the applied level.
+   */
+  async setThinkingLevel(id: string, level: string): Promise<{ level: string }> {
+    if (!SessionManager.THINKING_LEVELS.includes(level as (typeof SessionManager.THINKING_LEVELS)[number])) {
+      throw new ModelNotFoundError(`Invalid thinking level: ${level}`);
+    }
+    const session = await this.ensureRunning(id);
+    if (!session) throw new ModelNotFoundError('Session not found');
+    const type = session.isProxy ? 'set_thinking' : 'set_thinking_level';
+    try {
+      await session.request({ type, level });
+    } catch (err) {
+      const msg = (err as Error).message;
+      if (session.isProxy && /unknown op/i.test(msg)) throw new ModelTransportError('Reload the host TUI to update the remote-pi extension');
+      throw new ModelTransportError(`Thinking level change failed: ${msg}`);
+    }
+    return { level };
+  }
+
   /**
    * Next model. Child → RPC cycle_model (respects scoped models); owner →
    * next entry of the available list (owners have no cycle op).

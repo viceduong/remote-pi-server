@@ -74,6 +74,9 @@ const SetModelSchema = z.object({
   provider: z.string().min(1).max(200).optional(),
   modelId: z.string().min(1).max(200),
 });
+const SetThinkingSchema = z.object({
+  level: z.enum(['off', 'minimal', 'low', 'medium', 'high', 'xhigh']),
+});
 const RewindSchema = z.object({
   entryId: z.string().min(1).max(128).optional(),
 });
@@ -706,6 +709,21 @@ export function registerRoutes(
     try {
       const model = await manager.setModel(id, body.modelId, body.provider);
       return { ok: true, model };
+    } catch (err) {
+      return sendError(reply, err);
+    }
+  });
+
+  // §11: set the reasoning/thinking level.
+  fastify.post('/api/sessions/:id/thinking', async (req, reply) => {
+    const id = idOf(req, reply);
+    if (!id) return;
+    const body = parse(SetThinkingSchema, req.body, reply, 'body');
+    if (!body) return;
+    if (await rejectExternalWriter(id, reply)) return;
+    try {
+      const result = await manager.setThinkingLevel(id, body.level);
+      return { ok: true, level: result.level };
     } catch (err) {
       return sendError(reply, err);
     }
